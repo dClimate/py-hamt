@@ -54,7 +54,7 @@ def bitmap_has(bitmap, position, byte=None, offset=None):
 # assumes bitmapHas(bitmap, position) = True, hence the (range(position) - 1) and ?+1 in the return?
 def index(bitmap, position):
     t = 0 
-    for i in range(position - 1):
+    for i in range(position):
         if bitmap_has(bitmap, i):
             t += 1
     return t 
