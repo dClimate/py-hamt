@@ -1,34 +1,50 @@
 import math
 
-# there is no bit-sequence lib in python like there is in go/js... converting to bitstring (works like https://www.npmjs.com/package/bit-sequence)
-def bitstring_to_bytes(s):
-    return int(s, 2).to_bytes((len(s) + 7) // 8, byteorder="big")
 
+def bit_sequence(bytes_obj, start, length):
+    start_offset = start % 8
+    byte_count = math.ceil((start_offset + length) / 8)
+    byte_start = start >> 3
+    end_offset = byte_count * 8 - length - start_offset
 
-def bit_sequence(bytes, start, length):
-    # Converting the bytes array into one long bit string
-    binstring = "".join([bin(byte)[2:].zfill(8) for byte in bytes])
+    result = 0
 
-    # Converting the required part of the bitstring
-    ret_byte = bitstring_to_bytes(binstring[start : start + length])
+    for i in range(byte_count):
+        local = bytes_obj[byte_start + i]
+        shift = 0
+        local_bit_length = 9
 
-    return ret_byte
+        if i == 0:
+            local_bit_length -= start_offset
+        
+        if i == byte_count - 1:
+            local_bit_length -= start_offset
+            shift = end_offset
+            local >>= shift
+        
+        if local_bit_length < 8:
+            m = 1 << local_bit_length - 1
+            local &= m
+        
+        if shift < 8:
+            result = result << (8 - shift)
+        result |= local
+    return result
 
-
-def mask(hash, depth, nbits):
-    return bit_sequence(hash, depth * nbits, nbits)
+def mask_fun(hash_obj, depth, nbits):
+    return bit_sequence(hash_obj, depth * nbits, nbits)
 
 
 # set the `position` bit in the given `bitmap` to be `set` (truthy=1, falsey=0)
-def set_bit(bitmap, position, set):
+def set_bit(bitmap, position, to_set):
     byte = math.floor(position / 8)
     offset = position % 8
     has = bitmap_has(bitmap, position, byte, offset)
 
     # if we assume that `bitmap` is already the opposite of `set`, we could skip this check
-    if (set and not has) or (not set and has):
+    if (to_set and not has) or (not to_set and has):
         b = bitmap[byte]
-        if set:
+        if to_set:
             b |= 1 << offset
         else:
             b ^= 1 << offset
@@ -61,3 +77,40 @@ def index(bitmap, position):
         if bitmap_has(bitmap, i):
             t += 1
     return t
+
+
+class TextEncoder:
+    def __init__(self):
+        pass
+
+    def encode(self, text: str) -> bytearray:
+        """
+        exp:
+            >>> textencoder = TextEncoder()
+            >>> textencoder.encode('$')
+            >>> [36]
+        """
+        if isinstance(text, str):
+            encoded_text = text.encode("utf-8")
+            return bytearray(encoded_text)
+        else:
+            raise TypeError(f"Expecting a str but got {type(text)}")
+
+
+class TextDecoder:
+    def __init__(self):
+        pass
+
+    def decode(self, array: bytearray) -> str:
+        """
+        exp:
+            >>> textdecoder = TextDecoder()
+            >>> textdecoder.decode([36])
+            >>> $
+        """
+        if isinstance(array, list):
+            return bytearray(array).decode("utf-8")
+        elif isinstance(array, bytearray):
+            return array.decode("utf-8")
+        else:
+            raise TypeError(f"expecting a list or bytearray got: {type(array)}")

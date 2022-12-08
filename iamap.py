@@ -1,6 +1,9 @@
-from bit_utils import mask, set_bit, bitmap_has, index
+import typing
+from bit_utils import mask_fun, set_bit, bitmap_has, index, TextDecoder, TextEncoder
 import asyncio
 import math
+from functools import cmp_to_key
+from multiformats import multihash
 
 """
 WORK IN PROGRESS, NOT FINISHED
@@ -15,55 +18,28 @@ The IAmap class methods, and related serializable functions in this file are unf
 and these are commented with [#*] to indicate they are finished.
 """
 
-# defining python equivalent for TextEncoder/TextDecoder
-class TextEncoder:
-    def __init__(self):
-        pass
-
-    def encode(self, text):
-        """
-        exp:
-            >>> textencoder = TextEncoder()
-            >>> textencoder.encode('$')
-            >>> [36]
-        """
-        if isinstance(text, str):
-            encoded_text = text.encode("utf-8")
-            byte_array = bytearray(encoded_text)
-            return list(byte_array)
-        else:
-            raise TypeError(f"Expecting a str but got {type(text)}")
-
-
-class TextDecoder:
-    def __init__(self):
-        pass
-
-    def decode(self, array):
-        """
-        exp:
-            >>> textdecoder = TextDecoder()
-            >>> textdecoder.decode([36])
-            >>> $
-        """
-        if isinstance(array, list):
-            return bytearray(array).decode("utf-8")
-        elif isinstance(array, bytearray):
-            return array.decode("utf-8")
-        else:
-            raise TypeError(f"expecting a list or bytearray got: {type(array)}")
-
-
 # set defaults
-default_bit_width = 8  # 2^8 = 256 buckets or children per node
-default_bucket_size = 5  # array size for a bucket of values
+DEFAULT_BIT_WIDTH = 8  # 2^8 = 256 buckets or children per node
+DEFAULT_BUCKET_SIZE = 5  # array size for a bucket of values
 
-hasher_registry = {}
+DEFAULT_OPTIONS = {
+    "bit_width": DEFAULT_BIT_WIDTH,
+    "bucket_size": DEFAULT_BUCKET_SIZE,
+    "hash_alg": "murmur3-32",
+}
+
+
+hasher_registry = {
+    "murmur3-32": {"hash_bytes": 4, "hasher": multihash.get("murmur3-32").digest}
+}
 text_encoder = TextEncoder()
 
 # *
-def register_hasher(hash_alg, hash_bytes, hasher):
-    hasher_registry[hash_alg] = {"hash_bytes": hash_bytes, "hasher": hasher}
+def register_hasher(hash_alg, hash_bytes):
+    hasher_registry[hash_alg] = {
+        "hash_bytes": hash_bytes,
+        "hasher": multihash.get(hash_alg).digest,
+    }
 
 
 class KV:
@@ -74,105 +50,167 @@ class KV:
     def to_serializable(self):
         return [self.key, self.value]
 
-    def from_serializable(self, obj):
-        # to do, add checks for obj
-        # assert(Array.isArray(obj))
-        # assert(obj.length === 2)
+    @staticmethod
+    def from_serializable(obj):
+        assert isinstance(obj, list)
+        assert len(obj) == 2
         return KV(obj[0], obj[1])
 
 
 # a element in the data array that each node holds, each element could be either a container of
 #  an array (bucket) of KVs or a link to a child node
 class Element:
-    def __init__(self, bucket=None, link=None):
-        assert (bucket == None) == (
-            link != None
-        )  # assert that either the bucket or link is None
+    def __init__(self, bucket: typing.List[KV] = None, link=None):
+        assert bucket or link
+        assert not (bucket and link)
         self.bucket = bucket  # should be array of KV's
         self.link = link
 
-    def to_serializable():
-        pass
+    def to_serializable(self):
+        if self.bucket is not None:
+            return [c.to_serializable() for c in self.bucket]
+        else:
+            # TODO add check for link type
+            return self.link
+
+    @staticmethod
+    def from_serializable(is_link, obj):
+        if is_link(obj):
+            return Element(None, obj)
+        elif isinstance(obj, list):
+            return Element([KV.from_serializable(ele) for ele in obj])
+
+
+async def create(store, options=DEFAULT_OPTIONS, map=None, depth=0, data=[]):
+    new_node = IAMap(store, options, map, depth, data)
+    return await save(store, new_node)
 
 
 class IAMap(object):
     # Create a new IAMap instance with a backing store
     ## define async create func https://stackoverflow.com/questions/33128325/how-to-set-class-attribute-with-await-in-init
-    @classmethod
-    async def create(
+    def __init__(
         self,
         store,
-        data=None,
-        options={"bit_width": default_bit_width, "bucket_size": default_bucket_size},
-        map=[],
+        options={
+            "bit_width": DEFAULT_BIT_WIDTH,
+            "bucket_size": DEFAULT_BUCKET_SIZE,
+            "hash_alg": "murmur3-32",
+        },
+        map=None,
         depth=0,
+        data=[],
     ):
-        self = IAMap()
-
         self.store = store
         # in javascript, self.data is made immutable
+        for e in data:
+            if not isinstance(e, Element):
+                raise Exception("`data` array must contain only `Element` types")
         self.data = data
-        self.map = map
+
+        self.id = None
+
+        if map and not isinstance(map, bytearray):
+            raise TypeError("map must be bytearray")
+        map_length = 1 + (2 ** options["bit_width"]) // 8
+
+        if map and map_length != len(map):
+            raise Exception(f"`map` must be a bytearray of length {map_length}")
+
+        self.map = map or bytearray([0 for _ in range(map_length)])
+        # if depth > math.floor(hash)
+
         self.depth = depth
 
         self.config = build_config(options)
-        self.id = None
-
-        return self
+        hash_bytes = hasher_registry[self.config["hash_alg"]]["hash_bytes"]
+        if self.depth > math.floor((hash_bytes * 8) / self.config["bit_width"]):
+            raise Exception("Overflow: maximum tree depth reached")
 
     # Asynchronously create a new `IAMap` instance identical to this one but with `key` set to `value`.
-    async def set(self, key, value, _cached_hash):
-        hash = _cached_hash  # this needs to check if the submitted hash is a byte array, and if not await call the hasher function for this key... for now i will assume hash input
-        bitpos = mask(hash, self.depth, self.options["bit_width"])
+    async def set(self, key, value, _cached_hash=None):
+        hashed_key = (
+            _cached_hash if isinstance(_cached_hash, bytearray) else hasher(self)(key)
+        )
+        bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
             find_elem = find_element(self, bitpos, key)
-            if "data" in find_elem.keys():
-                if find_elem["data"]["found"] == True:
-                    if (
-                        find_elem["data"].bucket_index == None
-                        or find_elem["data"].bucket_entry == None
-                    ):
+            if "data" in find_elem:
+                data = find_elem["data"]
+                if data["found"]:
+                    if data["bucket_index"] is None or data["bucket_entry"] is None:
                         raise Exception("Unexpected error")
-                    if find_elem["data"].bucket_entry["value"] == value:
+                    if data["bucket_entry"].value == value:
                         return self
-
-        pass
+                    return await update_bucket(
+                        self,
+                        data["element_at"],
+                        data["bucket_index"],
+                        key,
+                        value,
+                    )
+                else:
+                    if len(data["element"].bucket) >= self.config["bucket_size"]:
+                        new_map = await replace_bucket_with_node(self, data["element_at"])
+                        return new_map.set(key, value, hashed_key)
+                    return await update_bucket(self, data["element_at"], -1, key, value)
+            elif "link" in find_elem:
+                link = find_elem["link"]
+                child = await load(
+                    self.store, link["element"].link, self.depth + 1, self.config
+                )
+                assert child
+                new_child = await child.set(key, value, hashed_key)
+                return await update_node(self, link["element_at"], new_child)
+            else:
+                raise Exception("Neither link nor data found")
+        else:
+            return await add_new_element(self, bitpos, key, value)
 
     # Asynchronously find and return a value for the given `key` if it exists within this `IAMap`.
-    async def get(self, key, _cached_hash):
+    async def get(self, key, _cached_hash=None):
         if not isinstance(key, bytes):
             key = text_encoder.encode(key)
-        # hash = something (todo)
-        bitpos = mask(hash, self.depth, self.config["bit_width"])
+        hashed_key = (
+            _cached_hash if isinstance(_cached_hash, bytearray) else hasher(self)(key)
+        )
+        bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
-            pass
+            find_elem = find_element(self, bitpos, key)
+            if "data" in find_elem:
+                data = find_elem["data"]
+                if data["found"]:
+                    return data["bucket_entry"].value
+                else:
+                    return None
+            elif "link" in find_elem:
+                link = find_elem["link"]
+                child = await load(
+                    self.store, link["element"].link, self.depth + 1, self.config
+                )
+                assert child
+                return await child.get(key, hashed_key)
+            else:
+                raise Exception("Neither link nor data found")
+        else:
+            return None
 
     async def has(self, key):
-        await self.get(key) != None
-        pass
+        return (await self.get(key)) is not None
 
     async def delete(self, key):
         if not isinstance(key, bytes):
             key = text_encoder.encode(key)
         pass
 
-    def is_serializable(self, serializable):
-        if isinstance(serializable, list):
-            return (
-                len(serializable) == 2
-                and isinstance(serializable[0], bytes)
-                and isinstance(serializable[1], list)
-            )
-        else:
-            return self.is_root_serializable(self, serializable)
+    @staticmethod
+    def is_iamap(node):
+        return isinstance(node, IAMap)
 
-    def is_root_serializable(self, serializable):
-        return self.is_serializable(self, serializable["hamt"])
-        # return type(serializable) == dict and isinstance(serializable['hash_alg'], int) and isinstance(serializable['bucket_size'], int) and isinstance(serializable['hamt'], list)
-
-    def from_serializable(self, store, id, serializable, options, depth=0):
+    @staticmethod
+    def from_serializable(store, id, serializable, options, depth=0):
         if depth == 0:
-            if not self.is_root_serializable(self, serializable):
+            if not is_root_serializable(serializable):
                 raise Exception(
                     "Loaded  object does not appear to be an IAMap root (depth==0)"
                 )
@@ -180,16 +218,45 @@ class IAMap(object):
             options = serializable_to_options(serializable)
             hamt = serializable["hamt"]
         else:
-            if not self.is_serializable(self, serializable):
+            if not is_serializable(serializable):
                 raise Exception(
                     "Loaded object does not appear to be an IAMap node (depth>0)"
                 )
-            hamt = serializable["hamt"]
-        # data = hamt[1]
-        # need to write anonymous function for line 1130 of code from iamap.js (.map on the hamt[1])
+            hamt = serializable
+        data = [Element.from_serializable(store.is_link, ele) for ele in hamt[1]]
+        node = IAMap(store, options, hamt[0], depth, data)
+        if id is not None:
+            node.id = id
+        return node
+
+    def to_serializable(self):
+        data = [ele.to_serializable() for ele in self.data]
+        hamt = [self.map, data]
+        if self.depth == 0:
+            return hamt
+
+        return {
+            "hash_alg": self.config["hash_alg"],
+            "bucket_size": self.config["bucket_size"],
+            "hamt": hamt,
+        }
 
     def from_child_serializable(self, id, serializable, depth):
         return self.from_serializable(self.store, id, serializable, self.config, depth)
+
+    def direct_entry_count(self):
+        count = 0
+        for ele in self.data:
+            if ele.bucket:
+                count += len(ele.bucket)
+        return count
+
+    def direct_node_count(self):
+        count = 0
+        for ele in self.data:
+            if ele.link:
+                count += 1
+        return count
 
     async def is_invariant(self):
         size = await self.size()
@@ -219,22 +286,99 @@ class IAMap(object):
         return c
 
 
-async def update_bucket(node, element_at, bucket_at, key, value):
-    old_element = node["data"][element_at]
+async def update_bucket(node: IAMap, element_at, bucket_at, key, value):
+    old_element = node.data[element_at]
+
+    if old_element.bucket is None:
+        raise Exception("Expected element with bucket")
+
+    new_element = Element([*old_element.bucket])
+    new_kv = KV(key, value)
+
+    if bucket_at == -1:
+        new_element.bucket.append(new_kv)
+        new_element.bucket.sort(key=cmp_to_key(byte_compare))
+    else:
+        new_element.bucket[bucket_at] = new_kv
+
+    new_data = [*node.data]
+    new_data[element_at] = new_element
+    return await create(node.store, node.config, node.map, node.depth, new_data)
+
+
+async def replace_bucket_with_node(node: IAMap, element_at):
+    new_node = IAMap(node.store, node.config, None, node.depth + 1)
+    element = node.data[element_at]
+    assert element
+    if element.bucket is None:
+        raise Exception("Expected element with bucket")
+
+    for c in element.bucket:
+        new_node = await new_node.set(c.key, c.value)
+    new_node = await save(node.store, new_node)
+    new_data = [*node.data]
+    new_data[element_at] = Element(None, new_node.id)
+    return await create(node.store, node.config, node.map, node.depth, new_data)
+
+
+async def update_node(node: IAMap, element_at, new_child):
+    assert new_child.id
+    new_element = Element(None, new_child.id)
+    new_data = [*node.data]
+    new_data[element_at] = new_element
+    return await create(node.store, node.config, node.map, node.depth, new_data)
+
+
+async def collapse_into_single_bucket(node: IAMap, hash, element_at, bucket_index):
+    new_map = set_bit(
+        bytearray([0 for _ in range(len(node.map))]),
+        mask_fun(hash, 0, node.config["bit_width"]),
+        True,
+    )
+    new_bucket = []
+    for i, c in enumerate(node.data):
+        if i == element_at:
+            if c.bucket is None:
+                raise Exception("Expected bucket")
+            if len(c.bucket) != 1:
+                # remove bucket we're collapsing
+                temp_bucket = [*c.bucket]
+                del temp_bucket[bucket_index]
+                new_bucket += temp_bucket
+        else:
+            if c.bucket is None:
+                raise Exception("Expected bucket")
+            new_bucket += c.bucket
+    new_bucket.sort(key=cmp_to_key(byte_compare))
+    new_element = Element(new_bucket)
+    return await create(node.store, node.config, new_map, 0, new_element)
+
+
+def remove_from_bucket(data, element_at, last_in_bucket, bucket_index):
+    new_data = [*data]
+    if not last_in_bucket:
+        old_element = data[element_at]
+        new_element = Element([*old_element])
+        del new_element.bucket[bucket_index]
+        new_data[element_at] = new_element
+    else:
+        del new_data[element_at]
+    return new_data
 
 
 def build_config(options):
     config = {}
-    if not isinstance(options["hash_alg"], int):
+    if not isinstance(options["hash_alg"], str):
         raise TypeError("Invalid hash_alg option")
 
-    if options["hash_alg"] not in hasher_registry.keys():
+    if options["hash_alg"] not in hasher_registry:
         raise Exception(f'Unkown "hash_alg": {options["hash_alg"]}')
 
     config["hash_alg"] = options["hash_alg"]
-    # to do: check bitwidth/buckketsize, for now just defaulting
-    config["bit_with"] = default_bit_width
-    config["bucket_size"] = default_bucket_size
+    # TODO: check bitwidth/buckketsize, for now just defaulting
+    config["bit_width"] = DEFAULT_BIT_WIDTH
+    config["bucket_size"] = DEFAULT_BUCKET_SIZE
+    return config
 
 
 # *
@@ -248,15 +392,39 @@ def serializable_to_options(serializable):
     }
 
 
-# *
-def is_iamap(node):
-    return type(node) is IAMap
+def is_serializable(serializable):
+    if isinstance(serializable, list):
+        return (
+            len(serializable) == 2
+            and isinstance(serializable[0], bytearray)
+            and isinstance(serializable[1], list)
+        )
+    return is_root_serializable(serializable)
 
 
-async def save(store, new_node):
+def is_root_serializable(serializable):
+    return (
+        isinstance(serializable, dict)
+        and isinstance(serializable.get("hash_alg"), int)
+        and isinstance(serializable.get("hash_alg"), int)
+        and isinstance(serializable["hamt"], list)
+        and is_serializable(serializable["hamt"])
+    )
+
+    # return type(serializable) == dict and isinstance(serializable['hash_alg'], int) and isinstance(serializable['bucket_size'], int) and isinstance(serializable['hamt'], list)
+
+
+async def save(store, new_node: IAMap):
     id = await store.save(new_node.to_serializable())
     new_node.id = id
     return new_node
+
+
+async def load(store, id, depth=0, options=None):
+    if depth != 0 and not options:
+        raise Exception("Cannot load() without options at depth > 0")
+    serialized = await store.load(id)
+    return IAMap.from_serializable(store, serialized, id, options, depth)
 
 
 def find_element(node, bitpos, key):
@@ -275,31 +443,45 @@ def find_element(node, bitpos, key):
                         "bucket_entry": bucket_entry,
                     }
                 }
-        return {"data": {"found": False, "element_at": element_at, "element": element}}
-
+        return {
+            "data": {
+                "found": False,
+                "element_at": element_at,
+                "element": element,
+                "bucket_index": None,
+                "bucket_entry": None,
+            }
+        }
+    assert element.link
     return {"link": {"element_at": element_at, "element": element}}
 
 
-# *
-def hasher(map):
-    return hasher_registry[map.config["hash_alg"]]["hasher"]
+async def add_new_element(node: IAMap, bitpos, key, value):
+    insert_at = index(node.map, bitpos)
+    new_data = [*node.data]
+    new_data.insert(insert_at, Element([KV(key, value)]))
+    new_map = set_bit(node.map, bitpos, True)
+    return await create(node.store, node.config, new_map, node.depth, new_data)
 
 
-# *
+def hasher(iamap):
+    return hasher_registry[iamap.config["hash_alg"]]["hasher"]
+
+
 def byte_compare(b1, b2):
+    if hasattr(b1, "key"):
+        b1 = b1.key
+    if hasattr(b2, "key"):
+        b2 = b2.key
     x = len(b1)
     y = len(b2)
-
     for i in range(min(x, y)):
         if b1[i] != b2[i]:
             x = b1[i]
             y = b2[i]
             break
-
     if x < y:
         return -1
-
     if x > y:
         return 1
-
     return 0
