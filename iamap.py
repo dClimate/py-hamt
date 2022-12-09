@@ -110,7 +110,7 @@ class IAMap(object):
 
         self.id = None
 
-        if map and not isinstance(map, bytearray):
+        if map and not isinstance(map, (bytes, bytearray)):
             raise TypeError("map must be bytearray")
         map_length = 1 + (2 ** options["bit_width"]) // 8
 
@@ -151,8 +151,10 @@ class IAMap(object):
                     )
                 else:
                     if len(data["element"].bucket) >= self.config["bucket_size"]:
-                        new_map = await replace_bucket_with_node(self, data["element_at"])
-                        return new_map.set(key, value, hashed_key)
+                        new_map = await replace_bucket_with_node(
+                            self, data["element_at"]
+                        )
+                        return await new_map.set(key, value, hashed_key)
                     return await update_bucket(self, data["element_at"], -1, key, value)
             elif "link" in find_elem:
                 link = find_elem["link"]
@@ -222,7 +224,7 @@ class IAMap(object):
                 raise Exception(
                     "Loaded object does not appear to be an IAMap node (depth>0)"
                 )
-            hamt = serializable
+            hamt = serializable["hamt"]
         data = [Element.from_serializable(store.is_link, ele) for ele in hamt[1]]
         node = IAMap(store, options, hamt[0], depth, data)
         if id is not None:
@@ -281,7 +283,7 @@ class IAMap(object):
             if e.bucket is not None:
                 c += len(e.bucket)
             else:
-                child = await self.load(self.store, e.link, self.depth + 1, self.config)
+                child = await load(self.store, e.link, self.depth + 1, self.config)
                 c += await child.size()
         return c
 
@@ -396,7 +398,7 @@ def is_serializable(serializable):
     if isinstance(serializable, list):
         return (
             len(serializable) == 2
-            and isinstance(serializable[0], bytearray)
+            and isinstance(serializable[0], (bytes, bytearray))
             and isinstance(serializable[1], list)
         )
     return is_root_serializable(serializable)
@@ -405,8 +407,7 @@ def is_serializable(serializable):
 def is_root_serializable(serializable):
     return (
         isinstance(serializable, dict)
-        and isinstance(serializable.get("hash_alg"), int)
-        and isinstance(serializable.get("hash_alg"), int)
+        and isinstance(serializable.get("hash_alg"), str)
         and isinstance(serializable["hamt"], list)
         and is_serializable(serializable["hamt"])
     )
@@ -424,7 +425,7 @@ async def load(store, id, depth=0, options=None):
     if depth != 0 and not options:
         raise Exception("Cannot load() without options at depth > 0")
     serialized = await store.load(id)
-    return IAMap.from_serializable(store, serialized, id, options, depth)
+    return IAMap.from_serializable(store, id, serialized, options, depth)
 
 
 def find_element(node, bitpos, key):
