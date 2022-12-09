@@ -3,30 +3,12 @@ import sys
 sys.path.append("..")
 import bit_utils
 
-# mask tests
-assert bit_utils.mask(bytes([0b11111111]), 0, 5) == bytes([0b11111])
-assert bit_utils.mask(bytes([0b10101010]), 0, 5) == bytes([0b10101])
-assert bit_utils.mask(bytes([0b10000000]), 0, 5) == bytes([0b10000])
-assert bit_utils.mask(bytes([0b00010000]), 0, 5) == bytes([0b00010])
-assert bit_utils.mask(
-    bytes([0b10000100, 0b10010000]), 0, 9
-) == bit_utils.bitstring_to_bytes("0b100001001")
-assert bit_utils.mask(
-    bytes([0b10101010, 0b10101010]), 0, 9
-) == bit_utils.bitstring_to_bytes("0b101010101")
-assert bit_utils.mask(
-    bytes([0b10000100, 0b10010000]), 1, 5
-) == bit_utils.bitstring_to_bytes("0b10010")
-assert bit_utils.mask(
-    bytes([0b10101010, 0b10101010]), 1, 5
-) == bit_utils.bitstring_to_bytes("0b01010")
-assert bit_utils.mask(
-    bytes([0b10000100, 0b10010000]), 2, 5
-) == bit_utils.bitstring_to_bytes("0b01000")
-assert bit_utils.mask(
-    bytes([0b10101010, 0b10101010]), 2, 5
-) == bit_utils.bitstring_to_bytes("0b10101")
-print("mask tests passed")
+# mask_fun tests
+import ipdb; ipdb.set_trace()
+assert bit_utils.mask_fun(bytes([0b11111111]), 0, 5) == 0b11111
+assert bit_utils.mask_fun(bytes([0b10101010]), 0, 5) == 0b10101
+assert bit_utils.mask_fun(bytes([0b10000000]), 0, 5) == 0b10000
+assert bit_utils.mask_fun(bytes([0b00010000]), 0, 5) == 0b00010
 
 # bitmap_has tests
 assert not bit_utils.bitmap_has(bytes([0b0]), 0)
@@ -52,7 +34,7 @@ assert bit_utils.index(bytes([0b111101]), 4) == 3
 assert bit_utils.index(bytes([0b111001]), 4) == 2
 assert bit_utils.index(bytes([0b111000]), 4) == 1
 assert bit_utils.index(bytes([0b110000]), 4) == 0
-# new node, no bitmask, insertion at the start
+# new node, no bitmask_fun, insertion at the start
 assert bit_utils.index(bytes([0b000000]), 0) == 0
 assert bit_utils.index(bytes([0b000000]), 1) == 0
 assert bit_utils.index(bytes([0b000000]), 2) == 0

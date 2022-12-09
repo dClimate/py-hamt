@@ -1,6 +1,5 @@
 import typing
 from bit_utils import mask_fun, set_bit, bitmap_has, index, TextDecoder, TextEncoder
-import asyncio
 import math
 from functools import cmp_to_key
 from multiformats import multihash
@@ -19,7 +18,7 @@ and these are commented with [#*] to indicate they are finished.
 """
 
 # set defaults
-DEFAULT_BIT_WIDTH = 8  # 2^8 = 256 buckets or children per node
+DEFAULT_BIT_WIDTH = 5  # 2^8 = 256 buckets or children per node
 DEFAULT_BUCKET_SIZE = 5  # array size for a bucket of values
 
 DEFAULT_OPTIONS = {
@@ -81,14 +80,14 @@ class Element:
             return Element([KV.from_serializable(ele) for ele in obj])
 
 
-async def create(store, options=DEFAULT_OPTIONS, map=None, depth=0, data=[]):
+def create(store, options=DEFAULT_OPTIONS, map=None, depth=0, data=[]):
     new_node = IAMap(store, options, map, depth, data)
-    return await save(store, new_node)
+    return save(store, new_node)
 
 
 class IAMap(object):
     # Create a new IAMap instance with a backing store
-    ## define async create func https://stackoverflow.com/questions/33128325/how-to-set-class-attribute-with-await-in-init
+    ## define create func https://stackoverflow.com/questions/33128325/how-to-set-class-attribute-with-in-init
     def __init__(
         self,
         store,
@@ -110,15 +109,14 @@ class IAMap(object):
 
         self.id = None
 
-        if map and not isinstance(map, (bytes, bytearray)):
-            raise TypeError("map must be bytearray")
-        map_length = 1 + (2 ** options["bit_width"]) // 8
+        if map and not isinstance(map, bytes):
+            raise TypeError("map must be bytes")
+        map_length = math.ceil(2 ** options["bit_width"] / 8)
 
         if map and map_length != len(map):
-            raise Exception(f"`map` must be a bytearray of length {map_length}")
+            raise Exception(f"`map` must be a bytes of length {map_length}")
 
-        self.map = map or bytearray([0 for _ in range(map_length)])
-        # if depth > math.floor(hash)
+        self.map = map or bytes([0 for _ in range(map_length)])
 
         self.depth = depth
 
@@ -128,9 +126,9 @@ class IAMap(object):
             raise Exception("Overflow: maximum tree depth reached")
 
     # Asynchronously create a new `IAMap` instance identical to this one but with `key` set to `value`.
-    async def set(self, key, value, _cached_hash=None):
+    def set(self, key, value, _cached_hash=None):
         hashed_key = (
-            _cached_hash if isinstance(_cached_hash, bytearray) else hasher(self)(key)
+            _cached_hash if _cached_hash is not None else hasher(self)(key)
         )
         bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
@@ -138,11 +136,12 @@ class IAMap(object):
             if "data" in find_elem:
                 data = find_elem["data"]
                 if data["found"]:
+                    print("found, shouldn't be here")
                     if data["bucket_index"] is None or data["bucket_entry"] is None:
                         raise Exception("Unexpected error")
                     if data["bucket_entry"].value == value:
                         return self
-                    return await update_bucket(
+                    return update_bucket(
                         self,
                         data["element_at"],
                         data["bucket_index"],
@@ -151,30 +150,28 @@ class IAMap(object):
                     )
                 else:
                     if len(data["element"].bucket) >= self.config["bucket_size"]:
-                        new_map = await replace_bucket_with_node(
-                            self, data["element_at"]
-                        )
-                        return await new_map.set(key, value, hashed_key)
-                    return await update_bucket(self, data["element_at"], -1, key, value)
+                        new_map = replace_bucket_with_node(self, data["element_at"])
+                        return new_map.set(key, value, hashed_key)
+                    return update_bucket(self, data["element_at"], -1, key, value)
             elif "link" in find_elem:
                 link = find_elem["link"]
-                child = await load(
+                child = load(
                     self.store, link["element"].link, self.depth + 1, self.config
                 )
                 assert child
-                new_child = await child.set(key, value, hashed_key)
-                return await update_node(self, link["element_at"], new_child)
+                new_child = child.set(key, value, hashed_key)
+                return update_node(self, link["element_at"], new_child)
             else:
                 raise Exception("Neither link nor data found")
         else:
-            return await add_new_element(self, bitpos, key, value)
+            return add_new_element(self, bitpos, key, value)
 
     # Asynchronously find and return a value for the given `key` if it exists within this `IAMap`.
-    async def get(self, key, _cached_hash=None):
+    def get(self, key, _cached_hash=None):
         if not isinstance(key, bytes):
             key = text_encoder.encode(key)
         hashed_key = (
-            _cached_hash if isinstance(_cached_hash, bytearray) else hasher(self)(key)
+            _cached_hash if isinstance(_cached_hash, bytes) else hasher(self)(key)
         )
         bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
@@ -187,23 +184,23 @@ class IAMap(object):
                     return None
             elif "link" in find_elem:
                 link = find_elem["link"]
-                child = await load(
+                child = load(
                     self.store, link["element"].link, self.depth + 1, self.config
                 )
                 assert child
-                return await child.get(key, hashed_key)
+                return child.get(key, hashed_key)
             else:
                 raise Exception("Neither link nor data found")
         else:
             return None
 
-    async def has(self, key):
-        return (await self.get(key)) is not None
+    def has(self, key):
+        return self.get(key) is not None
 
-    async def delete(self, key):
-        if not isinstance(key, bytes):
-            key = text_encoder.encode(key)
-        pass
+    # def delete(self, key):
+    #     if not isinstance(key, bytes):
+    #         key = text_encoder.encode(key)
+    #     pass
 
     @staticmethod
     def is_iamap(node):
@@ -224,7 +221,7 @@ class IAMap(object):
                 raise Exception(
                     "Loaded object does not appear to be an IAMap node (depth>0)"
                 )
-            hamt = serializable["hamt"]
+            hamt = serializable
         data = [Element.from_serializable(store.is_link, ele) for ele in hamt[1]]
         node = IAMap(store, options, hamt[0], depth, data)
         if id is not None:
@@ -234,7 +231,7 @@ class IAMap(object):
     def to_serializable(self):
         data = [ele.to_serializable() for ele in self.data]
         hamt = [self.map, data]
-        if self.depth == 0:
+        if self.depth != 0:
             return hamt
 
         return {
@@ -260,41 +257,41 @@ class IAMap(object):
                 count += 1
         return count
 
-    async def is_invariant(self):
-        size = await self.size()
-        entry_arity = self.direct_entry_count()
-        node_arity = self.direct_node_count()
-        arity = entry_arity + node_arity
-        size_predicate = 2
-        if node_arity == 0:
-            size_predicate = min(2, entry_arity)
+    # def is_invariant(self):
+    #     size = self.size()
+    #     entry_arity = self.direct_entry_count()
+    #     node_arity = self.direct_node_count()
+    #     arity = entry_arity + node_arity
+    #     size_predicate = 2
+    #     if node_arity == 0:
+    #         size_predicate = min(2, entry_arity)
 
-        inv1 = size - entry_arity >= 2 * (arity - entry_arity)
-        # to do invars 2-4
-        inv5 = (
-            node_arity >= 0 and entry_arity >= 0 and (entry_arity + node_arity == arity)
-        )
+    #     inv1 = size - entry_arity >= 2 * (arity - entry_arity)
+    #     # to do invars 2-4
+    #     inv5 = (
+    #         node_arity >= 0 and entry_arity >= 0 and (entry_arity + node_arity == arity)
+    #     )
 
-        return inv1 and inv5
+    #     return inv1 and inv5
 
-    async def size(self):
+    def size(self):
         c = 0
         for e in self.data:
             if e.bucket is not None:
                 c += len(e.bucket)
             else:
-                child = await load(self.store, e.link, self.depth + 1, self.config)
-                c += await child.size()
+                child = load(self.store, e.link, self.depth + 1, self.config)
+                c += child.size()
         return c
 
 
-async def update_bucket(node: IAMap, element_at, bucket_at, key, value):
+def update_bucket(node: IAMap, element_at, bucket_at, key, value):
     old_element = node.data[element_at]
 
     if old_element.bucket is None:
         raise Exception("Expected element with bucket")
 
-    new_element = Element([*old_element.bucket])
+    new_element = Element(list(old_element.bucket))
     new_kv = KV(key, value)
 
     if bucket_at == -1:
@@ -303,12 +300,12 @@ async def update_bucket(node: IAMap, element_at, bucket_at, key, value):
     else:
         new_element.bucket[bucket_at] = new_kv
 
-    new_data = [*node.data]
+    new_data = list(node.data)
     new_data[element_at] = new_element
-    return await create(node.store, node.config, node.map, node.depth, new_data)
+    return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-async def replace_bucket_with_node(node: IAMap, element_at):
+def replace_bucket_with_node(node: IAMap, element_at):
     new_node = IAMap(node.store, node.config, None, node.depth + 1)
     element = node.data[element_at]
     assert element
@@ -316,24 +313,24 @@ async def replace_bucket_with_node(node: IAMap, element_at):
         raise Exception("Expected element with bucket")
 
     for c in element.bucket:
-        new_node = await new_node.set(c.key, c.value)
-    new_node = await save(node.store, new_node)
-    new_data = [*node.data]
+        new_node = new_node.set(c.key, c.value)
+    new_node = save(node.store, new_node)
+    new_data = list(node.data)
     new_data[element_at] = Element(None, new_node.id)
-    return await create(node.store, node.config, node.map, node.depth, new_data)
+    return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-async def update_node(node: IAMap, element_at, new_child):
+def update_node(node: IAMap, element_at, new_child):
     assert new_child.id
     new_element = Element(None, new_child.id)
-    new_data = [*node.data]
+    new_data = list(node.data)
     new_data[element_at] = new_element
-    return await create(node.store, node.config, node.map, node.depth, new_data)
+    return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-async def collapse_into_single_bucket(node: IAMap, hash, element_at, bucket_index):
+def collapse_into_single_bucket(node: IAMap, hash, element_at, bucket_index):
     new_map = set_bit(
-        bytearray([0 for _ in range(len(node.map))]),
+        bytes([0 for _ in range(len(node.map))]),
         mask_fun(hash, 0, node.config["bit_width"]),
         True,
     )
@@ -344,7 +341,7 @@ async def collapse_into_single_bucket(node: IAMap, hash, element_at, bucket_inde
                 raise Exception("Expected bucket")
             if len(c.bucket) != 1:
                 # remove bucket we're collapsing
-                temp_bucket = [*c.bucket]
+                temp_bucket = list(c.bucket)
                 del temp_bucket[bucket_index]
                 new_bucket += temp_bucket
         else:
@@ -353,14 +350,14 @@ async def collapse_into_single_bucket(node: IAMap, hash, element_at, bucket_inde
             new_bucket += c.bucket
     new_bucket.sort(key=cmp_to_key(byte_compare))
     new_element = Element(new_bucket)
-    return await create(node.store, node.config, new_map, 0, new_element)
+    return create(node.store, node.config, new_map, 0, new_element)
 
 
 def remove_from_bucket(data, element_at, last_in_bucket, bucket_index):
-    new_data = [*data]
+    new_data = list(data)
     if not last_in_bucket:
         old_element = data[element_at]
-        new_element = Element([*old_element])
+        new_element = Element(list(old_element))
         del new_element.bucket[bucket_index]
         new_data[element_at] = new_element
     else:
@@ -388,7 +385,7 @@ def serializable_to_options(serializable):
     return {
         "hash_alg": serializable["hash_alg"],
         "bit_width": math.log2(
-            serializable["hamt"][0].length * 8
+            len(serializable["hamt"][0]) * 8
         ),  # inverse of (2**bit_width) / 8
         "bucket_size": serializable["bucket_size"],
     }
@@ -398,7 +395,7 @@ def is_serializable(serializable):
     if isinstance(serializable, list):
         return (
             len(serializable) == 2
-            and isinstance(serializable[0], (bytes, bytearray))
+            and isinstance(serializable[0], bytes)
             and isinstance(serializable[1], list)
         )
     return is_root_serializable(serializable)
@@ -412,19 +409,17 @@ def is_root_serializable(serializable):
         and is_serializable(serializable["hamt"])
     )
 
-    # return type(serializable) == dict and isinstance(serializable['hash_alg'], int) and isinstance(serializable['bucket_size'], int) and isinstance(serializable['hamt'], list)
 
-
-async def save(store, new_node: IAMap):
-    id = await store.save(new_node.to_serializable())
+def save(store, new_node: IAMap):
+    id = store.save(new_node.to_serializable())
     new_node.id = id
     return new_node
 
 
-async def load(store, id, depth=0, options=None):
+def load(store, id, depth=0, options=None):
     if depth != 0 and not options:
         raise Exception("Cannot load() without options at depth > 0")
-    serialized = await store.load(id)
+    serialized = store.load(id)
     return IAMap.from_serializable(store, id, serialized, options, depth)
 
 
@@ -457,12 +452,12 @@ def find_element(node, bitpos, key):
     return {"link": {"element_at": element_at, "element": element}}
 
 
-async def add_new_element(node: IAMap, bitpos, key, value):
+def add_new_element(node: IAMap, bitpos, key, value):
     insert_at = index(node.map, bitpos)
-    new_data = [*node.data]
+    new_data = list(node.data)
     new_data.insert(insert_at, Element([KV(key, value)]))
     new_map = set_bit(node.map, bitpos, True)
-    return await create(node.store, node.config, new_map, node.depth, new_data)
+    return create(node.store, node.config, new_map, node.depth, new_data)
 
 
 def hasher(iamap):

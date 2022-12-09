@@ -12,24 +12,30 @@ def bit_sequence(bytes_obj, start, length):
     for i in range(byte_count):
         local = bytes_obj[byte_start + i]
         shift = 0
-        local_bit_length = 9
+        local_bit_length = 8
 
         if i == 0:
             local_bit_length -= start_offset
-        
+
         if i == byte_count - 1:
             local_bit_length -= start_offset
             shift = end_offset
             local >>= shift
-        
+
         if local_bit_length < 8:
-            m = 1 << local_bit_length - 1
+            m = (1 << local_bit_length) - 1
             local &= m
-        
-        if shift < 8:
-            result = result << (8 - shift)
-        result |= local
+
+        if i < 3:
+            if shift < 8:
+                result = result << (8 - shift)
+            result |= local
+        else:
+            if shift < 8:
+                result = result * 2 ** (8 - shift)
+            result += local
     return result
+
 
 def mask_fun(hash_obj, depth, nbits):
     return bit_sequence(hash_obj, depth * nbits, nbits)
@@ -39,10 +45,10 @@ def mask_fun(hash_obj, depth, nbits):
 def set_bit(bitmap, position, to_set):
     byte = math.floor(position / 8)
     offset = position % 8
-    has = bitmap_has(bitmap, position, byte, offset)
-
+    has = bitmap_has(bitmap, None, byte, offset)
     # if we assume that `bitmap` is already the opposite of `set`, we could skip this check
     if (to_set and not has) or (not to_set and has):
+        new_bit_map = bytearray(bitmap)
         b = bitmap[byte]
         if to_set:
             b |= 1 << offset
@@ -50,20 +56,16 @@ def set_bit(bitmap, position, to_set):
             b ^= 1 << offset
 
         # since bytes are immutable, we need to change bytes to bytearrays
-        if type(bitmap) is bytes:
-            bitmap = bytearray(bitmap)
-
-        bitmap = bytearray(bitmap)
-        bitmap[byte] = b
-        return bitmap
-
+        new_bit_map[byte] = b
+        return bytes(new_bit_map)
     return bitmap
 
 
 # check whether `bitmap` has a `1` at the given `position` bit
 def bitmap_has(bitmap, position, byte=None, offset=None):
-    byte = math.floor(position / 8)
-    offset = position % 8
+    if position is not None:
+        byte = math.floor(position / 8)
+        offset = position % 8
     return ((bitmap[byte] >> offset) & 1) == 1
 
 
