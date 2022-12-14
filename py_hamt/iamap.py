@@ -1,48 +1,23 @@
 import typing
-from bit_utils import mask_fun, set_bit, bitmap_has, index, TextDecoder, TextEncoder
+from bit_utils import mask_fun, set_bit, bitmap_has, index, byte_compare
 import math
 from functools import cmp_to_key
-from multiformats import multihash
-
-"""
-WORK IN PROGRESS, NOT FINISHED
-
-This is based on https://github.com/rvagg/iamap/blob/master/iamap.js
-
-Currently, the bitswapping functionality (found in bit_utils.py) which is based on this (https://github.com/rvagg/iamap/blob/master/bit-utils.js) is done.
-
-The next step is creating all the functionality present in iamap.js. Mainly, finishing the IAMap primary class methods (get/set/delete). 
-
-The IAmap class methods, and related serializable functions in this file are unfinished. Some of the helper functions which are self-sufficient are finished,
-and these are commented with [#*] to indicate they are finished.
-"""
 
 # set defaults
-DEFAULT_BIT_WIDTH = 5  # 2^8 = 256 buckets or children per node
+DEFAULT_BIT_WIDTH = 8  # 2^8 = 256 buckets or children per node
 DEFAULT_BUCKET_SIZE = 5  # array size for a bucket of values
 
 DEFAULT_OPTIONS = {
     "bit_width": DEFAULT_BIT_WIDTH,
     "bucket_size": DEFAULT_BUCKET_SIZE,
-    "hash_alg": "murmur3-32",
+    "hash_alg": 0x23,
 }
-
-
-hasher_registry = {
-    "murmur3-32": {"hash_bytes": 4, "hasher": multihash.get("murmur3-32").digest}
-}
-text_encoder = TextEncoder()
-
-# *
-def register_hasher(hash_alg, hash_bytes):
-    hasher_registry[hash_alg] = {
-        "hash_bytes": hash_bytes,
-        "hasher": multihash.get(hash_alg).digest,
-    }
 
 
 class KV:
-    def __init__(self, key, value):
+    """Object representing a single key/value pair"""
+
+    def __init__(self, key: str, value):
         self.key = key
         self.value = value
 
@@ -56,9 +31,11 @@ class KV:
         return KV(obj[0], obj[1])
 
 
-# a element in the data array that each node holds, each element could be either a container of
-#  an array (bucket) of KVs or a link to a child node
 class Element:
+    """an element in the data array that each node holds, each element could be either a container of
+    an array (bucket) of KVs or a link to a child node
+    """
+
     def __init__(self, bucket: typing.List[KV] = None, link=None):
         assert bucket or link
         assert not (bucket and link)
@@ -69,7 +46,6 @@ class Element:
         if self.bucket is not None:
             return [c.to_serializable() for c in self.bucket]
         else:
-            # TODO add check for link type
             return self.link
 
     @staticmethod
@@ -80,32 +56,79 @@ class Element:
             return Element([KV.from_serializable(ele) for ele in obj])
 
 
-def create(store, options=DEFAULT_OPTIONS, map=None, depth=0, data=[]):
-    new_node = IAMap(store, options, map, depth, data)
+def create(
+    store,
+    options: dict = DEFAULT_OPTIONS,
+    map: typing.Optional[bytes] = None,
+    depth: int = 0,
+    data: typing.Optional[typing.List[Element]] = None,
+) -> "Hamt":
+    """Creates a Hamt and uses `save` to generate an id for it
+
+    Args:
+        store: backing store for new node
+        options (dict): Configuration for new node. Defaults to DEFAULT_OPTIONS.
+        map (typing.Optional[bytes]): bitmap used to quickly find keys. Defaults to None.
+        depth (int, optional): how deeply in the HAMT this node sits. Defaults to 0.
+        data (typing.Optional[typing.List[Element]], optional):
+            Elements representing all data stored in this node. Defaults to None.
+
+    Returns:
+        Hamt: Created and saved HAMT
+    """
+    new_node = Hamt(store, options, map, depth, data)
     return save(store, new_node)
 
 
-class IAMap(object):
-    # Create a new IAMap instance with a backing store
-    ## define create func https://stackoverflow.com/questions/33128325/how-to-set-class-attribute-with-in-init
+class Hamt:
+    hasher_registry = {}
+
+    @classmethod
+    def register_hasher(
+        cls, hash_alg: int, hash_bytes: int, hasher: typing.Callable[[str], bytes]
+    ):
+        """Register a hashing algorithm with the class
+
+        Args:
+            hash_alg (int): A multicodec
+                (see https://github.com/multiformats/multicodec/blob/master/table.csv)
+                hash function identifier  e.g. `0x23` for `murmur3-32`.
+            hash_bytes (int): The number of length of the `bytes` object returned by `hasher`
+            hasher (typing.Callable): Hash function that converts a string to bytes
+        """
+        if not isinstance(hash_alg, int):
+            raise TypeError("`hash_alg` should be of type `int`")
+        if not isinstance(hash_bytes, int):
+            raise TypeError("`hash_bytes` should be of type `int`")
+        if not callable(hasher):
+            raise TypeError("`hasher` should be a function")
+        cls.hasher_registry[hash_alg] = {"hash_bytes": hash_bytes, "hasher": hasher}
+
+    @classmethod
+    def hasher(cls, hamt: "Hamt") -> typing.Callable[[str], bytes]:
+        """Gets the hashing function corresponding to the hash_alg in config
+
+        Args:
+            hamt (Hamt): hamt for which the get the hasher
+
+        Returns:
+            typing.Callable: hasher stored in `hasher_registry`
+        """
+        return cls.hasher_registry[hamt.config["hash_alg"]]["hasher"]
+
     def __init__(
         self,
         store,
-        options={
-            "bit_width": DEFAULT_BIT_WIDTH,
-            "bucket_size": DEFAULT_BUCKET_SIZE,
-            "hash_alg": "murmur3-32",
-        },
-        map=None,
-        depth=0,
-        data=[],
+        options: dict = DEFAULT_OPTIONS,
+        map: typing.Optional[bytes] = None,
+        depth: int = 0,
+        data: typing.Optional[typing.List[Element]] = None,
     ):
         self.store = store
-        # in javascript, self.data is made immutable
-        for e in data:
+        self.data = data if data is not None else []
+        for e in self.data:
             if not isinstance(e, Element):
                 raise Exception("`data` array must contain only `Element` types")
-        self.data = data
 
         self.id = None
 
@@ -116,19 +139,32 @@ class IAMap(object):
         if map and map_length != len(map):
             raise Exception(f"`map` must be a bytes of length {map_length}")
 
-        self.map = map or bytes([0 for _ in range(map_length)])
+        self.map = map if map is not None else bytes([0 for _ in range(map_length)])
 
         self.depth = depth
 
-        self.config = build_config(options)
-        hash_bytes = hasher_registry[self.config["hash_alg"]]["hash_bytes"]
+        self.config = options
+        hash_bytes = self.hasher_registry[self.config["hash_alg"]]["hash_bytes"]
         if self.depth > math.floor((hash_bytes * 8) / self.config["bit_width"]):
             raise Exception("Overflow: maximum tree depth reached")
 
-    # Asynchronously create a new `IAMap` instance identical to this one but with `key` set to `value`.
-    def set(self, key, value, _cached_hash=None):
+    def set(
+        self, key: str, value, _cached_hash: typing.Optional[bytes] = None
+    ) -> "Hamt":
+        """Create a new `Hamt` instance identical to this one but with `key` set to `value`.
+
+        Args:
+            key (str): key used to locate value within Hamt
+            value: value to be placed at key
+            _cached_hash (typing.Optional[bytes], optional):
+                If key has already been hashed, cache it in this variable for use in recursion.
+                Defaults to None.
+
+        Returns:
+            Hamt: Instance of Hampt identical to `self` but with `key` set to `value`
+        """
         hashed_key = (
-            _cached_hash if _cached_hash is not None else hasher(self)(key)
+            _cached_hash if _cached_hash is not None else self.hasher(self)(key)
         )
         bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
@@ -136,7 +172,6 @@ class IAMap(object):
             if "data" in find_elem:
                 data = find_elem["data"]
                 if data["found"]:
-                    print("found, shouldn't be here")
                     if data["bucket_index"] is None or data["bucket_entry"] is None:
                         raise Exception("Unexpected error")
                     if data["bucket_entry"].value == value:
@@ -166,12 +201,24 @@ class IAMap(object):
         else:
             return add_new_element(self, bitpos, key, value)
 
-    # Asynchronously find and return a value for the given `key` if it exists within this `IAMap`.
-    def get(self, key, _cached_hash=None):
-        if not isinstance(key, bytes):
-            key = text_encoder.encode(key)
+    def get(self, key: str, _cached_hash: typing.Optional[bytes] = None):
+        """Find and return a value for the given `key` if it exists within this `Hamt`.
+        Raise KeyError otherwise
+
+        Args:
+            key (str): where to find value
+            _cached_hash (typing.Optional[bytes], optional):
+                If key has already been hashed, cache it in this variable for use in recursion.
+                Defaults to None.
+
+        Raises:
+            KeyError: Raised when `key` cannot be found in `self`
+
+        Returns:
+            value located at `key`
+        """
         hashed_key = (
-            _cached_hash if isinstance(_cached_hash, bytes) else hasher(self)(key)
+            _cached_hash if isinstance(_cached_hash, bytes) else self.hasher(self)(key)
         )
         bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
@@ -181,7 +228,7 @@ class IAMap(object):
                 if data["found"]:
                     return data["bucket_entry"].value
                 else:
-                    return None
+                    raise KeyError("not in hamt")
             elif "link" in find_elem:
                 link = find_elem["link"]
                 child = load(
@@ -192,43 +239,105 @@ class IAMap(object):
             else:
                 raise Exception("Neither link nor data found")
         else:
-            return None
+            raise KeyError("not in hamt")
 
-    def has(self, key):
-        return self.get(key) is not None
+    def has(self, key: str) -> bool:
+        """Determines whether hamt has `key`
 
-    # def delete(self, key):
-    #     if not isinstance(key, bytes):
-    #         key = text_encoder.encode(key)
-    #     pass
+        Args:
+            key (str)
+
+        Returns:
+            bool: whether hamt has `key`
+        """
+        try:
+            self.get(key)
+            return True
+        except KeyError:
+            return False
+
+    def size(self) -> int:
+        """Gets the total number of keys in the hamt
+
+        Returns:
+            int
+        """
+        c = 0
+        for e in self.data:
+            if e.bucket is not None:
+                c += len(e.bucket)
+            else:
+                child = load(self.store, e.link, self.depth + 1, self.config)
+                c += child.size()
+        return c
+
+    def keys(self) -> typing.Iterator[str]:
+        """Get iterator with all keys in hamt
+
+        Yields:
+            str: key
+        """
+        for e in self.data:
+            if e.bucket is not None:
+                for kv in e.bucket:
+                    yield kv.key
+            else:
+                child = load(self.store, e.link, self.depth + 1, self.config)
+                yield from child.keys()
+
+    def delete(self, key):
+        raise NotImplementedError
 
     @staticmethod
-    def is_iamap(node):
-        return isinstance(node, IAMap)
+    def is_hamt(node) -> bool:
+        return isinstance(node, Hamt)
 
     @staticmethod
-    def from_serializable(store, id, serializable, options, depth=0):
+    def from_serializable(
+        store, id, serializable: typing.Union[list, dict], options: dict, depth: int = 0
+    ) -> "Hamt":
+        """Generates a `Hamt` object from a serialized dict or list, which typically comes from
+        `Hamt.to_serializable`
+
+        Args:
+            store: backing store
+            id: id representing the entire node in the store
+            serializable (typing.Union[list, dict]): object generated from `to_serializable` to be turned
+                into a `Hamt` object
+            options (dict): Config for new hamt. Will be ignored if `serializable` is of depth 0
+                (and thus has its own options)
+            depth (int, optional): How deep in the hamt this node will sit. Defaults to 0.
+
+        Returns:
+            Hamt: node generated from `serializable`
+        """
         if depth == 0:
             if not is_root_serializable(serializable):
                 raise Exception(
-                    "Loaded  object does not appear to be an IAMap root (depth==0)"
+                    "Loaded  object does not appear to be an Hamt root (depth==0)"
                 )
-            # don't use passed-in options
+            # don't use passed-in options, since the object itself specifies options
             options = serializable_to_options(serializable)
             hamt = serializable["hamt"]
         else:
             if not is_serializable(serializable):
                 raise Exception(
-                    "Loaded object does not appear to be an IAMap node (depth>0)"
+                    "Loaded object does not appear to be an Hamt node (depth>0)"
                 )
             hamt = serializable
         data = [Element.from_serializable(store.is_link, ele) for ele in hamt[1]]
-        node = IAMap(store, options, hamt[0], depth, data)
+
+        node = Hamt(store, options, hamt[0], depth, data)
         if id is not None:
             node.id = id
         return node
 
-    def to_serializable(self):
+    def to_serializable(self) -> typing.Union[list, dict]:
+        """Turns hamt into serialized list or dict
+
+        Returns:
+            typing.Union[list, dict]: serialized version of the `self`
+        """
         data = [ele.to_serializable() for ele in self.data]
         hamt = [self.map, data]
         if self.depth != 0:
@@ -240,52 +349,58 @@ class IAMap(object):
             "hamt": hamt,
         }
 
-    def from_child_serializable(self, id, serializable, depth):
+    def from_child_serializable(
+        self, id, serializable: typing.Union[list, dict], depth: int
+    ):
+        """A convenience shortcut to `hamt.from_serializable` that uses this IAMap node
+        instance's backing `store` and configuration `options`. Intended to be used to instantiate
+        child IAMap nodes from a root IAMap node.
+
+        Args:
+            id: id for child
+            serializable (typing.Union[list, dict]):
+            depth (int): _description_
+
+        Returns:
+            _type_: _description_
+        """
         return self.from_serializable(self.store, id, serializable, self.config, depth)
 
-    def direct_entry_count(self):
+    def direct_entry_count(self) -> int:
         count = 0
         for ele in self.data:
             if ele.bucket:
                 count += len(ele.bucket)
         return count
 
-    def direct_node_count(self):
+    def direct_node_count(self) -> int:
         count = 0
         for ele in self.data:
             if ele.link:
                 count += 1
         return count
 
-    # def is_invariant(self):
-    #     size = self.size()
-    #     entry_arity = self.direct_entry_count()
-    #     node_arity = self.direct_node_count()
-    #     arity = entry_arity + node_arity
-    #     size_predicate = 2
-    #     if node_arity == 0:
-    #         size_predicate = min(2, entry_arity)
+    def is_invariant(self) -> bool:
+        size = self.size()
+        entry_arity = self.direct_entry_count()
+        node_arity = self.direct_node_count()
+        arity = entry_arity + node_arity
+        size_predicate = 2
+        if node_arity == 0:
+            size_predicate = min(2, entry_arity)
 
-    #     inv1 = size - entry_arity >= 2 * (arity - entry_arity)
-    #     # to do invars 2-4
-    #     inv5 = (
-    #         node_arity >= 0 and entry_arity >= 0 and (entry_arity + node_arity == arity)
-    #     )
+        inv1 = size - entry_arity >= 2 * (arity - entry_arity)
+        inv2 = size_predicate == 0 if arity == 0 else True
+        inv3 = size_predicate == 1 if (arity == 1 and entry_arity == 1) else True
+        inv4 = size_predicate == 2 if arity >= 2 else True
+        inv5 = (
+            node_arity >= 0 and entry_arity >= 0 and (entry_arity + node_arity == arity)
+        )
 
-    #     return inv1 and inv5
-
-    def size(self):
-        c = 0
-        for e in self.data:
-            if e.bucket is not None:
-                c += len(e.bucket)
-            else:
-                child = load(self.store, e.link, self.depth + 1, self.config)
-                c += child.size()
-        return c
+        return inv1 and inv2 and inv3 and inv4 and inv5
 
 
-def update_bucket(node: IAMap, element_at, bucket_at, key, value):
+def update_bucket(node: Hamt, element_at, bucket_at, key, value):
     old_element = node.data[element_at]
 
     if old_element.bucket is None:
@@ -305,8 +420,8 @@ def update_bucket(node: IAMap, element_at, bucket_at, key, value):
     return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-def replace_bucket_with_node(node: IAMap, element_at):
-    new_node = IAMap(node.store, node.config, None, node.depth + 1)
+def replace_bucket_with_node(node: Hamt, element_at):
+    new_node = Hamt(node.store, node.config, None, node.depth + 1)
     element = node.data[element_at]
     assert element
     if element.bucket is None:
@@ -320,7 +435,7 @@ def replace_bucket_with_node(node: IAMap, element_at):
     return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-def update_node(node: IAMap, element_at, new_child):
+def update_node(node: Hamt, element_at, new_child):
     assert new_child.id
     new_element = Element(None, new_child.id)
     new_data = list(node.data)
@@ -328,7 +443,7 @@ def update_node(node: IAMap, element_at, new_child):
     return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-def collapse_into_single_bucket(node: IAMap, hash, element_at, bucket_index):
+def collapse_into_single_bucket(node: Hamt, hash, element_at, bucket_index):
     new_map = set_bit(
         bytes([0 for _ in range(len(node.map))]),
         mask_fun(hash, 0, node.config["bit_width"]),
@@ -365,22 +480,6 @@ def remove_from_bucket(data, element_at, last_in_bucket, bucket_index):
     return new_data
 
 
-def build_config(options):
-    config = {}
-    if not isinstance(options["hash_alg"], str):
-        raise TypeError("Invalid hash_alg option")
-
-    if options["hash_alg"] not in hasher_registry:
-        raise Exception(f'Unkown "hash_alg": {options["hash_alg"]}')
-
-    config["hash_alg"] = options["hash_alg"]
-    # TODO: check bitwidth/buckketsize, for now just defaulting
-    config["bit_width"] = DEFAULT_BIT_WIDTH
-    config["bucket_size"] = DEFAULT_BUCKET_SIZE
-    return config
-
-
-# *
 def serializable_to_options(serializable):
     return {
         "hash_alg": serializable["hash_alg"],
@@ -410,7 +509,7 @@ def is_root_serializable(serializable):
     )
 
 
-def save(store, new_node: IAMap):
+def save(store, new_node: Hamt):
     id = store.save(new_node.to_serializable())
     new_node.id = id
     return new_node
@@ -420,7 +519,7 @@ def load(store, id, depth=0, options=None):
     if depth != 0 and not options:
         raise Exception("Cannot load() without options at depth > 0")
     serialized = store.load(id)
-    return IAMap.from_serializable(store, id, serialized, options, depth)
+    return Hamt.from_serializable(store, id, serialized, options, depth)
 
 
 def find_element(node, bitpos, key):
@@ -452,32 +551,9 @@ def find_element(node, bitpos, key):
     return {"link": {"element_at": element_at, "element": element}}
 
 
-def add_new_element(node: IAMap, bitpos, key, value):
+def add_new_element(node: Hamt, bitpos, key, value):
     insert_at = index(node.map, bitpos)
     new_data = list(node.data)
     new_data.insert(insert_at, Element([KV(key, value)]))
     new_map = set_bit(node.map, bitpos, True)
     return create(node.store, node.config, new_map, node.depth, new_data)
-
-
-def hasher(iamap):
-    return hasher_registry[iamap.config["hash_alg"]]["hasher"]
-
-
-def byte_compare(b1, b2):
-    if hasattr(b1, "key"):
-        b1 = b1.key
-    if hasattr(b2, "key"):
-        b2 = b2.key
-    x = len(b1)
-    y = len(b2)
-    for i in range(min(x, y)):
-        if b1[i] != b2[i]:
-            x = b1[i]
-            y = b2[i]
-            break
-    if x < y:
-        return -1
-    if x > y:
-        return 1
-    return 0

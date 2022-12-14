@@ -1,24 +1,9 @@
 import requests
 import dag_cbor
-from multiformats import CID
-import sys
 import cbor2
+from multiformats import CID
 
-sys.path.append("..")
-from iamap import create, TextEncoder, load, save
-
-
-def default_encoder(encoder, value):
-    encoder.encode(cbor2.CBORTag(42, b"\x00" + bytes(value)))
-
-
-def tag_hook(decoder, tag):
-    if tag.tag != 42:
-        return tag
-    return CID.decode(tag.value[1:])
-
-
-class IPFSStore:
+class HamtIPFSStore:
     def save(self, obj):
         obj = dag_cbor.encode(obj)
         res = requests.post(
@@ -29,7 +14,9 @@ class IPFSStore:
         res.raise_for_status()
         return CID.decode(res.json()["Cid"]["/"])
 
-    def load(self, id: CID):
+    def load(self, id):
+        if isinstance(id, cbor2.CBORTag):
+            id = CID.decode(id.value[1:])
         res = requests.post(
             "http://localhost:5001/api/v0/block/get", params={"arg": str(id)}
         )
@@ -41,29 +28,3 @@ class IPFSStore:
 
     def is_link(self, obj: CID):
         return isinstance(obj, CID) and obj.codec.name == "dag-cbor"
-
-
-store = IPFSStore()
-
-def add_all_keys(iamap):
-    kvs = {str(i): i for i in range(100, 200)}
-    for k in kvs:
-        iamap = iamap.set(k, kvs[k])
-    return iamap
-
-
-def main(store):
-    res = requests.post(
-        "http://localhost:5001/api/v0/block/get",
-        params={"arg": "bafyreif3v2k5ibkrtlu5db4qu2avvltlks7ocr6twddkp6saxqc3it5l3i"},
-    )   
-    d = cbor2.loads(res.content, tag_hook=tag_hook)
-    
-    iamap = create(store)
-    iamap = add_all_keys(iamap)
-
-    import ipdb; ipdb.set_trace()
-    # s = new_iamap.size()
-    # import ipdb; ipdb.set_trace()
-
-main(store)

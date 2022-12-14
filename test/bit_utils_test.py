@@ -1,10 +1,8 @@
 import sys
 
-sys.path.append("..")
-import bit_utils
+from py_hamt import bit_utils
 
 # mask_fun tests
-import ipdb; ipdb.set_trace()
 assert bit_utils.mask_fun(bytes([0b11111111]), 0, 5) == 0b11111
 assert bit_utils.mask_fun(bytes([0b10101010]), 0, 5) == 0b10101
 assert bit_utils.mask_fun(bytes([0b10000000]), 0, 5) == 0b10000
