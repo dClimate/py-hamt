@@ -1,5 +1,3 @@
-import sys
-
 from py_hamt import bit_utils
 
 # mask_fun tests
@@ -94,5 +92,4 @@ assert bit_utils.set_bit(
 assert bit_utils.set_bit(
     bytes([0b11000010, 0b11010010, 0b01001010, 0b0000001]), 24, 1
 ) == bytes(([0b11000010, 0b11010010, 0b01001010, 0b0000001]))
-# assert(bit_utils.set_bit(bytes([0b0, 0, 0, 0]), 31, 1)== bytes(([0b0, 0, 0, -0b10000000]))) commenting this out for now, don't know how to interpret negative byte, python doesn't know either
 print("all tests passed")

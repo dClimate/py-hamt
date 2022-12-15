@@ -3,6 +3,7 @@ import dag_cbor
 import cbor2
 from multiformats import CID
 
+
 class HamtIPFSStore:
     def save(self, obj):
         obj = dag_cbor.encode(obj)

@@ -1,5 +1,5 @@
 import typing
-from bit_utils import mask_fun, set_bit, bitmap_has, index, byte_compare
+from py_hamt.bit_utils import mask_fun, set_bit, bitmap_has, index
 import math
 from functools import cmp_to_key
 
@@ -351,7 +351,7 @@ class Hamt:
 
     def from_child_serializable(
         self, id, serializable: typing.Union[list, dict], depth: int
-    ):
+    ) -> "Hamt":
         """A convenience shortcut to `hamt.from_serializable` that uses this IAMap node
         instance's backing `store` and configuration `options`. Intended to be used to instantiate
         child IAMap nodes from a root IAMap node.
@@ -367,6 +367,11 @@ class Hamt:
         return self.from_serializable(self.store, id, serializable, self.config, depth)
 
     def direct_entry_count(self) -> int:
+        """Count the number of direct children of the node (not links)
+
+        Returns:
+            int: number of direct children of the node
+        """
         count = 0
         for ele in self.data:
             if ele.bucket:
@@ -374,6 +379,11 @@ class Hamt:
         return count
 
     def direct_node_count(self) -> int:
+        """Count the number of children of the node that are also Hamt
+
+        Returns:
+            int: number of child links for this node
+        """
         count = 0
         for ele in self.data:
             if ele.link:
@@ -381,6 +391,15 @@ class Hamt:
         return count
 
     def is_invariant(self) -> bool:
+        """Asynchronously perform a check on this node and its children that it is in
+        canonical format for the current data. As this uses `size()` to calculate the total
+        number of entries in this node and its children, it performs a full
+        scan of nodes and therefore incurs a load and deserialisation cost for each child node.
+        A `false` result from this method suggests a flaw in the implemetation.
+
+        Returns:
+            bool: whether the tree is in it canonical form
+        """
         size = self.size()
         entry_arity = self.direct_entry_count()
         node_arity = self.direct_node_count()
@@ -400,7 +419,22 @@ class Hamt:
         return inv1 and inv2 and inv3 and inv4 and inv5
 
 
-def update_bucket(node: Hamt, element_at, bucket_at, key, value):
+def update_bucket(node: Hamt, element_at: int, bucket_at: int, key, value) -> Hamt:
+    """Modify bucket with new key/value
+
+    Args:
+        node (Hamt): node containing bucket to update
+        element_at (int): index of element containing bucket to update
+        bucket_at (int): index of kv within bucket to update. When -1,
+            append to bucket then sort. Otherwise, update bucket at this index,
+            meaning that `key` already exists within bucket
+        key: key to set
+        value: value corresponding to key
+
+    Returns:
+        Hamt: Node with key set to value through bucket update
+    """
+
     old_element = node.data[element_at]
 
     if old_element.bucket is None:
@@ -420,7 +454,16 @@ def update_bucket(node: Hamt, element_at, bucket_at, key, value):
     return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-def replace_bucket_with_node(node: Hamt, element_at):
+def replace_bucket_with_node(node: Hamt, element_at: int) -> Hamt:
+    """Bucket has overflowed and needs to be replaced with a node
+
+    Args:
+        node (Hamt): parent of bucket that has overflowed
+        element_at (int): index of element containing overflowing bucket
+
+    Returns:
+        Hamt: Hamt with bucket replaced with child node
+    """
     new_node = Hamt(node.store, node.config, None, node.depth + 1)
     element = node.data[element_at]
     assert element
@@ -435,7 +478,17 @@ def replace_bucket_with_node(node: Hamt, element_at):
     return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-def update_node(node: Hamt, element_at, new_child):
+def update_node(node: Hamt, element_at: int, new_child: Hamt) -> Hamt:
+    """Update a child node
+
+    Args:
+        node (Hamt): parent to update
+        element_at (int): index of element at which to insert child
+        new_child (Hamt): child to update with
+
+    Returns:
+        Hamt: New Hamt with child node updated at the given index
+    """
     assert new_child.id
     new_element = Element(None, new_child.id)
     new_data = list(node.data)
@@ -444,6 +497,7 @@ def update_node(node: Hamt, element_at, new_child):
 
 
 def collapse_into_single_bucket(node: Hamt, hash, element_at, bucket_index):
+    # Function used in delete, will be fleshed out when this functionality is added
     new_map = set_bit(
         bytes([0 for _ in range(len(node.map))]),
         mask_fun(hash, 0, node.config["bit_width"]),
@@ -469,6 +523,7 @@ def collapse_into_single_bucket(node: Hamt, hash, element_at, bucket_index):
 
 
 def remove_from_bucket(data, element_at, last_in_bucket, bucket_index):
+    # Function used in delete, will be fleshed out when this functionality is added
     new_data = list(data)
     if not last_in_bucket:
         old_element = data[element_at]
@@ -480,17 +535,33 @@ def remove_from_bucket(data, element_at, last_in_bucket, bucket_index):
     return new_data
 
 
-def serializable_to_options(serializable):
+def serializable_to_options(serializable: dict) -> dict:
+    """Turn serialized node into configs that can be passed into Hamt as options
+
+    Args:
+        serializable (dict): Serialized node
+
+    Returns:
+        dict: Options generated for serialized node
+    """
     return {
         "hash_alg": serializable["hash_alg"],
-        "bit_width": math.log2(
-            len(serializable["hamt"][0]) * 8
+        "bit_width": int(
+            math.log2(len(serializable["hamt"][0]) * 8)
         ),  # inverse of (2**bit_width) / 8
         "bucket_size": serializable["bucket_size"],
     }
 
 
-def is_serializable(serializable):
+def is_serializable(serializable: typing.Union[dict, list]) -> bool:
+    """Check if `serializable` is a valid serialized Hamt
+
+    Args:
+        serializable (typing.Union[dict, list]): Serialized object to test
+
+    Returns:
+        bool: whether object is valid hamt
+    """
     if isinstance(serializable, list):
         return (
             len(serializable) == 2
@@ -500,29 +571,68 @@ def is_serializable(serializable):
     return is_root_serializable(serializable)
 
 
-def is_root_serializable(serializable):
+def is_root_serializable(serializable: dict) -> bool:
+    """Whether `serializable` is the serialized root of a Hamt
+
+    Args:
+        serializable (dict): object to check
+
+    Returns:
+        bool: whether object is serialized root
+    """
     return (
         isinstance(serializable, dict)
-        and isinstance(serializable.get("hash_alg"), str)
+        and isinstance(serializable.get("hash_alg"), int)
         and isinstance(serializable["hamt"], list)
         and is_serializable(serializable["hamt"])
     )
 
 
-def save(store, new_node: Hamt):
+def save(store, new_node: Hamt) -> Hamt:
+    """Save a Hamt `new_node` to the store, giving it an id
+
+    Args:
+        store: backing store
+        new_node (Hamt): node to save to store
+
+    Returns:
+        Hamt: node with store-generated id attached
+    """
     id = store.save(new_node.to_serializable())
     new_node.id = id
     return new_node
 
 
-def load(store, id, depth=0, options=None):
+def load(store, id, depth: int = 0, options: typing.Optional[dict] = None) -> Hamt:
+    """Use id to load a node from the store
+
+    Args:
+        store: backing store
+        id: id to load from store
+        depth (int, optional): Depth at which node sits in tree. Defaults to 0.
+        options (typing.Optional[dict], optional): config to be passed into Hamt constructor.
+            Defaults to None.
+
+        Hamt: node loaded from store
+    """
     if depth != 0 and not options:
         raise Exception("Cannot load() without options at depth > 0")
     serialized = store.load(id)
     return Hamt.from_serializable(store, id, serialized, options, depth)
 
 
-def find_element(node, bitpos, key):
+def find_element(node: Hamt, bitpos: int, key) -> dict:
+    """Find a key within bucket or link in element located at bitpos
+
+    Args:
+        node (Hamt): node to search
+        bitpos (int): bitpos within node used to find element
+        key: key to locate
+
+    Returns:
+        dict: dict representing whether the key was found, whether it was found in a link
+            or bucket and where to locate the key within the bucket
+    """
     element_at = index(node.map, bitpos)
     element = node.data[element_at]
     if element.bucket:
@@ -551,9 +661,49 @@ def find_element(node, bitpos, key):
     return {"link": {"element_at": element_at, "element": element}}
 
 
-def add_new_element(node: Hamt, bitpos, key, value):
+def add_new_element(node: Hamt, bitpos: int, key, value) -> Hamt:
+    """Insert a new element containing a bucket with a single kv into node
+
+    Args:
+        node (Hamt): node in which to insert element
+        bitpos (int): location of element within bitmap
+        key: key to add
+        value: value
+
+    Returns:
+        Hamt: Node with element inserted
+    """
     insert_at = index(node.map, bitpos)
     new_data = list(node.data)
     new_data.insert(insert_at, Element([KV(key, value)]))
     new_map = set_bit(node.map, bitpos, True)
     return create(node.store, node.config, new_map, node.depth, new_data)
+
+
+def byte_compare(b1: typing.Union[bytes, KV], b2: typing.Union[bytes, KV]) -> int:
+    """Compare bytes/keys for use in sorting function
+
+    Args:
+        b1 (typing.Union[bytes, KV]): first byte/key to compare
+        b2 (typing.Union[bytes, KV]): second byte/key to compare
+
+    Returns:
+        int: 1 if b1 > b2, -1 if b2 > b1, 0 if b1 == b2
+    """
+    if hasattr(b1, "key"):
+        b1 = b1.key
+    if hasattr(b2, "key"):
+        b2 = b2.key
+    x = len(b1)
+    y = len(b2)
+    for i in range(min(x, y)):
+        if b1[i] != b2[i]:
+            if b1[i] < b2[i]:
+                return -1
+            if b1[i] > b2[i]:
+                return 1
+    if x < y:
+        return -1
+    if x > y:
+        return 1
+    return 0

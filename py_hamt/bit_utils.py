@@ -134,22 +134,3 @@ def index(bitmap: bytes, position: int) -> int:
         if bitmap_has(bitmap, i):
             t += 1
     return t
-    
-def byte_compare(b1, b2):
-    if hasattr(b1, "key"):
-        b1 = b1.key
-    if hasattr(b2, "key"):
-        b2 = b2.key
-    x = len(b1)
-    y = len(b2)
-    for i in range(min(x, y)):
-        if b1[i] != b2[i]:
-            if b1[i] < b2[i]:
-                return -1
-            if b1[i] > b2[i]:
-                return 1
-    if x < y:
-        return -1
-    if x > y:
-        return 1
-    return 0
