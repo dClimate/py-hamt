@@ -94,7 +94,6 @@ def set_bit(bitmap: bytes, position: int, to_set: bool) -> bytes:
     return bitmap
 
 
-#
 def bitmap_has(
     bitmap: bytes,
     position: typing.Optional[int],
@@ -107,7 +106,7 @@ def bitmap_has(
     Args:
         bitmap (bytes): bytes to check
         position (typing.Optional[int]): Position of bit to modify
-        byte (typing.Optional[int], optional): byte postition to modify. Byte to None.
+        byte (typing.Optional[int], optional): byte postition to modify. Defaults to None.
         offset (typing.Optional[int], optional) Defaults to None.
 
     Returns:

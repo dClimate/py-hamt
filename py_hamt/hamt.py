@@ -93,7 +93,7 @@ class Hamt:
             hash_alg (int): A multicodec
                 (see https://github.com/multiformats/multicodec/blob/master/table.csv)
                 hash function identifier  e.g. `0x23` for `murmur3-32`.
-            hash_bytes (int): The number of length of the `bytes` object returned by `hasher`
+            hash_bytes (int): The length of the `bytes` object returned by `hasher`
             hasher (typing.Callable): Hash function that converts a string to bytes
         """
         if not isinstance(hash_alg, int):
@@ -161,7 +161,7 @@ class Hamt:
                 Defaults to None.
 
         Returns:
-            Hamt: Instance of Hampt identical to `self` but with `key` set to `value`
+            Hamt: Instance of Hamt identical to `self` but with `key` set to `value`
         """
         hashed_key = (
             _cached_hash if _cached_hash is not None else self.hasher(self)(key)
@@ -391,14 +391,14 @@ class Hamt:
         return count
 
     def is_invariant(self) -> bool:
-        """Asynchronously perform a check on this node and its children that it is in
+        """Perform a check on this node and its children that it is in
         canonical format for the current data. As this uses `size()` to calculate the total
         number of entries in this node and its children, it performs a full
         scan of nodes and therefore incurs a load and deserialisation cost for each child node.
         A `false` result from this method suggests a flaw in the implemetation.
 
         Returns:
-            bool: whether the tree is in it canonical form
+            bool: whether the tree is in its canonical form
         """
         size = self.size()
         entry_arity = self.direct_entry_count()
