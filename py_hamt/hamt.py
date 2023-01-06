@@ -56,7 +56,7 @@ class Element:
             return Element([KV.from_serializable(ele) for ele in obj])
 
 
-def create(
+async def create(
     store,
     options: dict = DEFAULT_OPTIONS,
     map: typing.Optional[bytes] = None,
@@ -77,7 +77,7 @@ def create(
         Hamt: Created and saved HAMT
     """
     new_node = Hamt(store, options, map, depth, data)
-    return save(store, new_node)
+    return await save(store, new_node)
 
 
 class Hamt:
@@ -148,7 +148,7 @@ class Hamt:
         if self.depth > math.floor((hash_bytes * 8) / self.config["bit_width"]):
             raise Exception("Overflow: maximum tree depth reached")
 
-    def set(
+    async def set(
         self, key: str, value, _cached_hash: typing.Optional[bytes] = None
     ) -> "Hamt":
         """Create a new `Hamt` instance identical to this one but with `key` set to `value`.
@@ -185,8 +185,7 @@ class Hamt:
                     )
                 else:
                     if len(data["element"].bucket) >= self.config["bucket_size"]:
-                        new_map = replace_bucket_with_node(self, data["element_at"])
-                        return new_map.set(key, value, hashed_key)
+                        return (await replace_bucket_with_node(self, data["element_at"])).set(key, value, hashed_key)
                     return update_bucket(self, data["element_at"], -1, key, value)
             elif "link" in find_elem:
                 link = find_elem["link"]
@@ -194,14 +193,14 @@ class Hamt:
                     self.store, link["element"].link, self.depth + 1, self.config
                 )
                 assert child
-                new_child = child.set(key, value, hashed_key)
+                new_child = await child.set(key, value, hashed_key)
                 return update_node(self, link["element_at"], new_child)
             else:
                 raise Exception("Neither link nor data found")
         else:
             return add_new_element(self, bitpos, key, value)
 
-    def get(self, key: str, _cached_hash: typing.Optional[bytes] = None):
+    async def get(self, key: str, _cached_hash: typing.Optional[bytes] = None):
         """Find and return a value for the given `key` if it exists within this `Hamt`.
         Raise KeyError otherwise
 
@@ -231,17 +230,17 @@ class Hamt:
                     raise KeyError("not in hamt")
             elif "link" in find_elem:
                 link = find_elem["link"]
-                child = load(
+                child = await load(
                     self.store, link["element"].link, self.depth + 1, self.config
                 )
                 assert child
-                return child.get(key, hashed_key)
+                return await child.get(key, hashed_key)
             else:
                 raise Exception("Neither link nor data found")
         else:
             raise KeyError("not in hamt")
 
-    def has(self, key: str) -> bool:
+    async def has(self, key: str) -> bool:
         """Determines whether hamt has `key`
 
         Args:
@@ -251,12 +250,12 @@ class Hamt:
             bool: whether hamt has `key`
         """
         try:
-            self.get(key)
+            await self.get(key)
             return True
         except KeyError:
             return False
 
-    def size(self) -> int:
+    async def size(self) -> int:
         """Gets the total number of keys in the hamt
 
         Returns:
@@ -267,11 +266,11 @@ class Hamt:
             if e.bucket is not None:
                 c += len(e.bucket)
             else:
-                child = load(self.store, e.link, self.depth + 1, self.config)
+                child = await load(self.store, e.link, self.depth + 1, self.config)
                 c += child.size()
         return c
 
-    def keys(self) -> typing.Iterator[str]:
+    async def keys(self) -> typing.Iterator[str]:
         """Get iterator with all keys in hamt
 
         Yields:
@@ -283,7 +282,8 @@ class Hamt:
                     yield kv.key
             else:
                 child = load(self.store, e.link, self.depth + 1, self.config)
-                yield from child.keys()
+                async for key in child.keys():
+                    yield key
 
     def delete(self, key):
         raise NotImplementedError
@@ -390,7 +390,7 @@ class Hamt:
                 count += 1
         return count
 
-    def is_invariant(self) -> bool:
+    async def is_invariant(self) -> bool:
         """Perform a check on this node and its children that it is in
         canonical format for the current data. As this uses `size()` to calculate the total
         number of entries in this node and its children, it performs a full
@@ -400,7 +400,7 @@ class Hamt:
         Returns:
             bool: whether the tree is in its canonical form
         """
-        size = self.size()
+        size = await self.size()
         entry_arity = self.direct_entry_count()
         node_arity = self.direct_node_count()
         arity = entry_arity + node_arity
@@ -419,7 +419,7 @@ class Hamt:
         return inv1 and inv2 and inv3 and inv4 and inv5
 
 
-def update_bucket(node: Hamt, element_at: int, bucket_at: int, key, value) -> Hamt:
+async def update_bucket(node: Hamt, element_at: int, bucket_at: int, key, value) -> Hamt:
     """Modify bucket with new key/value
 
     Args:
@@ -454,7 +454,7 @@ def update_bucket(node: Hamt, element_at: int, bucket_at: int, key, value) -> Ha
     return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-def replace_bucket_with_node(node: Hamt, element_at: int) -> Hamt:
+async def replace_bucket_with_node(node: Hamt, element_at: int) -> Hamt:
     """Bucket has overflowed and needs to be replaced with a node
 
     Args:
@@ -471,14 +471,14 @@ def replace_bucket_with_node(node: Hamt, element_at: int) -> Hamt:
         raise Exception("Expected element with bucket")
 
     for c in element.bucket:
-        new_node = new_node.set(c.key, c.value)
-    new_node = save(node.store, new_node)
+        new_node = await new_node.set(c.key, c.value)
+    new_node = await save(node.store, new_node)
     new_data = list(node.data)
     new_data[element_at] = Element(None, new_node.id)
     return create(node.store, node.config, node.map, node.depth, new_data)
 
 
-def update_node(node: Hamt, element_at: int, new_child: Hamt) -> Hamt:
+async def update_node(node: Hamt, element_at: int, new_child: Hamt) -> Hamt:
     """Update a child node
 
     Args:
@@ -588,7 +588,7 @@ def is_root_serializable(serializable: dict) -> bool:
     )
 
 
-def save(store, new_node: Hamt) -> Hamt:
+async def save(store, new_node: Hamt) -> Hamt:
     """Save a Hamt `new_node` to the store, giving it an id
 
     Args:
@@ -598,12 +598,12 @@ def save(store, new_node: Hamt) -> Hamt:
     Returns:
         Hamt: node with store-generated id attached
     """
-    id = store.save(new_node.to_serializable())
+    id = await store.save(new_node.to_serializable())
     new_node.id = id
     return new_node
 
 
-def load(store, id, depth: int = 0, options: typing.Optional[dict] = None) -> Hamt:
+async def load(store, id, depth: int = 0, options: typing.Optional[dict] = None) -> Hamt:
     """Use id to load a node from the store
 
     Args:
@@ -617,7 +617,7 @@ def load(store, id, depth: int = 0, options: typing.Optional[dict] = None) -> Ha
     """
     if depth != 0 and not options:
         raise Exception("Cannot load() without options at depth > 0")
-    serialized = store.load(id)
+    serialized = await store.load(id)
     return Hamt.from_serializable(store, id, serialized, options, depth)
 
 
@@ -661,7 +661,7 @@ def find_element(node: Hamt, bitpos: int, key) -> dict:
     return {"link": {"element_at": element_at, "element": element}}
 
 
-def add_new_element(node: Hamt, bitpos: int, key, value) -> Hamt:
+async def add_new_element(node: Hamt, bitpos: int, key, value) -> Hamt:
     """Insert a new element containing a bucket with a single kv into node
 
     Args:
