@@ -176,7 +176,7 @@ class Hamt:
                         raise Exception("Unexpected error")
                     if data["bucket_entry"].value == value:
                         return self
-                    return update_bucket(
+                    return await update_bucket(
                         self,
                         data["element_at"],
                         data["bucket_index"],
@@ -186,7 +186,7 @@ class Hamt:
                 else:
                     if len(data["element"].bucket) >= self.config["bucket_size"]:
                         return (await replace_bucket_with_node(self, data["element_at"])).set(key, value, hashed_key)
-                    return update_bucket(self, data["element_at"], -1, key, value)
+                    return await update_bucket(self, data["element_at"], -1, key, value)
             elif "link" in find_elem:
                 link = find_elem["link"]
                 child = load(
@@ -194,11 +194,11 @@ class Hamt:
                 )
                 assert child
                 new_child = await child.set(key, value, hashed_key)
-                return update_node(self, link["element_at"], new_child)
+                return await update_node(self, link["element_at"], new_child)
             else:
                 raise Exception("Neither link nor data found")
         else:
-            return add_new_element(self, bitpos, key, value)
+            return await add_new_element(self, bitpos, key, value)
 
     async def get(self, key: str, _cached_hash: typing.Optional[bytes] = None):
         """Find and return a value for the given `key` if it exists within this `Hamt`.
