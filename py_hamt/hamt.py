@@ -189,7 +189,7 @@ class Hamt:
                     return await update_bucket(self, data["element_at"], -1, key, value)
             elif "link" in find_elem:
                 link = find_elem["link"]
-                child = load(
+                child = await load(
                     self.store, link["element"].link, self.depth + 1, self.config
                 )
                 assert child
