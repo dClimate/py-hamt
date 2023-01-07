@@ -185,7 +185,7 @@ class Hamt:
                     )
                 else:
                     if len(data["element"].bucket) >= self.config["bucket_size"]:
-                        return (await replace_bucket_with_node(self, data["element_at"])).set(key, value, hashed_key)
+                        return await (await replace_bucket_with_node(self, data["element_at"])).set(key, value, hashed_key)
                     return await update_bucket(self, data["element_at"], -1, key, value)
             elif "link" in find_elem:
                 link = find_elem["link"]
