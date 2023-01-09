@@ -54,6 +54,8 @@ class Element:
             return Element(None, obj)
         elif isinstance(obj, list):
             return Element([KV.from_serializable(ele) for ele in obj])
+        else:
+            raise Exception("element is neither link nor list")
 
 
 async def create(
@@ -451,7 +453,7 @@ async def update_bucket(node: Hamt, element_at: int, bucket_at: int, key, value)
 
     new_data = list(node.data)
     new_data[element_at] = new_element
-    return create(node.store, node.config, node.map, node.depth, new_data)
+    return await create(node.store, node.config, node.map, node.depth, new_data)
 
 
 async def replace_bucket_with_node(node: Hamt, element_at: int) -> Hamt:
@@ -475,7 +477,7 @@ async def replace_bucket_with_node(node: Hamt, element_at: int) -> Hamt:
     new_node = await save(node.store, new_node)
     new_data = list(node.data)
     new_data[element_at] = Element(None, new_node.id)
-    return create(node.store, node.config, node.map, node.depth, new_data)
+    return await create(node.store, node.config, node.map, node.depth, new_data)
 
 
 async def update_node(node: Hamt, element_at: int, new_child: Hamt) -> Hamt:
@@ -493,7 +495,7 @@ async def update_node(node: Hamt, element_at: int, new_child: Hamt) -> Hamt:
     new_element = Element(None, new_child.id)
     new_data = list(node.data)
     new_data[element_at] = new_element
-    return create(node.store, node.config, node.map, node.depth, new_data)
+    return await create(node.store, node.config, node.map, node.depth, new_data)
 
 
 def collapse_into_single_bucket(node: Hamt, hash, element_at, bucket_index):
@@ -677,7 +679,7 @@ async def add_new_element(node: Hamt, bitpos: int, key, value) -> Hamt:
     new_data = list(node.data)
     new_data.insert(insert_at, Element([KV(key, value)]))
     new_map = set_bit(node.map, bitpos, True)
-    return create(node.store, node.config, new_map, node.depth, new_data)
+    return await create(node.store, node.config, new_map, node.depth, new_data)
 
 
 def byte_compare(b1: typing.Union[bytes, KV], b2: typing.Union[bytes, KV]) -> int:
