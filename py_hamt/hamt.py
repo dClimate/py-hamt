@@ -283,7 +283,7 @@ class Hamt:
                 for kv in e.bucket:
                     yield kv.key
             else:
-                child = load(self.store, e.link, self.depth + 1, self.config)
+                child = await load(self.store, e.link, self.depth + 1, self.config)
                 async for key in child.keys():
                     yield key
 
