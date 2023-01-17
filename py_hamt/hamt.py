@@ -285,6 +285,18 @@ class Hamt:
                 child = load(self.store, e.link, self.depth + 1, self.config)
                 yield from child.keys()
 
+    def ids(self) -> typing.Iterator[str]:
+        """Get iterator with all ids in hamt
+
+        Yields:
+            str: id
+        """
+        yield self.id
+        for e in self.data:
+            if e.link:
+                child = load(self.store, e.link, self.depth + 1, self.config)
+                yield from child.ids()
+
     def delete(self, key):
         raise NotImplementedError
 
