@@ -39,14 +39,10 @@ def bit_sequence(bytes_obj: bytes, start: int, length: int) -> int:
             m = (1 << local_bit_length) - 1
             local &= m
 
-        if i < 3:
-            if shift < 8:
-                result = result << (8 - shift)
-            result |= local
-        else:
-            if shift < 8:
-                result = result * 2 ** (8 - shift)
-            result += local
+        if shift < 8:
+            result = result << (8 - shift)
+        result |= local
+
     return result
 
 
