@@ -1,29 +1,29 @@
 import math
-import typing
 
 
-def bit_sequence(bytes_obj: bytes, start: int, length: int) -> int:
-    """Given a bytes-like object (i.e. an array of 8-bit integers),
-    extract an arbitrary sequence of the underlying bits and convert
-    them into an unsigned integer value
-    Adapted from https://github.com/rvagg/bit-sequence
+def mask_fun(hash_obj: bytes, depth: int, nbits: int) -> int:
+    """Extract `nbits` bits from `hash_obj`, beginning at position `depth * nbits`,
+    and convert them into an unsigned integer value.
+
     Args:
-        bytes_obj (bytes): bytes-like object from which to extract bits
-        start (int):  an integer bit index to start extraction (not a byte index)
-        length (int):  is the number of bits to extract from `bytes_obj`
+        hash_obj (bytes): binary hash to extract bit sequence from
+        depth (int): depth of the node containing the hash
+        nbits (int): bit width of hash
 
     Returns:
         int: An unsigned integer version of the bit sequence
     """
+    start = depth * nbits
     start_offset = start % 8
-    byte_count = math.ceil((start_offset + length) / 8)
+
+    byte_count = math.ceil((start_offset + nbits) / 8)
     byte_start = start >> 3
-    end_offset = byte_count * 8 - length - start_offset
+    end_offset = byte_count * 8 - nbits - start_offset
 
     result = 0
 
     for i in range(byte_count):
-        local = bytes_obj[byte_start + i]
+        local = hash_obj[byte_start + i]
         shift = 0
         local_bit_length = 8
 
@@ -46,21 +46,6 @@ def bit_sequence(bytes_obj: bytes, start: int, length: int) -> int:
     return result
 
 
-def mask_fun(hash_obj: bytes, depth: int, nbits: int) -> int:
-    """Helper function that calls `bit_sequence` with specific start and length
-    that are functions of characteristics of the hamt
-
-    Args:
-        hash_obj (bytes): binary hash to extract bit sequence from
-        depth (int): depth of the node containing the hash
-        nbits (int): bit width of hash
-
-    Returns:
-        int: _description_
-    """
-    return bit_sequence(hash_obj, depth * nbits, nbits)
-
-
 def set_bit(bitmap: bytes, position: int, to_set: bool) -> bytes:
     """set the `position` bit in the given `bitmap` to be `to_set` (truthy=1, falsey=0)
 
@@ -72,9 +57,9 @@ def set_bit(bitmap: bytes, position: int, to_set: bool) -> bytes:
     Returns:
         bytes: Modified bitmap
     """
+    has = bitmap_has(bitmap, position)
     byte = math.floor(position / 8)
     offset = position % 8
-    has = bitmap_has(bitmap, None, byte, offset)
     # if we assume that `bitmap` is already the opposite of `set`, we could skip this check
     if (to_set and not has) or (not to_set and has):
         new_bit_map = bytearray(bitmap)
@@ -92,34 +77,28 @@ def set_bit(bitmap: bytes, position: int, to_set: bool) -> bytes:
 
 def bitmap_has(
     bitmap: bytes,
-    position: typing.Optional[int],
-    byte: typing.Optional[int] = None,
-    offset: typing.Optional[int] = None,
+    position: int,
 ) -> bool:
-    """check whether `bitmap` has a `1` at the given `position` bit. If `position`
-    is `None`, intead caclulate position using a `byte` position and an `offset`
+    """check whether `bitmap` has a `1` at the given `position` bit.
 
     Args:
         bitmap (bytes): bytes to check
-        position (typing.Optional[int]): Position of bit to modify
-        byte (typing.Optional[int], optional): byte postition to modify. Defaults to None.
-        offset (typing.Optional[int], optional) Defaults to None.
+        position (int): Position of bit to read
 
     Returns:
-        bool: _description_
+        bool: whether the `bitmap` has a 1 value at the `position` bit
     """
-    if position is not None:
-        byte = math.floor(position / 8)
-        offset = position % 8
+    byte = math.floor(position / 8)
+    offset = position % 8
     return ((bitmap[byte] >> offset) & 1) == 1
 
 
-def index(bitmap: bytes, position: int) -> int:
+def rank(bitmap: bytes, position: int) -> int:
     """count how many `1` bits are in `bitmap` up until `position`
     tells us where in the compacted element array an element should live
     Args:
         bitmap (bytes): bitmap to count truthy bits on
-        position (int): where to stop coutning
+        position (int): where to stop counting
 
     Returns:
         int: how many bits are `1` in `bitmap`

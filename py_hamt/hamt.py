@@ -1,5 +1,5 @@
 import typing
-from py_hamt.bit_utils import mask_fun, set_bit, bitmap_has, index
+from py_hamt.bit_utils import mask_fun, set_bit, bitmap_has, rank
 import math
 from functools import cmp_to_key
 
@@ -36,7 +36,7 @@ class Element:
     an array (bucket) of KVs or a link to a child node
     """
 
-    def __init__(self, bucket: typing.List[KV] = None, link=None):
+    def __init__(self, bucket: typing.Optional[typing.List[KV]] = None, link=None):
         assert bucket or link
         assert not (bucket and link)
         self.bucket = bucket  # should be array of KV's
@@ -81,7 +81,7 @@ def create(
 
 
 class Hamt:
-    hasher_registry = {}
+    hasher_registry: typing.Dict[int, typing.Dict] = {}
 
     @classmethod
     def register_hasher(
@@ -103,18 +103,6 @@ class Hamt:
         if not callable(hasher):
             raise TypeError("`hasher` should be a function")
         cls.hasher_registry[hash_alg] = {"hash_bytes": hash_bytes, "hasher": hasher}
-
-    @classmethod
-    def hasher(cls, hamt: "Hamt") -> typing.Callable[[str], bytes]:
-        """Gets the hashing function corresponding to the hash_alg in config
-
-        Args:
-            hamt (Hamt): hamt for which the get the hasher
-
-        Returns:
-            typing.Callable: hasher stored in `hasher_registry`
-        """
-        return cls.hasher_registry[hamt.config["hash_alg"]]["hasher"]
 
     def __init__(
         self,
@@ -148,6 +136,13 @@ class Hamt:
         if self.depth > math.floor((hash_bytes * 8) / self.config["bit_width"]):
             raise Exception("Overflow: maximum tree depth reached")
 
+    def hasher(self) -> typing.Callable[[str], bytes]:
+        """Gets the hashing function corresponding to the hash_alg in config
+        Returns:
+            typing.Callable: hasher stored in `hasher_registry`
+        """
+        return self.hasher_registry[self.config["hash_alg"]]["hasher"]
+
     def set(
         self, key: str, value, _cached_hash: typing.Optional[bytes] = None
     ) -> "Hamt":
@@ -164,11 +159,11 @@ class Hamt:
             Hamt: Instance of Hamt identical to `self` but with `key` set to `value`
         """
         hashed_key = (
-            _cached_hash if _cached_hash is not None else self.hasher(self)(key)
+            _cached_hash if _cached_hash is not None else self.hasher()(key)
         )
         bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
-            find_elem = find_element(self, bitpos, key)
+            find_elem = self.find_element(bitpos, key)
             if "data" in find_elem:
                 data = find_elem["data"]
                 if data["found"]:
@@ -176,8 +171,7 @@ class Hamt:
                         raise Exception("Unexpected error")
                     if data["bucket_entry"].value == value:
                         return self
-                    return update_bucket(
-                        self,
+                    return self.update_bucket(
                         data["element_at"],
                         data["bucket_index"],
                         key,
@@ -185,9 +179,9 @@ class Hamt:
                     )
                 else:
                     if len(data["element"].bucket) >= self.config["bucket_size"]:
-                        new_map = replace_bucket_with_node(self, data["element_at"])
+                        new_map = self.replace_bucket_with_node(data["element_at"])
                         return new_map.set(key, value, hashed_key)
-                    return update_bucket(self, data["element_at"], -1, key, value)
+                    return self.update_bucket(data["element_at"], -1, key, value)
             elif "link" in find_elem:
                 link = find_elem["link"]
                 child = load(
@@ -195,11 +189,11 @@ class Hamt:
                 )
                 assert child
                 new_child = child.set(key, value, hashed_key)
-                return update_node(self, link["element_at"], new_child)
+                return self.update_node(link["element_at"], new_child)
             else:
                 raise Exception("Neither link nor data found")
         else:
-            return add_new_element(self, bitpos, key, value)
+            return self.add_new_element(bitpos, key, value)
 
     def get(self, key: str, _cached_hash: typing.Optional[bytes] = None):
         """Find and return a value for the given `key` if it exists within this `Hamt`.
@@ -218,11 +212,11 @@ class Hamt:
             value located at `key`
         """
         hashed_key = (
-            _cached_hash if isinstance(_cached_hash, bytes) else self.hasher(self)(key)
+            _cached_hash if isinstance(_cached_hash, bytes) else self.hasher()(key)
         )
         bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
-            find_elem = find_element(self, bitpos, key)
+            find_elem = self.find_element(bitpos, key)
             if "data" in find_elem:
                 data = find_elem["data"]
                 if data["found"]:
@@ -240,6 +234,9 @@ class Hamt:
                 raise Exception("Neither link nor data found")
         else:
             raise KeyError("not in hamt")
+
+    def delete(self, key):
+        raise NotImplementedError
 
     def has(self, key: str) -> bool:
         """Determines whether hamt has `key`
@@ -285,11 +282,11 @@ class Hamt:
                 child = load(self.store, e.link, self.depth + 1, self.config)
                 yield from child.keys()
 
-    def ids(self) -> typing.Iterator[str]:
+    def ids(self):
         """Get iterator with all ids in hamt
 
         Yields:
-            str: id
+            id
         """
         yield self.id
         for e in self.data:
@@ -297,8 +294,132 @@ class Hamt:
                 child = load(self.store, e.link, self.depth + 1, self.config)
                 yield from child.ids()
 
-    def delete(self, key):
-        raise NotImplementedError
+    def update_bucket(self, element_at: int, bucket_at: int, key, value) -> "Hamt":
+        """Modify bucket with new key/value
+
+        Args:
+            element_at (int): index of element containing bucket to update
+            bucket_at (int): index of kv within bucket to update. When -1,
+                append to bucket then sort. Otherwise, update bucket at this index,
+                meaning that `key` already exists within bucket
+            key: key to set
+            value: value corresponding to key
+
+        Returns:
+            Hamt: Node with key set to value through bucket update
+        """
+
+        old_element = self.data[element_at]
+
+        if old_element.bucket is None:
+            raise Exception("Expected element with bucket")
+
+        new_element = Element(list(old_element.bucket))
+        new_kv = KV(key, value)
+
+        if bucket_at == -1:
+            new_element.bucket.append(new_kv)
+            new_element.bucket.sort(key=cmp_to_key(byte_compare))
+        else:
+            new_element.bucket[bucket_at] = new_kv
+
+        new_data = list(self.data)
+        new_data[element_at] = new_element
+        return create(self.store, self.config, self.map, self.depth, new_data)
+
+    def find_element(self, bitpos: int, key) -> dict:
+        """Find a key within bucket or link in element located at bitpos
+
+        Args:
+            bitpos (int): bitpos within node used to find element
+            key: key to locate
+
+        Returns:
+            dict: dict representing whether the key was found, whether it was found in a link
+                or bucket and where to locate the key within the bucket
+        """
+        element_at = rank(self.map, bitpos)
+        element = self.data[element_at]
+        if element.bucket:
+            for bucket_index in range(len(element.bucket)):
+                bucket_entry = element.bucket[bucket_index]
+                if byte_compare(bucket_entry.key, key) == 0:
+                    return {
+                        "data": {
+                            "found": True,
+                            "element_at": element_at,
+                            "element": element,
+                            "bucket_index": bucket_index,
+                            "bucket_entry": bucket_entry,
+                        }
+                    }
+            return {
+                "data": {
+                    "found": False,
+                    "element_at": element_at,
+                    "element": element,
+                    "bucket_index": None,
+                    "bucket_entry": None,
+                }
+            }
+        assert element.link
+        return {"link": {"element_at": element_at, "element": element}}
+
+    def update_node(self, element_at: int, new_child: "Hamt") -> "Hamt":
+        """Update a child node
+
+        Args:
+            element_at (int): index of element at which to insert child
+            new_child (Hamt): child to update with
+
+        Returns:
+            Hamt: New Hamt with child node updated at the given index
+        """
+        assert new_child.id
+        new_element = Element(None, new_child.id)
+        new_data = list(self.data)
+        new_data[element_at] = new_element
+        return create(self.store, self.config, self.map, self.depth, new_data)
+
+    def replace_bucket_with_node(self, element_at: int) -> "Hamt":
+        """Bucket has overflowed and needs to be replaced with a node
+
+        Args:
+            node (Hamt): parent of bucket that has overflowed
+            element_at (int): index of element containing overflowing bucket
+
+        Returns:
+            Hamt: Hamt with bucket replaced with child node
+        """
+        new_node = Hamt(self.store, self.config, None, self.depth + 1)
+        element = self.data[element_at]
+        assert element
+        if element.bucket is None:
+            raise Exception("Expected element with bucket")
+
+        for c in element.bucket:
+            new_node = new_node.set(c.key, c.value)
+        new_node = save(self.store, new_node)
+        new_data = list(self.data)
+        new_data[element_at] = Element(None, new_node.id)
+        return create(self.store, self.config, self.map, self.depth, new_data)
+
+    def add_new_element(self, bitpos: int, key, value) -> "Hamt":
+        """Insert a new element containing a bucket with a single kv into node
+
+        Args:
+            bitpos (int): location of element within bitmap
+            key: key to add
+            value: value
+
+        Returns:
+            Hamt: Node with element inserted
+        """
+        insert_at = rank(self.map, bitpos)
+        new_data = list(self.data)
+        new_data.insert(insert_at, Element([KV(key, value)]))
+        new_map = set_bit(self.map, bitpos, True)
+        return create(self.store, self.config, new_map, self.depth, new_data)
 
     @staticmethod
     def is_hamt(node) -> bool:
@@ -306,7 +427,7 @@ class Hamt:
 
     @staticmethod
     def from_serializable(
-        store, id, serializable: typing.Union[list, dict], options: dict, depth: int = 0
+        store, id, serializable: typing.Union[list, dict], options: typing.Optional[dict], depth: int = 0
     ) -> "Hamt":
         """Generates a `Hamt` object from a serialized dict or list, which typically comes from
         `Hamt.to_serializable`
@@ -374,7 +495,7 @@ class Hamt:
             depth (int): _description_
 
         Returns:
-            _type_: _description_
+            Hamt: new HAMT generated from serializable object
         """
         return self.from_serializable(self.store, id, serializable, self.config, depth)
 
@@ -431,123 +552,7 @@ class Hamt:
         return inv1 and inv2 and inv3 and inv4 and inv5
 
 
-def update_bucket(node: Hamt, element_at: int, bucket_at: int, key, value) -> Hamt:
-    """Modify bucket with new key/value
-
-    Args:
-        node (Hamt): node containing bucket to update
-        element_at (int): index of element containing bucket to update
-        bucket_at (int): index of kv within bucket to update. When -1,
-            append to bucket then sort. Otherwise, update bucket at this index,
-            meaning that `key` already exists within bucket
-        key: key to set
-        value: value corresponding to key
-
-    Returns:
-        Hamt: Node with key set to value through bucket update
-    """
-
-    old_element = node.data[element_at]
-
-    if old_element.bucket is None:
-        raise Exception("Expected element with bucket")
-
-    new_element = Element(list(old_element.bucket))
-    new_kv = KV(key, value)
-
-    if bucket_at == -1:
-        new_element.bucket.append(new_kv)
-        new_element.bucket.sort(key=cmp_to_key(byte_compare))
-    else:
-        new_element.bucket[bucket_at] = new_kv
-
-    new_data = list(node.data)
-    new_data[element_at] = new_element
-    return create(node.store, node.config, node.map, node.depth, new_data)
-
-
-def replace_bucket_with_node(node: Hamt, element_at: int) -> Hamt:
-    """Bucket has overflowed and needs to be replaced with a node
-
-    Args:
-        node (Hamt): parent of bucket that has overflowed
-        element_at (int): index of element containing overflowing bucket
-
-    Returns:
-        Hamt: Hamt with bucket replaced with child node
-    """
-    new_node = Hamt(node.store, node.config, None, node.depth + 1)
-    element = node.data[element_at]
-    assert element
-    if element.bucket is None:
-        raise Exception("Expected element with bucket")
-
-    for c in element.bucket:
-        new_node = new_node.set(c.key, c.value)
-    new_node = save(node.store, new_node)
-    new_data = list(node.data)
-    new_data[element_at] = Element(None, new_node.id)
-    return create(node.store, node.config, node.map, node.depth, new_data)
-
-
-def update_node(node: Hamt, element_at: int, new_child: Hamt) -> Hamt:
-    """Update a child node
-
-    Args:
-        node (Hamt): parent to update
-        element_at (int): index of element at which to insert child
-        new_child (Hamt): child to update with
-
-    Returns:
-        Hamt: New Hamt with child node updated at the given index
-    """
-    assert new_child.id
-    new_element = Element(None, new_child.id)
-    new_data = list(node.data)
-    new_data[element_at] = new_element
-    return create(node.store, node.config, node.map, node.depth, new_data)
-
-
-def collapse_into_single_bucket(node: Hamt, hash, element_at, bucket_index):
-    # Function used in delete, will be fleshed out when this functionality is added
-    new_map = set_bit(
-        bytes([0 for _ in range(len(node.map))]),
-        mask_fun(hash, 0, node.config["bit_width"]),
-        True,
-    )
-    new_bucket = []
-    for i, c in enumerate(node.data):
-        if i == element_at:
-            if c.bucket is None:
-                raise Exception("Expected bucket")
-            if len(c.bucket) != 1:
-                # remove bucket we're collapsing
-                temp_bucket = list(c.bucket)
-                del temp_bucket[bucket_index]
-                new_bucket += temp_bucket
-        else:
-            if c.bucket is None:
-                raise Exception("Expected bucket")
-            new_bucket += c.bucket
-    new_bucket.sort(key=cmp_to_key(byte_compare))
-    new_element = Element(new_bucket)
-    return create(node.store, node.config, new_map, 0, new_element)
-
-
-def remove_from_bucket(data, element_at, last_in_bucket, bucket_index):
-    # Function used in delete, will be fleshed out when this functionality is added
-    new_data = list(data)
-    if not last_in_bucket:
-        old_element = data[element_at]
-        new_element = Element(list(old_element))
-        del new_element.bucket[bucket_index]
-        new_data[element_at] = new_element
-    else:
-        del new_data[element_at]
-    return new_data
-
-
-def serializable_to_options(serializable: dict) -> dict:
+def serializable_to_options(serializable: typing.Union[dict, list]) -> dict:
     """Turn serialized node into configs that can be passed into Hamt as options
 
     Args:
@@ -583,7 +588,7 @@ def is_serializable(serializable: typing.Union[dict, list]) -> bool:
     return is_root_serializable(serializable)
 
 
-def is_root_serializable(serializable: dict) -> bool:
+def is_root_serializable(serializable: typing.Union[dict, list]) -> bool:
     """Whether `serializable` is the serialized root of a Hamt
 
     Args:
@@ -633,66 +638,7 @@ def load(store, id, depth: int = 0, options: typing.Optional[dict] = None) -> Ha
     return Hamt.from_serializable(store, id, serialized, options, depth)
 
 
-def find_element(node: Hamt, bitpos: int, key) -> dict:
-    """Find a key within bucket or link in element located at bitpos
-
-    Args:
-        node (Hamt): node to search
-        bitpos (int): bitpos within node used to find element
-        key: key to locate
-
-    Returns:
-        dict: dict representing whether the key was found, whether it was found in a link
-            or bucket and where to locate the key within the bucket
-    """
-    element_at = index(node.map, bitpos)
-    element = node.data[element_at]
-    if element.bucket:
-        for bucket_index in range(len(element.bucket)):
-            bucket_entry = element.bucket[bucket_index]
-            if byte_compare(bucket_entry.key, key) == 0:
-                return {
-                    "data": {
-                        "found": True,
-                        "element_at": element_at,
-                        "element": element,
-                        "bucket_index": bucket_index,
-                        "bucket_entry": bucket_entry,
-                    }
-                }
-        return {
-            "data": {
-                "found": False,
-                "element_at": element_at,
-                "element": element,
-                "bucket_index": None,
-                "bucket_entry": None,
-            }
-        }
-    assert element.link
-    return {"link": {"element_at": element_at, "element": element}}
-
-
-def add_new_element(node: Hamt, bitpos: int, key, value) -> Hamt:
-    """Insert a new element containing a bucket with a single kv into node
-
-    Args:
-        node (Hamt): node in which to insert element
-        bitpos (int): location of element within bitmap
-        key: key to add
-        value: value
-
-    Returns:
-        Hamt: Node with element inserted
-    """
-    insert_at = index(node.map, bitpos)
-    new_data = list(node.data)
-    new_data.insert(insert_at, Element([KV(key, value)]))
-    new_map = set_bit(node.map, bitpos, True)
-    return create(node.store, node.config, new_map, node.depth, new_data)
-
-
-def byte_compare(b1: typing.Union[bytes, KV], b2: typing.Union[bytes, KV]) -> int:
+def byte_compare(b1: typing.Union[bytes, str, KV], b2: typing.Union[bytes, str, KV]) -> int:
     """Compare bytes/keys for use in sorting function
 
     Args:

@@ -21,20 +21,20 @@ assert bit_utils.bitmap_has(bytes([0b00100000]), 5)
 print("bitmap_has tests passed")
 
 # index tests
-assert bit_utils.index(bytes([0b111111]), 0) == 0
-assert bit_utils.index(bytes([0b111111]), 1) == 1
-assert bit_utils.index(bytes([0b111111]), 2) == 2
-assert bit_utils.index(bytes([0b111111]), 4) == 4
-assert bit_utils.index(bytes([0b111100]), 2) == 0
-assert bit_utils.index(bytes([0b111101]), 4) == 3
-assert bit_utils.index(bytes([0b111001]), 4) == 2
-assert bit_utils.index(bytes([0b111000]), 4) == 1
-assert bit_utils.index(bytes([0b110000]), 4) == 0
+assert bit_utils.rank(bytes([0b111111]), 0) == 0
+assert bit_utils.rank(bytes([0b111111]), 1) == 1
+assert bit_utils.rank(bytes([0b111111]), 2) == 2
+assert bit_utils.rank(bytes([0b111111]), 4) == 4
+assert bit_utils.rank(bytes([0b111100]), 2) == 0
+assert bit_utils.rank(bytes([0b111101]), 4) == 3
+assert bit_utils.rank(bytes([0b111001]), 4) == 2
+assert bit_utils.rank(bytes([0b111000]), 4) == 1
+assert bit_utils.rank(bytes([0b110000]), 4) == 0
 # new node, no bitmask_fun, insertion at the start
-assert bit_utils.index(bytes([0b000000]), 0) == 0
-assert bit_utils.index(bytes([0b000000]), 1) == 0
-assert bit_utils.index(bytes([0b000000]), 2) == 0
-assert bit_utils.index(bytes([0b000000]), 3) == 0
+assert bit_utils.rank(bytes([0b000000]), 0) == 0
+assert bit_utils.rank(bytes([0b000000]), 1) == 0
+assert bit_utils.rank(bytes([0b000000]), 2) == 0
+assert bit_utils.rank(bytes([0b000000]), 3) == 0
 print("index tests passed")
 
 # set_bit tests
