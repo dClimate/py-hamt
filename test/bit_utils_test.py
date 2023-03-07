@@ -1,10 +1,10 @@
 from py_hamt import bit_utils
 
 # mask_fun tests
-assert bit_utils.mask_fun(bytes([0b11111111]), 0, 5) == 0b11111
-assert bit_utils.mask_fun(bytes([0b10101010]), 0, 5) == 0b10101
-assert bit_utils.mask_fun(bytes([0b10000000]), 0, 5) == 0b10000
-assert bit_utils.mask_fun(bytes([0b00010000]), 0, 5) == 0b00010
+assert bit_utils.extract_bits(bytes([0b11111111]), 0, 5) == 0b11111
+assert bit_utils.extract_bits(bytes([0b10101010]), 0, 5) == 0b10101
+assert bit_utils.extract_bits(bytes([0b10000000]), 0, 5) == 0b10000
+assert bit_utils.extract_bits(bytes([0b00010000]), 0, 5) == 0b00010
 
 # bitmap_has tests
 assert not bit_utils.bitmap_has(bytes([0b0]), 0)

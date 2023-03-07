@@ -1,7 +1,7 @@
 import math
 
 
-def mask_fun(hash_obj: bytes, depth: int, nbits: int) -> int:
+def extract_bits(hash_obj: bytes, depth: int, nbits: int) -> int:
     """Extract `nbits` bits from `hash_obj`, beginning at position `depth * nbits`,
     and convert them into an unsigned integer value.
 

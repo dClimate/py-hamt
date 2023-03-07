@@ -1,5 +1,5 @@
 import typing
-from py_hamt.bit_utils import mask_fun, set_bit, bitmap_has, rank
+from py_hamt.bit_utils import extract_bits, set_bit, bitmap_has, rank
 import math
 from functools import cmp_to_key
 
@@ -56,30 +56,6 @@ class Element:
             return Element([KV.from_serializable(ele) for ele in obj])
 
 
-def create(
-    store,
-    options: dict = DEFAULT_OPTIONS,
-    map: typing.Optional[bytes] = None,
-    depth: int = 0,
-    data: typing.Optional[typing.List[Element]] = None,
-) -> "Hamt":
-    """Creates a Hamt and uses `save` to generate an id for it
-
-    Args:
-        store: backing store for new node
-        options (dict): Configuration for new node. Defaults to DEFAULT_OPTIONS.
-        map (typing.Optional[bytes]): bitmap used to quickly find keys. Defaults to None.
-        depth (int, optional): how deeply in the HAMT this node sits. Defaults to 0.
-        data (typing.Optional[typing.List[Element]], optional):
-            Elements representing all data stored in this node. Defaults to None.
-
-    Returns:
-        Hamt: Created and saved HAMT
-    """
-    new_node = Hamt(store, options, map, depth, data)
-    return save(store, new_node)
-
-
 class Hamt:
     hasher_registry: typing.Dict[int, typing.Dict] = {}
 
@@ -103,6 +79,31 @@ class Hamt:
         if not callable(hasher):
             raise TypeError("`hasher` should be a function")
         cls.hasher_registry[hash_alg] = {"hash_bytes": hash_bytes, "hasher": hasher}
+
+    @classmethod
+    def create(
+        cls,
+        store,
+        options: dict = DEFAULT_OPTIONS,
+        map: typing.Optional[bytes] = None,
+        depth: int = 0,
+        data: typing.Optional[typing.List[Element]] = None,
+    ) -> "Hamt":
+        """Creates a Hamt and uses `save` to generate an id for it
+
+        Args:
+            store: backing store for new node
+            options (dict): Configuration for new node. Defaults to DEFAULT_OPTIONS.
+            map (typing.Optional[bytes]): bitmap used to quickly find keys. Defaults to None.
+            depth (int, optional): how deeply in the HAMT this node sits. Defaults to 0.
+            data (typing.Optional[typing.List[Element]], optional):
+                Elements representing all data stored in this node. Defaults to None.
+
+        Returns:
+            Hamt: Created and saved HAMT
+        """
+        new_node = cls(store, options, map, depth, data)
+        return save(store, new_node)
 
     def __init__(
         self,
@@ -161,7 +162,7 @@ class Hamt:
         hashed_key = (
             _cached_hash if _cached_hash is not None else self.hasher()(key)
         )
-        bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
+        bitpos = extract_bits(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
             find_elem = self.find_element(bitpos, key)
             if "data" in find_elem:
@@ -214,7 +215,7 @@ class Hamt:
         hashed_key = (
             _cached_hash if isinstance(_cached_hash, bytes) else self.hasher()(key)
         )
-        bitpos = mask_fun(hashed_key, self.depth, self.config["bit_width"])
+        bitpos = extract_bits(hashed_key, self.depth, self.config["bit_width"])
         if bitmap_has(self.map, bitpos):
             find_elem = self.find_element(bitpos, key)
             if "data" in find_elem:
@@ -325,7 +326,7 @@ class Hamt:
 
         new_data = list(self.data)
         new_data[element_at] = new_element
-        return create(self.store, self.config, self.map, self.depth, new_data)
+        return self.create(self.store, self.config, self.map, self.depth, new_data)
 
     def find_element(self, bitpos: int, key) -> dict:
         """Find a key within bucket or link in element located at bitpos
@@ -379,7 +380,7 @@ class Hamt:
         new_element = Element(None, new_child.id)
         new_data = list(self.data)
         new_data[element_at] = new_element
-        return create(self.store, self.config, self.map, self.depth, new_data)
+        return self.create(self.store, self.config, self.map, self.depth, new_data)
 
     def replace_bucket_with_node(self, element_at: int) -> "Hamt":
         """Bucket has overflowed and needs to be replaced with a node
@@ -402,7 +403,7 @@ class Hamt:
         new_node = save(self.store, new_node)
         new_data = list(self.data)
         new_data[element_at] = Element(None, new_node.id)
-        return create(self.store, self.config, self.map, self.depth, new_data)
+        return self.create(self.store, self.config, self.map, self.depth, new_data)
 
     def add_new_element(self, bitpos: int, key, value) -> "Hamt":
         """Insert a new element containing a bucket with a single kv into node
@@ -419,7 +420,7 @@ class Hamt:
         new_data = list(self.data)
         new_data.insert(insert_at, Element([KV(key, value)]))
         new_map = set_bit(self.map, bitpos, True)
-        return create(self.store, self.config, new_map, self.depth, new_data)
+        return self.create(self.store, self.config, new_map, self.depth, new_data)
 
     @staticmethod
     def is_hamt(node) -> bool:
