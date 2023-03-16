@@ -7,17 +7,18 @@ from functools import cmp_to_key
 DEFAULT_BIT_WIDTH = 8  # 2^8 = 256 buckets or children per node
 DEFAULT_BUCKET_SIZE = 5  # array size for a bucket of values
 
+# Using camelCase here to allign with the spec
 DEFAULT_OPTIONS = {
-    "bit_width": DEFAULT_BIT_WIDTH,
-    "bucket_size": DEFAULT_BUCKET_SIZE,
-    "hash_alg": 0x23,
+    "bitWidth": DEFAULT_BIT_WIDTH,
+    "bucketSize": DEFAULT_BUCKET_SIZE,
+    "hashAlg": 0x23,
 }
 
 
 class KV:
     """Object representing a single key/value pair"""
 
-    def __init__(self, key: str, value):
+    def __init__(self, key: bytes, value):
         self.key = key
         self.value = value
 
@@ -61,7 +62,7 @@ class Hamt:
 
     @classmethod
     def register_hasher(
-        cls, hash_alg: int, hash_bytes: int, hasher: typing.Callable[[str], bytes]
+        cls, hash_alg: int, hash_bytes: int, hasher: typing.Callable[[bytes], bytes]
     ):
         """Register a hashing algorithm with the class
 
@@ -123,7 +124,7 @@ class Hamt:
 
         if map and not isinstance(map, bytes):
             raise TypeError("map must be bytes")
-        map_length = math.ceil(2 ** options["bit_width"] / 8)
+        map_length = math.ceil(2 ** options["bitWidth"] / 8)
 
         if map and map_length != len(map):
             raise Exception(f"`map` must be a bytes of length {map_length}")
@@ -133,24 +134,24 @@ class Hamt:
         self.depth = depth
 
         self.config = options
-        hash_bytes = self.hasher_registry[self.config["hash_alg"]]["hash_bytes"]
-        if self.depth > math.floor((hash_bytes * 8) / self.config["bit_width"]):
+        hash_bytes = self.hasher_registry[self.config["hashAlg"]]["hash_bytes"]
+        if self.depth > math.floor((hash_bytes * 8) / self.config["bitWidth"]):
             raise Exception("Overflow: maximum tree depth reached")
 
-    def hasher(self) -> typing.Callable[[str], bytes]:
+    def hasher(self) -> typing.Callable[[bytes], bytes]:
         """Gets the hashing function corresponding to the hash_alg in config
         Returns:
             typing.Callable: hasher stored in `hasher_registry`
         """
-        return self.hasher_registry[self.config["hash_alg"]]["hasher"]
+        return self.hasher_registry[self.config["hashAlg"]]["hasher"]
 
     def set(
-        self, key: str, value, _cached_hash: typing.Optional[bytes] = None
+        self, key: typing.Union[str, bytes], value, _cached_hash: typing.Optional[bytes] = None
     ) -> "Hamt":
         """Create a new `Hamt` instance identical to this one but with `key` set to `value`.
 
         Args:
-            key (str): key used to locate value within Hamt
+            key (typing.Union[str, bytes]): key used to locate value within Hamt
             value: value to be placed at key
             _cached_hash (typing.Optional[bytes], optional):
                 If key has already been hashed, cache it in this variable for use in recursion.
@@ -159,10 +160,12 @@ class Hamt:
         Returns:
             Hamt: Instance of Hamt identical to `self` but with `key` set to `value`
         """
+        if not isinstance(key, bytes):
+            key = key.encode("utf-8")
         hashed_key = (
             _cached_hash if _cached_hash is not None else self.hasher()(key)
         )
-        bitpos = extract_bits(hashed_key, self.depth, self.config["bit_width"])
+        bitpos = extract_bits(hashed_key, self.depth, self.config["bitWidth"])
         if bitmap_has(self.map, bitpos):
             find_elem = self.find_element(bitpos, key)
             if "data" in find_elem:
@@ -179,7 +182,7 @@ class Hamt:
                         value,
                     )
                 else:
-                    if len(data["element"].bucket) >= self.config["bucket_size"]:
+                    if len(data["element"].bucket) >= self.config["bucketSize"]:
                         new_map = self.replace_bucket_with_node(data["element_at"])
                         return new_map.set(key, value, hashed_key)
                     return self.update_bucket(data["element_at"], -1, key, value)
@@ -196,12 +199,12 @@ class Hamt:
         else:
             return self.add_new_element(bitpos, key, value)
 
-    def get(self, key: str, _cached_hash: typing.Optional[bytes] = None):
+    def get(self, key: typing.Union[str, bytes], _cached_hash: typing.Optional[bytes] = None):
         """Find and return a value for the given `key` if it exists within this `Hamt`.
         Raise KeyError otherwise
 
         Args:
-            key (str): where to find value
+            key (typing.Union[str, bytes]): where to find value
             _cached_hash (typing.Optional[bytes], optional):
                 If key has already been hashed, cache it in this variable for use in recursion.
                 Defaults to None.
@@ -212,10 +215,13 @@ class Hamt:
         Returns:
             value located at `key`
         """
+        if not isinstance(key, bytes):
+            key = key.encode("utf-8")
+
         hashed_key = (
             _cached_hash if isinstance(_cached_hash, bytes) else self.hasher()(key)
         )
-        bitpos = extract_bits(hashed_key, self.depth, self.config["bit_width"])
+        bitpos = extract_bits(hashed_key, self.depth, self.config["bitWidth"])
         if bitmap_has(self.map, bitpos):
             find_elem = self.find_element(bitpos, key)
             if "data" in find_elem:
@@ -239,11 +245,11 @@ class Hamt:
     def delete(self, key):
         raise NotImplementedError
 
-    def has(self, key: str) -> bool:
+    def has(self, key: typing.Union[str, bytes]) -> bool:
         """Determines whether hamt has `key`
 
         Args:
-            key (str)
+            key (typing.Union[str, bytes])
 
         Returns:
             bool: whether hamt has `key`
@@ -273,7 +279,7 @@ class Hamt:
         """Get iterator with all keys in hamt
 
         Yields:
-            str: key
+            bytes: key
         """
         for e in self.data:
             if e.bucket is not None:
@@ -478,8 +484,8 @@ class Hamt:
             return hamt
 
         return {
-            "hash_alg": self.config["hash_alg"],
-            "bucket_size": self.config["bucket_size"],
+            "hashAlg": self.config["hashAlg"],
+            "bucketSize": self.config["bucketSize"],
             "hamt": hamt,
         }
 
@@ -563,11 +569,11 @@ def serializable_to_options(serializable: typing.Union[dict, list]) -> dict:
         dict: Options generated for serialized node
     """
     return {
-        "hash_alg": serializable["hash_alg"],
-        "bit_width": int(
+        "hashAlg": serializable["hashAlg"],
+        "bitWidth": int(
             math.log2(len(serializable["hamt"][0]) * 8)
-        ),  # inverse of (2**bit_width) / 8
-        "bucket_size": serializable["bucket_size"],
+        ),  # inverse of (2**bitWidth) / 8
+        "bucketSize": serializable["bucketSize"],
     }
 
 
@@ -600,7 +606,7 @@ def is_root_serializable(serializable: typing.Union[dict, list]) -> bool:
     """
     return (
         isinstance(serializable, dict)
-        and isinstance(serializable.get("hash_alg"), int)
+        and isinstance(serializable.get("hashAlg"), int)
         and isinstance(serializable["hamt"], list)
         and is_serializable(serializable["hamt"])
     )
