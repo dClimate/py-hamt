@@ -62,24 +62,24 @@ class Hamt:
 
     @classmethod
     def register_hasher(
-        cls, hashAlg: int, hash_bytes: int, hasher: typing.Callable[[bytes], bytes]
+        cls, hash_alg: int, hash_bytes: int, hasher: typing.Callable[[bytes], bytes]
     ):
         """Register a hashing algorithm with the class
 
         Args:
-            hashAlg (int): A multicodec
+            hash_alg (int): A multicodec
                 (see https://github.com/multiformats/multicodec/blob/master/table.csv)
                 hash function identifier  e.g. `0x23` for `murmur3-32`.
             hash_bytes (int): The length of the `bytes` object returned by `hasher`
             hasher (typing.Callable): Hash function that converts a string to bytes
         """
-        if not isinstance(hashAlg, int):
-            raise TypeError("`hashAlg` should be of type `int`")
+        if not isinstance(hash_alg, int):
+            raise TypeError("`hash_alg` should be of type `int`")
         if not isinstance(hash_bytes, int):
             raise TypeError("`hash_bytes` should be of type `int`")
         if not callable(hasher):
             raise TypeError("`hasher` should be a function")
-        cls.hasher_registry[hashAlg] = {"hash_bytes": hash_bytes, "hasher": hasher}
+        cls.hasher_registry[hash_alg] = {"hash_bytes": hash_bytes, "hasher": hasher}
 
     @classmethod
     def create(
@@ -139,19 +139,19 @@ class Hamt:
             raise Exception("Overflow: maximum tree depth reached")
 
     def hasher(self) -> typing.Callable[[bytes], bytes]:
-        """Gets the hashing function corresponding to the hashAlg in config
+        """Gets the hashing function corresponding to the hash_alg in config
         Returns:
             typing.Callable: hasher stored in `hasher_registry`
         """
         return self.hasher_registry[self.config["hashAlg"]]["hasher"]
 
     def set(
-        self, key: str or bytes, value, _cached_hash: typing.Optional[bytes] = None
+        self, key: typing.Union[str, bytes], value, _cached_hash: typing.Optional[bytes] = None
     ) -> "Hamt":
         """Create a new `Hamt` instance identical to this one but with `key` set to `value`.
 
         Args:
-            key (str or bytes): key used to locate value within Hamt
+            key (typing.Union[str, bytes]): key used to locate value within Hamt
             value: value to be placed at key
             _cached_hash (typing.Optional[bytes], optional):
                 If key has already been hashed, cache it in this variable for use in recursion.
@@ -199,12 +199,12 @@ class Hamt:
         else:
             return self.add_new_element(bitpos, key, value)
 
-    def get(self, key: str or bytes, _cached_hash: typing.Optional[bytes] = None):
+    def get(self, key: typing.Union[str, bytes], _cached_hash: typing.Optional[bytes] = None):
         """Find and return a value for the given `key` if it exists within this `Hamt`.
         Raise KeyError otherwise
 
         Args:
-            key (str or bytes): where to find value
+            key (typing.Union[str, bytes]): where to find value
             _cached_hash (typing.Optional[bytes], optional):
                 If key has already been hashed, cache it in this variable for use in recursion.
                 Defaults to None.
@@ -245,11 +245,11 @@ class Hamt:
     def delete(self, key):
         raise NotImplementedError
 
-    def has(self, key: str or bytes) -> bool:
+    def has(self, key: typing.Union[str, bytes]) -> bool:
         """Determines whether hamt has `key`
 
         Args:
-            key (str or bytes)
+            key (typing.Union[str, bytes])
 
         Returns:
             bool: whether hamt has `key`
