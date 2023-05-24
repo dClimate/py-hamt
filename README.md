@@ -11,4 +11,4 @@ See https://ipld.io/specs/advanced-data-layouts/hamt/spec/ for information on th
 
 dClimate uses HAMTs as key/value stores that can be distributed across multiple nodes and used without the whole data structure being loaded into memory. This is extremely useful in the context of [zarrs](https://zarr.readthedocs.io/en/stable/), where metadata mapping coordinates to chunks containing the actual data can stretch into the 10s or even 100s of MBs. Because IPFS imposes a limit on the sizes of blocks that can be transferred from peer to peer, it is not feasible to store all this metadata in a single IPFS object. Instead, a HAMT can be used to provide efficient lookups in a data structure distributed across many IPFS objects, with only the parts of the HAMT needed for the lookup ever being accessed. 
 
-See [ipldstore](https://github.com/dClimate/ipldstore/tree/hamt) for an example of this HAMT implementation in action.
+See [ipldstore](https://github.com/dClimate/ipldstore) for an example of this HAMT implementation in action.
