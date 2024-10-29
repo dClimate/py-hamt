@@ -1,20 +1,24 @@
-name: Check linting and formatting
-run-name: Check linting and formatting , triggered on push from ${{ github.actor }} to branch/tag ${{ github.ref_name }}
+name: Run checks
+run-name: Triggered on push from ${{ github.actor }} to branch/tag ${{ github.ref_name }}
 on: push
 
 jobs:
-  linting_and_formatting:
-    name: Check linting and formatting
+  run_checks:
+    name: Create project environment, run all checks
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
       - name: Create project environment
         run: uv sync
+
+      - name: Call pytest
+        run: uv run pytest
 
       - name: Check linting with ruff
         run: uv run ruff check
