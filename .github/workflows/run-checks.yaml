@@ -17,8 +17,11 @@ jobs:
       - name: Create project environment
         run: uv sync
 
-      - name: Call pytest
-        run: uv run pytest
+      - name: Run pytest with coverage
+        run: uv run pytest --cov=py_hamt tests/
+
+      - name: Check coverage
+        run: uv run coverage report --fail-under=100 --show-missing
 
       - name: Check linting with ruff
         run: uv run ruff check

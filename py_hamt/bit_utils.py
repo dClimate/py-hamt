@@ -1,47 +1,28 @@
-import math
-
-
-def extract_bits(hash_obj: bytes, depth: int, nbits: int) -> int:
-    """Extract `nbits` bits from `hash_obj`, beginning at position `depth * nbits`,
+def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
+    """Extract `nbits` bits from `hash_bytes`, beginning at position `depth * nbits`,
     and convert them into an unsigned integer value.
 
     Args:
-        hash_obj (bytes): binary hash to extract bit sequence from
+        hash_bytes (bytes): binary hash to extract bit sequence from
         depth (int): depth of the node containing the hash
         nbits (int): bit width of hash
 
     Returns:
         int: An unsigned integer version of the bit sequence
     """
-    start = depth * nbits
-    start_offset = start % 8
+    # This is needed since int.bit_length on a integer representation of a bytes object ignores leading 0s
+    hash_bit_length = len(hash_bytes) * 8
 
-    byte_count = math.ceil((start_offset + nbits) / 8)
-    byte_start = start >> 3
-    end_offset = byte_count * 8 - nbits - start_offset
+    start_bit_index = depth * nbits
 
-    result = 0
+    if hash_bit_length - start_bit_index < nbits:
+        raise IndexError("Arguments extract more bits than remain in the hash bits")
 
-    for i in range(byte_count):
-        local = hash_obj[byte_start + i]
-        shift = 0
-        local_bit_length = 8
+    mask = (0b1 << (hash_bit_length - start_bit_index)) - 1
+    n_chop_off_at_end = int.bit_length(mask) - nbits
 
-        if i == 0:
-            local_bit_length -= start_offset
-
-        if i == byte_count - 1:
-            local_bit_length -= start_offset
-            shift = end_offset
-            local >>= shift
-
-        if local_bit_length < 8:
-            m = (1 << local_bit_length) - 1
-            local &= m
-
-        if shift < 8:
-            result = result << (8 - shift)
-        result |= local
+    hash_as_int = int.from_bytes(hash_bytes)
+    result = (hash_as_int & mask) >> n_chop_off_at_end
 
     return result
 
@@ -58,7 +39,7 @@ def set_bit(bitmap: bytes, position: int, to_set: bool) -> bytes:
         bytes: Modified bitmap
     """
     has = bitmap_has(bitmap, position)
-    byte = math.floor(position / 8)
+    byte = position // 8
     offset = position % 8
     # if we assume that `bitmap` is already the opposite of `set`, we could skip this check
     if (to_set and not has) or (not to_set and has):
@@ -88,9 +69,9 @@ def bitmap_has(
     Returns:
         bool: whether the `bitmap` has a 1 value at the `position` bit
     """
-    byte = math.floor(position / 8)
+    byte_index = position // 8
     offset = position % 8
-    return ((bitmap[byte] >> offset) & 1) == 1
+    return ((bitmap[byte_index] >> offset) & 1) == 1
 
 
 def rank(bitmap: bytes, position: int) -> int:
