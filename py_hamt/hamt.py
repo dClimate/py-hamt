@@ -146,7 +146,10 @@ class Hamt:
         return self.hasher_registry[self.config["hashAlg"]]["hasher"]
 
     def set(
-        self, key: typing.Union[str, bytes], value, _cached_hash: typing.Optional[bytes] = None
+        self,
+        key: typing.Union[str, bytes],
+        value,
+        _cached_hash: typing.Optional[bytes] = None,
     ) -> "Hamt":
         """Create a new `Hamt` instance identical to this one but with `key` set to `value`.
 
@@ -162,9 +165,7 @@ class Hamt:
         """
         if not isinstance(key, bytes):
             key = key.encode("utf-8")
-        hashed_key = (
-            _cached_hash if _cached_hash is not None else self.hasher()(key)
-        )
+        hashed_key = _cached_hash if _cached_hash is not None else self.hasher()(key)
         bitpos = extract_bits(hashed_key, self.depth, self.config["bitWidth"])
         if bitmap_has(self.map, bitpos):
             find_elem = self.find_element(bitpos, key)
@@ -199,7 +200,9 @@ class Hamt:
         else:
             return self.add_new_element(bitpos, key, value)
 
-    def get(self, key: typing.Union[str, bytes], _cached_hash: typing.Optional[bytes] = None):
+    def get(
+        self, key: typing.Union[str, bytes], _cached_hash: typing.Optional[bytes] = None
+    ):
         """Find and return a value for the given `key` if it exists within this `Hamt`.
         Raise KeyError otherwise
 
@@ -434,7 +437,11 @@ class Hamt:
 
     @staticmethod
     def from_serializable(
-        store, id, serializable: typing.Union[list, dict], options: typing.Optional[dict], depth: int = 0
+        store,
+        id,
+        serializable: typing.Union[list, dict],
+        options: typing.Optional[dict],
+        depth: int = 0,
     ) -> "Hamt":
         """Generates a `Hamt` object from a serialized dict or list, which typically comes from
         `Hamt.to_serializable`
@@ -645,7 +652,9 @@ def load(store, id, depth: int = 0, options: typing.Optional[dict] = None) -> Ha
     return Hamt.from_serializable(store, id, serialized, options, depth)
 
 
-def byte_compare(b1: typing.Union[bytes, str, KV], b2: typing.Union[bytes, str, KV]) -> int:
+def byte_compare(
+    b1: typing.Union[bytes, str, KV], b2: typing.Union[bytes, str, KV]
+) -> int:
     """Compare bytes/keys for use in sorting function
 
     Args:
