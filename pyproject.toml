@@ -1,11 +1,17 @@
-# pyproject.toml
+[project]
+name = "py-hamt"
+version = "1.1.1"
+description = "HAMT Implementation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
 [build-system]
-requires = [
-    "setuptools>=45",
-    "wheel",
-    "setuptools_scm>=6.2"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.3",
+    "ruff>=0.7.1",
 ]
-build-backend = "setuptools.build_meta"
-[tool.setuptools_scm]
-version_scheme = "post-release"
-local_scheme = "no-local-version"
