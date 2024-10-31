@@ -3,7 +3,7 @@ name = "py-hamt"
 version = "1.1.1"
 description = "HAMT Implementation"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "pytest-cov>=5.0.0",
 ]
