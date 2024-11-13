@@ -2,7 +2,7 @@ import dag_cbor
 from hypothesis import given, strategies as st
 import pytest
 
-from py_hamt.hamt import Node, Hamt, blake3_hashfn
+from py_hamt.hamt import Node, HAMT, blake3_hashfn
 from py_hamt.dict_store import DictStore
 
 memory_store = DictStore()
@@ -21,7 +21,7 @@ async def test_fuzz(kvs):
     """Test that all inserted items can be retrieved correctly."""
     # Use a smaller max bucket size to make overfull buckets more likely
     for bucket_size in [1, 2]:
-        hamt = await Hamt.create(
+        hamt = await HAMT.create(
             store=memory_store,
             hash_fn=blake3_hashfn,
             max_bucket_size=bucket_size,
@@ -86,7 +86,7 @@ async def test_remaining_exceptions():
         bad_serialization = dag_cbor.encode([])
         Node.deserialize(bad_serialization)
 
-    hamt = await Hamt.create(
+    hamt = await HAMT.create(
         store=memory_store,
         hash_fn=blake3_hashfn,
         max_bucket_size=5,
@@ -114,7 +114,7 @@ async def test_remaining_exceptions():
 
 @pytest.mark.asyncio
 async def test_key_rewrite():
-    hamt = await Hamt.create(
+    hamt = await HAMT.create(
         store=memory_store, hash_fn=blake3_hashfn, max_bucket_size=5, read_only=False
     )
     await hamt.set("foo", bytes("bar", "utf-8"))

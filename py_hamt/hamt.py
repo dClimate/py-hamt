@@ -85,10 +85,10 @@ class Node:
             raise ValueError("Data not a valid Node serialization")
 
 
-class Hamt:
+class HAMT:
     store: Store
     # Every call of this will look like self.hash_fn() and so the first argument will always take a self argument
-    hash_fn: Callable[["Hamt", bytes], bytes]
+    hash_fn: Callable[["HAMT", bytes], bytes]
     # Only important for writing, when reading this will use buckets even if they are overly big
     max_bucket_size: int
 
@@ -105,10 +105,10 @@ class Hamt:
     async def create(
         cls,
         store: Store,
-        hash_fn: Callable[["Hamt", bytes], bytes],
+        hash_fn: Callable[["HAMT", bytes], bytes],
         max_bucket_size: int = 4,
         read_only: bool = False,
-    ) -> "Hamt":
+    ) -> "HAMT":
         instance = cls()
         cls.store = store
         cls.hash_fn = hash_fn
@@ -438,7 +438,7 @@ class Hamt:
 b3 = multihash.get("blake3")
 
 
-def blake3_hashfn(self: Hamt, input_bytes: bytes) -> bytes:
+def blake3_hashfn(self: HAMT, input_bytes: bytes) -> bytes:
     # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
     digest = b3.digest(input_bytes, size=32)
     raw_bytes = b3.unwrap(digest)
