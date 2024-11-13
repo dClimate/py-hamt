@@ -1,6 +1,7 @@
 name: Run checks
 run-name: Triggered on push from ${{ github.actor }} to branch/tag ${{ github.ref_name }}
 on: push
+# Should be the same as py-hamt/run-checks.sh
 
 jobs:
   run_checks:

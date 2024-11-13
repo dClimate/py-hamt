@@ -1,0 +1,6 @@
+from typing import Protocol
+
+
+class Store(Protocol):
+    async def save(self, node: bytes) -> bytes: ...
+    async def load(self, id: bytes) -> bytes: ...

@@ -1,6 +1,7 @@
 pyrightconfig.json
 
 *.prof
+memray*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

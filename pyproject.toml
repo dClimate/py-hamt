@@ -1,10 +1,13 @@
 [project]
 name = "py-hamt"
-version = "1.1.1"
-description = "HAMT Implementation"
+version = "2.0.0"
+description = "HAMT implementation for an abstract backing store"
 readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    "dag-cbor>=0.3.3",
+    "multiformats[full]>=0.3.1.post4",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -13,7 +16,9 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "hypothesis>=6.115.5",
+    "memray>=1.14.0",
     "pdoc>=15.0.0",
+    "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "pytest>=8.3.3",
     "ruff>=0.7.1",

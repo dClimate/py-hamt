@@ -1,683 +1,445 @@
-import typing
-from py_hamt.bit_utils import extract_bits, set_bit, bitmap_has, rank
-import math
-from functools import cmp_to_key
+from typing import Callable
+from threading import Lock
 
-# set defaults
-DEFAULT_BIT_WIDTH = 8  # 2^8 = 256 buckets or children per node
-DEFAULT_BUCKET_SIZE = 5  # array size for a bucket of values
+import dag_cbor
+from dag_cbor.ipld import IPLDKind
+from multiformats import multihash
 
-# Using camelCase here to allign with the spec
-DEFAULT_OPTIONS = {
-    "bitWidth": DEFAULT_BIT_WIDTH,
-    "bucketSize": DEFAULT_BUCKET_SIZE,
-    "hashAlg": 0x23,
-}
+from .store import Store
 
 
-class KV:
-    """Object representing a single key/value pair"""
+def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
+    """Extract `nbits` bits from `hash_bytes`, beginning at position `depth * nbits`,
+    and convert them into an unsigned integer value.
 
-    def __init__(self, key: bytes, value):
-        self.key = key
-        self.value = value
+    Args:
+        hash_bytes (bytes): binary hash to extract bit sequence from
+        depth (int): depth of the node containing the hash
+        nbits (int): bit width of hash
 
-    def to_serializable(self):
-        return [self.key, self.value]
-
-    @staticmethod
-    def from_serializable(obj):
-        assert isinstance(obj, list)
-        assert len(obj) == 2
-        return KV(obj[0], obj[1])
-
-
-class Element:
-    """an element in the data array that each node holds, each element could be either a container of
-    an array (bucket) of KVs or a link to a child node
+    Returns:
+        int: An unsigned integer version of the bit sequence
     """
+    # This is needed since int.bit_length on a integer representation of a bytes object ignores leading 0s
+    hash_bit_length = len(hash_bytes) * 8
 
-    def __init__(self, bucket: typing.Optional[typing.List[KV]] = None, link=None):
-        assert bucket or link
-        assert not (bucket and link)
-        self.bucket = bucket  # should be array of KV's
-        self.link = link
+    start_bit_index = depth * nbits
 
-    def to_serializable(self):
-        if self.bucket is not None:
-            return [c.to_serializable() for c in self.bucket]
+    if hash_bit_length - start_bit_index < nbits:
+        raise IndexError("Arguments extract more bits than remain in the hash bits")
+
+    mask = (0b1 << (hash_bit_length - start_bit_index)) - 1
+    n_chop_off_at_end = int.bit_length(mask) - nbits
+
+    hash_as_int = int.from_bytes(hash_bytes)
+    result = (hash_as_int & mask) >> n_chop_off_at_end
+
+    return result
+
+
+class Node:
+    # Use a dict for easy serializability with dag_cbor
+    data: dict[str, IPLDKind]
+
+    def __init__(self):
+        data = {}
+
+        # Each "string" key for both buckets and CIDs is the bits as a string, e.g. str(0b1101) = '13'
+        buckets: dict[str, list[dict[str, bytes]]] = {}
+        data["b"] = buckets
+        links: dict[str, bytes] = {}
+        data["c"] = links
+        self.data = data
+
+    def _replace_link(self, old_link: bytes, new_link: bytes):
+        links: dict[str, bytes] = self.data["c"]  # type: ignore
+        for str_key in list(links.keys()):
+            link = links[str_key]
+            if link == old_link:
+                links[str_key] = new_link
+
+    def _remove_link(self, old_link: bytes):
+        links: dict[str, bytes] = self.data["c"]  # type: ignore
+        for str_key in list(links.keys()):
+            link = links[str_key]
+            if link == old_link:
+                del links[str_key]
+
+    def serialize(self) -> bytes:
+        return dag_cbor.encode(self.data)
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> "Node":
+        decoded = dag_cbor.decode(data)
+        if (
+            isinstance(decoded, dict)
+            and "b" in decoded
+            and isinstance(decoded["b"], dict)
+            and "c" in decoded
+            and isinstance(decoded["c"], dict)
+        ):
+            node = cls()
+            node.data = decoded
+            return node
         else:
-            return self.link
-
-    @staticmethod
-    def from_serializable(is_link, obj):
-        if is_link(obj):
-            return Element(None, obj)
-        elif isinstance(obj, list):
-            return Element([KV.from_serializable(ele) for ele in obj])
+            raise ValueError("Data not a valid Node serialization")
 
 
 class Hamt:
-    hasher_registry: typing.Dict[int, typing.Dict] = {}
+    store: Store
+    # Every call of this will look like self.hash_fn() and so the first argument will always take a self argument
+    hash_fn: Callable[["Hamt", bytes], bytes]
+    # Only important for writing, when reading this will use buckets even if they are overly big
+    max_bucket_size: int
 
+    root_node_id: bytes
+    key_count: int
+
+    # Modifying a HAMT is not multithreading safe
+    lock: Lock
+    # Allows for multithreaded access since you no longer have to worry about setting operations, acquiring a lock and changing the root node and its links
+    read_only: bool
+
+    # We have to use create instead of __init__ since __init__ cannot be async
     @classmethod
-    def register_hasher(
-        cls, hash_alg: int, hash_bytes: int, hasher: typing.Callable[[bytes], bytes]
-    ):
-        """Register a hashing algorithm with the class
-
-        Args:
-            hash_alg (int): A multicodec
-                (see https://github.com/multiformats/multicodec/blob/master/table.csv)
-                hash function identifier  e.g. `0x23` for `murmur3-32`.
-            hash_bytes (int): The length of the `bytes` object returned by `hasher`
-            hasher (typing.Callable): Hash function that converts a string to bytes
-        """
-        if not isinstance(hash_alg, int):
-            raise TypeError("`hash_alg` should be of type `int`")
-        if not isinstance(hash_bytes, int):
-            raise TypeError("`hash_bytes` should be of type `int`")
-        if not callable(hasher):
-            raise TypeError("`hasher` should be a function")
-        cls.hasher_registry[hash_alg] = {"hash_bytes": hash_bytes, "hasher": hasher}
-
-    @classmethod
-    def create(
+    async def create(
         cls,
-        store,
-        options: dict = DEFAULT_OPTIONS,
-        map: typing.Optional[bytes] = None,
-        depth: int = 0,
-        data: typing.Optional[typing.List[Element]] = None,
+        store: Store,
+        hash_fn: Callable[["Hamt", bytes], bytes],
+        max_bucket_size: int = 4,
+        read_only: bool = False,
     ) -> "Hamt":
-        """Creates a Hamt and uses `save` to generate an id for it
+        instance = cls()
+        cls.store = store
+        cls.hash_fn = hash_fn
 
-        Args:
-            store: backing store for new node
-            options (dict): Configuration for new node. Defaults to DEFAULT_OPTIONS.
-            map (typing.Optional[bytes]): bitmap used to quickly find keys. Defaults to None.
-            depth (int, optional): how deeply in the HAMT this node sits. Defaults to 0.
-            data (typing.Optional[typing.List[Element]], optional):
-                Elements representing all data stored in this node. Defaults to None.
+        root_node = Node()
+        cls.root_node_id = await store.save(root_node.serialize())
 
-        Returns:
-            Hamt: Created and saved HAMT
-        """
-        new_node = cls(store, options, map, depth, data)
-        return save(store, new_node)
+        cls.key_count = 0
 
-    def __init__(
-        self,
-        store,
-        options: dict = DEFAULT_OPTIONS,
-        map: typing.Optional[bytes] = None,
-        depth: int = 0,
-        data: typing.Optional[typing.List[Element]] = None,
-    ):
-        self.store = store
-        self.data = data if data is not None else []
-        for e in self.data:
-            if not isinstance(e, Element):
-                raise Exception("`data` array must contain only `Element` types")
+        cls.max_bucket_size = max_bucket_size
+        cls.read_only = read_only
+        cls.lock = Lock()
 
-        self.id = None
+        return instance
 
-        if map and not isinstance(map, bytes):
-            raise TypeError("map must be bytes")
-        map_length = math.ceil(2 ** options["bitWidth"] / 8)
+    def make_read_only(self):
+        self.lock.acquire(blocking=True)
+        self.read_only = True
+        self.lock.release()
 
-        if map and map_length != len(map):
-            raise Exception(f"`map` must be a bytes of length {map_length}")
+    def enable_write(self):
+        self.lock.acquire(blocking=True)
+        self.read_only = False
+        self.lock.release()
 
-        self.map = map if map is not None else bytes([0 for _ in range(map_length)])
+    """
+    For internal use
+    This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
+    Takes a stack of nodes, we represent a stack with a list where the first element is the root element and the last element is the top of the stack
+    Each element in the list is a tuple where the first element is the ID from the store and the second element is the Node in python
+    If a node ends up being empty, then it is deleted entirely, unless it is the root node
+    Modifies in place
+    """
 
-        self.depth = depth
+    async def _reserialize_and_link(self, node_stack: list[tuple[bytes, Node]]):
+        # Iterate in the reverse direction
+        for stack_index in range(len(node_stack) - 1, -1, -1):
+            old_store_id, node = node_stack[stack_index]
 
-        self.config = options
-        hash_bytes = self.hasher_registry[self.config["hashAlg"]]["hash_bytes"]
-        if self.depth > math.floor((hash_bytes * 8) / self.config["bitWidth"]):
-            raise Exception("Overflow: maximum tree depth reached")
+            # If this node is empty, and its not the root node, then we can delete it entirely from the list
+            buckets: dict[str, list[dict[str, bytes]]] = node.data["b"]  # type: ignore
+            links: dict[str, bytes] = node.data["c"]  # type: ignore
+            is_empty = len(buckets) == 0 and len(links) == 0
 
-    def hasher(self) -> typing.Callable[[bytes], bytes]:
-        """Gets the hashing function corresponding to the hash_alg in config
-        Returns:
-            typing.Callable: hasher stored in `hasher_registry`
-        """
-        return self.hasher_registry[self.config["hashAlg"]]["hasher"]
+            if is_empty and stack_index > 0:
+                # Unlink from the rest of the tree
+                _, prev_node = node_stack[stack_index - 1]
+                prev_node._remove_link(old_store_id)
 
-    def set(
-        self,
-        key: typing.Union[str, bytes],
-        value,
-        _cached_hash: typing.Optional[bytes] = None,
-    ) -> "Hamt":
-        """Create a new `Hamt` instance identical to this one but with `key` set to `value`.
-
-        Args:
-            key (typing.Union[str, bytes]): key used to locate value within Hamt
-            value: value to be placed at key
-            _cached_hash (typing.Optional[bytes], optional):
-                If key has already been hashed, cache it in this variable for use in recursion.
-                Defaults to None.
-
-        Returns:
-            Hamt: Instance of Hamt identical to `self` but with `key` set to `value`
-        """
-        if not isinstance(key, bytes):
-            key = key.encode("utf-8")
-        hashed_key = _cached_hash if _cached_hash is not None else self.hasher()(key)
-        bitpos = extract_bits(hashed_key, self.depth, self.config["bitWidth"])
-        if bitmap_has(self.map, bitpos):
-            find_elem = self.find_element(bitpos, key)
-            if "data" in find_elem:
-                data = find_elem["data"]
-                if data["found"]:
-                    if data["bucket_index"] is None or data["bucket_entry"] is None:
-                        raise Exception("Unexpected error")
-                    if data["bucket_entry"].value == value:
-                        return self
-                    return self.update_bucket(
-                        data["element_at"],
-                        data["bucket_index"],
-                        key,
-                        value,
-                    )
-                else:
-                    if len(data["element"].bucket) >= self.config["bucketSize"]:
-                        new_map = self.replace_bucket_with_node(data["element_at"])
-                        return new_map.set(key, value, hashed_key)
-                    return self.update_bucket(data["element_at"], -1, key, value)
-            elif "link" in find_elem:
-                link = find_elem["link"]
-                child = load(
-                    self.store, link["element"].link, self.depth + 1, self.config
-                )
-                assert child
-                new_child = child.set(key, value, hashed_key)
-                return self.update_node(link["element_at"], new_child)
+                # Remove from our stack
+                node_stack.pop(stack_index)
             else:
-                raise Exception("Neither link nor data found")
-        else:
-            return self.add_new_element(bitpos, key, value)
+                # Reserialize
+                new_store_id = await self.store.save(node.serialize())
+                node_stack[stack_index] = (new_store_id, node)
 
-    def get(
-        self, key: typing.Union[str, bytes], _cached_hash: typing.Optional[bytes] = None
-    ):
-        """Find and return a value for the given `key` if it exists within this `Hamt`.
-        Raise KeyError otherwise
+                # If this is not the last i.e. root node, we need to change the linking of the node prior in the list
+                if stack_index > 0:
+                    _, prev_node = node_stack[stack_index - 1]
+                    prev_node._replace_link(old_store_id, new_store_id)
 
-        Args:
-            key (typing.Union[str, bytes]): where to find value
-            _cached_hash (typing.Optional[bytes], optional):
-                If key has already been hashed, cache it in this variable for use in recursion.
-                Defaults to None.
+    async def set(self, key_to_insert: str, val_to_insert: bytes):
+        if self.read_only:
+            raise Exception("Cannot call set on a read only HAMT")
 
-        Raises:
-            KeyError: Raised when `key` cannot be found in `self`
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
 
-        Returns:
-            value located at `key`
-        """
-        if not isinstance(key, bytes):
-            key = key.encode("utf-8")
+        node_stack: list[tuple[bytes, Node]] = []
+        root_node = Node.deserialize(await self.store.load(self.root_node_id))
+        node_stack.append((self.root_node_id, root_node))
 
-        hashed_key = (
-            _cached_hash if isinstance(_cached_hash, bytes) else self.hasher()(key)
-        )
-        bitpos = extract_bits(hashed_key, self.depth, self.config["bitWidth"])
-        if bitmap_has(self.map, bitpos):
-            find_elem = self.find_element(bitpos, key)
-            if "data" in find_elem:
-                data = find_elem["data"]
-                if data["found"]:
-                    return data["bucket_entry"].value
-                else:
-                    raise KeyError("not in hamt")
-            elif "link" in find_elem:
-                link = find_elem["link"]
-                child = load(
-                    self.store, link["element"].link, self.depth + 1, self.config
+        # FIFO queue to keep track of all the KVs we need to insert
+        # This is important for if any buckets overflow and thus we need to reinsert all those KVs
+        kvs_queue: list[tuple[str, bytes]] = []
+        kvs_queue.append((key_to_insert, val_to_insert))
+
+        created_change = False
+        # Keep iterating until we have no more KVs to insert
+        while len(kvs_queue) != 0:
+            _, top_node = node_stack[-1]
+            curr_key, curr_val = kvs_queue[0]
+
+            raw_hash = self.hash_fn(bytes(curr_key, "utf-8"))  # type: ignore
+            map_key = str(extract_bits(raw_hash, len(node_stack), 8))
+
+            buckets: dict[str, list[dict[str, bytes]]] = top_node.data["b"]  # type: ignore
+            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+
+            if map_key in links and map_key in buckets:
+                self.lock.release()
+                raise Exception(
+                    "Key in both buckets and links of the node, invariant violated"
                 )
-                assert child
-                return child.get(key, hashed_key)
+            # We do not need to check this since new nodes that are created when buckets are too full are pushed on top of the stuck, as if we had traversed down the links already
+            # elif map_key in links:
+            elif map_key in buckets:
+                created_change = True
+                bucket = buckets[map_key]
+
+                bucket_has_space = len(bucket) < self.max_bucket_size
+
+                # If this bucket already has this same key, just rewrite the value
+                # Since we can't use continues to go back to the top of the while loop, use this boolean flag instead
+                should_continue_at_while = False
+                for kv in bucket:
+                    if curr_key in kv:
+                        kv[curr_key] = curr_val
+                        kvs_queue.pop(0)
+                        should_continue_at_while = True
+                        break
+                if should_continue_at_while:
+                    continue
+
+                if bucket_has_space:
+                    bucket.append({curr_key: curr_val})
+                    kvs_queue.pop(0)
+                    self.key_count += 1
+                # If bucket is full and we need to add, then all these KVs need to be taken out of this bucket and reinserted throughout the tree
+                else:
+                    # Empty the bucket of KVs into the queue
+                    for kv in bucket:
+                        for k, v in kv.items():
+                            kvs_queue.append((k, v))
+                            self.key_count -= 1
+
+                    # Delete empty bucket, there should only be a link now
+                    del buckets[map_key]
+
+                    # Create a new link to a new node so that we can reflow these KVs into new buckets
+                    new_node = Node()
+                    new_node_id = await self.store.save(new_node.serialize())
+
+                    links[map_key] = new_node_id
+
+                    # We need to rerun from the top with the new queue, but this time this node will have a link to put KVs deeper down in the tree
+                    node_stack.append((new_node_id, new_node))
             else:
-                raise Exception("Neither link nor data found")
-        else:
-            raise KeyError("not in hamt")
+                # If there is no link and no bucket, then we can create a new bucket, insert, and be done with this key
+                bucket: list[dict[str, bytes]] = []
+                bucket.append({curr_key: curr_val})
+                kvs_queue.pop(0)
+                buckets[map_key] = bucket
+                self.key_count += 1
+                created_change = True
 
-    def delete(self, key):
-        raise NotImplementedError
+        # Finally, reserialize and fix all links, deleting empty nodes as needed
+        if created_change:
+            await self._reserialize_and_link(node_stack)
+            self.root_node_id = node_stack[0][0]
 
-    def has(self, key: typing.Union[str, bytes]) -> bool:
-        """Determines whether hamt has `key`
+        if not self.read_only:
+            self.lock.release()
 
-        Args:
-            key (typing.Union[str, bytes])
+    async def delete(self, key: str):
+        if self.read_only:
+            raise Exception("Cannot call delete on a read only HAMT")
 
-        Returns:
-            bool: whether hamt has `key`
-        """
-        try:
-            self.get(key)
-            return True
-        except KeyError:
-            return False
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
+
+        raw_hash = self.hash_fn(bytes(key, "utf-8"))  # type: ignore
+
+        node_stack: list[tuple[bytes, Node]] = []
+        root_node = Node.deserialize(await self.store.load(self.root_node_id))
+        node_stack.append((self.root_node_id, root_node))
+
+        created_change = False
+        while True:
+            top_id, top_node = node_stack[-1]
+            map_key = str(extract_bits(raw_hash, len(node_stack), 8))
+
+            buckets: dict[str, list[dict[str, bytes]]] = top_node.data["b"]  # type: ignore
+            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+
+            if map_key in buckets and map_key in links:
+                self.lock.release()
+                raise Exception(
+                    "Key in both buckets and links of the node, invariant violated"
+                )
+            elif map_key in buckets:
+                bucket = buckets[map_key]
+
+                # Delete from within this bucket
+                for bucket_index in range(len(bucket)):
+                    kv = bucket[bucket_index]
+                    if key in kv:
+                        created_change = True
+                        bucket.pop(bucket_index)
+
+                        # If this bucket becomes empty then delete this dict entry for the bucket
+                        if len(bucket) == 0:
+                            del buckets[map_key]
+
+                        # This must be done to avoid IndexErrors after continuing to iterate since the length of the bucket has now changed
+                        break
+
+                break
+            elif map_key in links:
+                link = links[map_key]
+                next_node = Node.deserialize(await self.store.load(link))
+                node_stack.append((link, next_node))
+                continue
+
+            else:
+                # This key is not even in the HAMT so just exit
+                break
+
+        # Finally, reserialize and fix all links, deleting empty nodes as needed
+        if created_change:
+            await self._reserialize_and_link(node_stack)
+            self.key_count -= 1
+            self.root_node_id = node_stack[0][0]
+
+        if not self.read_only:
+            self.lock.release()
+
+    async def get(self, key: str) -> bytes | None:
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
+
+        raw_hash = self.hash_fn(bytes(key, "utf-8"))  # type: ignore
+
+        node_id_stack: list[bytes] = []
+        node_id_stack.append(self.root_node_id)
+
+        result: bytes | None = None
+        while True:
+            top_id = node_id_stack[-1]
+            top_node = Node.deserialize(await self.store.load(top_id))
+            map_key = str(extract_bits(raw_hash, len(node_id_stack), 8))
+
+            # Check if this node is in one of the buckets
+            buckets: dict[str, list[dict[str, bytes]]] = top_node.data["b"]  # type: ignore
+            if map_key in buckets:
+                bucket = buckets[map_key]
+                for kv in bucket:
+                    if key in kv:
+                        result = kv[key]
+                        break
+
+            # If it isn't in one of the buckets, check if there's a link to another serialized node id
+            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+            if map_key in links:
+                link_id = links[map_key]
+                node_id_stack.append(link_id)
+                continue
+            # Nowhere left to go, stop walking down the tree
+            else:
+                break
+
+        if not self.read_only:
+            self.lock.release()
+
+        return result
+
+    async def has(self, key: str) -> bool:
+        result = await self.get(key)
+
+        return result is not None
 
     def size(self) -> int:
-        """Gets the total number of keys in the hamt
-
-        Returns:
-            int
-        """
-        c = 0
-        for e in self.data:
-            if e.bucket is not None:
-                c += len(e.bucket)
-            else:
-                child = load(self.store, e.link, self.depth + 1, self.config)
-                c += child.size()
-        return c
-
-    def keys(self) -> typing.Iterator[str]:
-        """Get iterator with all keys in hamt
-
-        Yields:
-            bytes: key
-        """
-        for e in self.data:
-            if e.bucket is not None:
-                for kv in e.bucket:
-                    yield kv.key
-            else:
-                child = load(self.store, e.link, self.depth + 1, self.config)
-                yield from child.keys()
-
-    def ids(self):
-        """Get iterator with all ids in hamt
-
-        Yields:
-            id
-        """
-        yield self.id
-        for e in self.data:
-            if e.link:
-                child = load(self.store, e.link, self.depth + 1, self.config)
-                yield from child.ids()
-
-    def update_bucket(self, element_at: int, bucket_at: int, key, value) -> "Hamt":
-        """Modify bucket with new key/value
-
-        Args:
-            element_at (int): index of element containing bucket to update
-            bucket_at (int): index of kv within bucket to update. When -1,
-                append to bucket then sort. Otherwise, update bucket at this index,
-                meaning that `key` already exists within bucket
-            key: key to set
-            value: value corresponding to key
-
-        Returns:
-            Hamt: Node with key set to value through bucket update
-        """
-
-        old_element = self.data[element_at]
-
-        if old_element.bucket is None:
-            raise Exception("Expected element with bucket")
-
-        new_element = Element(list(old_element.bucket))
-        new_kv = KV(key, value)
-
-        if bucket_at == -1:
-            new_element.bucket.append(new_kv)
-            new_element.bucket.sort(key=cmp_to_key(byte_compare))
-        else:
-            new_element.bucket[bucket_at] = new_kv
-
-        new_data = list(self.data)
-        new_data[element_at] = new_element
-        return self.create(self.store, self.config, self.map, self.depth, new_data)
-
-    def find_element(self, bitpos: int, key) -> dict:
-        """Find a key within bucket or link in element located at bitpos
-
-        Args:
-            bitpos (int): bitpos within node used to find element
-            key: key to locate
-
-        Returns:
-            dict: dict representing whether the key was found, whether it was found in a link
-                or bucket and where to locate the key within the bucket
-        """
-        element_at = rank(self.map, bitpos)
-        element = self.data[element_at]
-        if element.bucket:
-            for bucket_index in range(len(element.bucket)):
-                bucket_entry = element.bucket[bucket_index]
-                if byte_compare(bucket_entry.key, key) == 0:
-                    return {
-                        "data": {
-                            "found": True,
-                            "element_at": element_at,
-                            "element": element,
-                            "bucket_index": bucket_index,
-                            "bucket_entry": bucket_entry,
-                        }
-                    }
-            return {
-                "data": {
-                    "found": False,
-                    "element_at": element_at,
-                    "element": element,
-                    "bucket_index": None,
-                    "bucket_entry": None,
-                }
-            }
-        assert element.link
-        return {"link": {"element_at": element_at, "element": element}}
-
-    def update_node(self, element_at: int, new_child: "Hamt") -> "Hamt":
-        """Update a child node
-
-        Args:
-            element_at (int): index of element at which to insert child
-            new_child (Hamt): child to update with
-
-        Returns:
-            Hamt: New Hamt with child node updated at the given index
-        """
-        assert new_child.id
-        new_element = Element(None, new_child.id)
-        new_data = list(self.data)
-        new_data[element_at] = new_element
-        return self.create(self.store, self.config, self.map, self.depth, new_data)
-
-    def replace_bucket_with_node(self, element_at: int) -> "Hamt":
-        """Bucket has overflowed and needs to be replaced with a node
-
-        Args:
-            node (Hamt): parent of bucket that has overflowed
-            element_at (int): index of element containing overflowing bucket
-
-        Returns:
-            Hamt: Hamt with bucket replaced with child node
-        """
-        new_node = Hamt(self.store, self.config, None, self.depth + 1)
-        element = self.data[element_at]
-        assert element
-        if element.bucket is None:
-            raise Exception("Expected element with bucket")
-
-        for c in element.bucket:
-            new_node = new_node.set(c.key, c.value)
-        new_node = save(self.store, new_node)
-        new_data = list(self.data)
-        new_data[element_at] = Element(None, new_node.id)
-        return self.create(self.store, self.config, self.map, self.depth, new_data)
-
-    def add_new_element(self, bitpos: int, key, value) -> "Hamt":
-        """Insert a new element containing a bucket with a single kv into node
-
-        Args:
-            bitpos (int): location of element within bitmap
-            key: key to add
-            value: value
-
-        Returns:
-            Hamt: Node with element inserted
-        """
-        insert_at = rank(self.map, bitpos)
-        new_data = list(self.data)
-        new_data.insert(insert_at, Element([KV(key, value)]))
-        new_map = set_bit(self.map, bitpos, True)
-        return self.create(self.store, self.config, new_map, self.depth, new_data)
-
-    @staticmethod
-    def is_hamt(node) -> bool:
-        return isinstance(node, Hamt)
-
-    @staticmethod
-    def from_serializable(
-        store,
-        id,
-        serializable: typing.Union[list, dict],
-        options: typing.Optional[dict],
-        depth: int = 0,
-    ) -> "Hamt":
-        """Generates a `Hamt` object from a serialized dict or list, which typically comes from
-        `Hamt.to_serializable`
-
-        Args:
-            store: backing store
-            id: id representing the entire node in the store
-            serializable (typing.Union[list, dict]): object generated from `to_serializable` to be turned
-                into a `Hamt` object
-            options (dict): Config for new hamt. Will be ignored if `serializable` is of depth 0
-                (and thus has its own options)
-            depth (int, optional): How deep in the hamt this node will sit. Defaults to 0.
-
-        Returns:
-            Hamt: node generated from `serializable`
-        """
-        if depth == 0:
-            if not is_root_serializable(serializable):
-                raise Exception(
-                    "Loaded  object does not appear to be an Hamt root (depth==0)"
-                )
-            # don't use passed-in options, since the object itself specifies options
-            options = serializable_to_options(serializable)
-            hamt = serializable["hamt"]
-        else:
-            if not is_serializable(serializable):
-                raise Exception(
-                    "Loaded object does not appear to be an Hamt node (depth>0)"
-                )
-            hamt = serializable
-        data = [Element.from_serializable(store.is_link, ele) for ele in hamt[1]]
-
-        node = Hamt(store, options, hamt[0], depth, data)
-        if id is not None:
-            node.id = id
-        return node
-
-    def to_serializable(self) -> typing.Union[list, dict]:
-        """Turns hamt into serialized list or dict
-
-        Returns:
-            typing.Union[list, dict]: serialized version of the `self`
-        """
-        data = [ele.to_serializable() for ele in self.data]
-        hamt = [self.map, data]
-        if self.depth != 0:
-            return hamt
-
-        return {
-            "hashAlg": self.config["hashAlg"],
-            "bucketSize": self.config["bucketSize"],
-            "hamt": hamt,
-        }
-
-    def from_child_serializable(
-        self, id, serializable: typing.Union[list, dict], depth: int
-    ) -> "Hamt":
-        """A convenience shortcut to `hamt.from_serializable` that uses this IAMap node
-        instance's backing `store` and configuration `options`. Intended to be used to instantiate
-        child IAMap nodes from a root IAMap node.
-
-        Args:
-            id: id for child
-            serializable (typing.Union[list, dict]):
-            depth (int): _description_
-
-        Returns:
-            Hamt: new HAMT generated from serializable object
-        """
-        return self.from_serializable(self.store, id, serializable, self.config, depth)
-
-    def direct_entry_count(self) -> int:
-        """Count the number of direct children of the node (not links)
-
-        Returns:
-            int: number of direct children of the node
-        """
-        count = 0
-        for ele in self.data:
-            if ele.bucket:
-                count += len(ele.bucket)
-        return count
-
-    def direct_node_count(self) -> int:
-        """Count the number of children of the node that are also Hamt
-
-        Returns:
-            int: number of child links for this node
-        """
-        count = 0
-        for ele in self.data:
-            if ele.link:
-                count += 1
-        return count
-
-    def is_invariant(self) -> bool:
-        """Perform a check on this node and its children that it is in
-        canonical format for the current data. As this uses `size()` to calculate the total
-        number of entries in this node and its children, it performs a full
-        scan of nodes and therefore incurs a load and deserialisation cost for each child node.
-        A `false` result from this method suggests a flaw in the implemetation.
-
-        Returns:
-            bool: whether the tree is in its canonical form
-        """
-        size = self.size()
-        entry_arity = self.direct_entry_count()
-        node_arity = self.direct_node_count()
-        arity = entry_arity + node_arity
-        size_predicate = 2
-        if node_arity == 0:
-            size_predicate = min(2, entry_arity)
-
-        inv1 = size - entry_arity >= 2 * (arity - entry_arity)
-        inv2 = size_predicate == 0 if arity == 0 else True
-        inv3 = size_predicate == 1 if (arity == 1 and entry_arity == 1) else True
-        inv4 = size_predicate == 2 if arity >= 2 else True
-        inv5 = (
-            node_arity >= 0 and entry_arity >= 0 and (entry_arity + node_arity == arity)
-        )
-
-        return inv1 and inv2 and inv3 and inv4 and inv5
-
-
-def serializable_to_options(serializable: typing.Union[dict, list]) -> dict:
-    """Turn serialized node into configs that can be passed into Hamt as options
-
-    Args:
-        serializable (dict): Serialized node
-
-    Returns:
-        dict: Options generated for serialized node
-    """
-    return {
-        "hashAlg": serializable["hashAlg"],
-        "bitWidth": int(
-            math.log2(len(serializable["hamt"][0]) * 8)
-        ),  # inverse of (2**bitWidth) / 8
-        "bucketSize": serializable["bucketSize"],
-    }
-
-
-def is_serializable(serializable: typing.Union[dict, list]) -> bool:
-    """Check if `serializable` is a valid serialized Hamt
-
-    Args:
-        serializable (typing.Union[dict, list]): Serialized object to test
-
-    Returns:
-        bool: whether object is valid hamt
-    """
-    if isinstance(serializable, list):
-        return (
-            len(serializable) == 2
-            and isinstance(serializable[0], bytes)
-            and isinstance(serializable[1], list)
-        )
-    return is_root_serializable(serializable)
-
-
-def is_root_serializable(serializable: typing.Union[dict, list]) -> bool:
-    """Whether `serializable` is the serialized root of a Hamt
-
-    Args:
-        serializable (dict): object to check
-
-    Returns:
-        bool: whether object is serialized root
-    """
-    return (
-        isinstance(serializable, dict)
-        and isinstance(serializable.get("hashAlg"), int)
-        and isinstance(serializable["hamt"], list)
-        and is_serializable(serializable["hamt"])
-    )
-
-
-def save(store, new_node: Hamt) -> Hamt:
-    """Save a Hamt `new_node` to the store, giving it an id
-
-    Args:
-        store: backing store
-        new_node (Hamt): node to save to store
-
-    Returns:
-        Hamt: node with store-generated id attached
-    """
-    id = store.save(new_node.to_serializable())
-    new_node.id = id
-    return new_node
-
-
-def load(store, id, depth: int = 0, options: typing.Optional[dict] = None) -> Hamt:
-    """Use id to load a node from the store
-
-    Args:
-        store: backing store
-        id: id to load from store
-        depth (int, optional): Depth at which node sits in tree. Defaults to 0.
-        options (typing.Optional[dict], optional): config to be passed into Hamt constructor.
-            Defaults to None.
-
-        Hamt: node loaded from store
-    """
-    if depth != 0 and not options:
-        raise Exception("Cannot load() without options at depth > 0")
-    serialized = store.load(id)
-    return Hamt.from_serializable(store, id, serialized, options, depth)
-
-
-def byte_compare(
-    b1: typing.Union[bytes, str, KV], b2: typing.Union[bytes, str, KV]
-) -> int:
-    """Compare bytes/keys for use in sorting function
-
-    Args:
-        b1 (typing.Union[bytes, KV]): first byte/key to compare
-        b2 (typing.Union[bytes, KV]): second byte/key to compare
-
-    Returns:
-        int: 1 if b1 > b2, -1 if b2 > b1, 0 if b1 == b2
-    """
-    if hasattr(b1, "key"):
-        b1 = b1.key
-    if hasattr(b2, "key"):
-        b2 = b2.key
-    x = len(b1)
-    y = len(b2)
-    for i in range(min(x, y)):
-        if b1[i] != b2[i]:
-            if b1[i] < b2[i]:
-                return -1
-            if b1[i] > b2[i]:
-                return 1
-    if x < y:
-        return -1
-    if x > y:
-        return 1
-    return 0
+        """Total number of keys"""
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
+
+        key_count = self.key_count
+
+        if not self.read_only:
+            self.lock.release()
+
+        return key_count
+
+    async def keys(self):
+        """Async generator of all keys"""
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
+
+        node_id_stack = []
+        node_id_stack.append(self.root_node_id)
+
+        while True:
+            if len(node_id_stack) == 0:
+                break
+
+            id_top = node_id_stack.pop()
+            top = await self.store.load(id_top)
+            node = Node.deserialize(top)
+
+            # Collect all keys from all buckets
+            buckets: dict[str, list[dict[str, bytes]]] = node.data["b"]  # type: ignore
+            for bucket in buckets.values():
+                for kv in bucket:
+                    for k in kv:
+                        yield k
+
+            # Traverse down list of CIDs
+            cids: dict[str, bytes] = node.data["c"]  # type: ignore
+            for cid in cids.values():
+                node_id_stack.append(cid)
+
+        if not self.read_only:
+            self.lock.release()
+
+    async def ids(self):
+        """Async generator of all IDs as the store uses"""
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
+
+        node_id_stack = []
+        node_id_stack.append(self.root_node_id)
+
+        while len(node_id_stack) > 0:
+            top_id = node_id_stack.pop()
+            yield top_id
+            top_node = Node.deserialize(await self.store.load(top_id))
+
+            # Traverse down list of ids that are the store's links'
+            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+            for link in links.values():
+                node_id_stack.append(link)
+
+        if not self.read_only:
+            self.lock.release()
+
+
+b3 = multihash.get("blake3")
+
+
+def blake3_hashfn(self: Hamt, input_bytes: bytes) -> bytes:
+    # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
+    digest = b3.digest(input_bytes, size=32)
+    raw_bytes = b3.unwrap(digest)
+    return raw_bytes
