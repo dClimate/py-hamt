@@ -142,7 +142,10 @@ class HAMT(MutableMapping):
     """@private"""
 
     root_node_id: bytes
-    """@private"""
+    """DO NOT modify this directly.
+
+    This is the ID that the store returns for the root node of the HAMT. This is exposed since it is sometimes useful to read this for storing to construct other HAMTs later if using a persistent store.
+    """
     key_count: int
     """@private"""
 
