@@ -1,5 +1,6 @@
-from typing import Callable
 from threading import Lock
+from typing import Callable
+from collections.abc import MutableMapping
 
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
@@ -85,46 +86,93 @@ class Node:
             raise ValueError("Data not a valid Node serialization")
 
 
-class HAMT:
+b3 = multihash.get("blake3")
+
+
+# _ ignores the self that will always be put in
+def blake3_hashfn(input_bytes: bytes) -> bytes:
+    """
+    This is provided as a default recommended hash function by py-hamt. It uses the blake3 hash function and uses 32 bytes as the hash size. For more about bringing your own hash function, read the `HAMT` class documentation.
+    """
+    # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
+    digest = b3.digest(input_bytes, size=32)
+    raw_bytes = b3.unwrap(digest)
+    return raw_bytes
+
+
+class HAMT(MutableMapping):
+    """
+    This represents the HAMT and is what the end user should be instantiating. Here is some sample code for how to use it.
+    ```python
+    from py_hamt import HAMT, blake3_hashfn, DictStore
+
+    in_memory_store = DictStore()
+    hamt = HAMT.create(store=in_memory_store)
+    hamt["foo"] = bytes("bar", "utf-8")
+    assert b"bar" == hamt.get("foo")
+    assert hamt.size() == 1
+    ```
+    A HAMT is mutable, so you can just keep calling operations on that one class instance.
+
+    Some notes about thread safety. Since modifying a HAMT changes all parts of the tree, due to reserializing and saving to the backing store, modificiations are not thread safe. Thus, we offer read-only mode, or write enabled mode. You can see what type it is from the `read_only` variable.
+
+    In write enabled mode, all operations block and wait, so multiple threads can write to the HAMT but the operations will in reality happen one after the other. Read only mode allows for no modifications but it has the advantages that reads can now be parallelized, as reads don't modify the HAMT. Normally, reads are done only after a write is finished so that it is not reading an invalid tree.
+
+    Almost all of a HAMT's operations are also
+    """
+
     store: Store
+    """@private"""
     # Every call of this will look like self.hash_fn() and so the first argument will always take a self argument
-    hash_fn: Callable[["HAMT", bytes], bytes]
+    hash_fn: Callable[[bytes], bytes]
+    """@private"""
     # Only important for writing, when reading this will use buckets even if they are overly big
     max_bucket_size: int
+    """@private"""
 
     root_node_id: bytes
+    """@private"""
     key_count: int
+    """@private"""
 
-    # Modifying a HAMT is not multithreading safe
     lock: Lock
-    # Allows for multithreaded access since you no longer have to worry about setting operations, acquiring a lock and changing the root node and its links
-    read_only: bool
+    """
+    @private
+    For use in multithreading
+    """
 
-    # We have to use create instead of __init__ since __init__ cannot be async
-    @classmethod
-    async def create(
-        cls,
+    read_only: bool
+    """
+    DO NOT modify this directly.
+
+    You can modify the read status of a HAMT through the `make_read_only` or `enable_write` functions, so that the HAMT will block on making a change until all mutating operations are done.
+    """
+
+    def __init__(
+        self,
         store: Store,
-        hash_fn: Callable[["HAMT", bytes], bytes],
+        hash_fn: Callable[[bytes], bytes] = blake3_hashfn,
         max_bucket_size: int = 4,
         read_only: bool = False,
-    ) -> "HAMT":
-        instance = cls()
-        cls.store = store
-        cls.hash_fn = hash_fn
+        root_node_id=None,
+    ):
+        self.store = store
+        self.hash_fn = hash_fn
 
-        root_node = Node()
-        cls.root_node_id = await store.save(root_node.serialize())
+        if root_node_id is None:
+            root_node = Node()
+            self.root_node_id = store.save(root_node.serialize())
+        else:
+            self.root_node_id = root_node_id
 
-        cls.key_count = 0
+        self.key_count = 0
 
-        cls.max_bucket_size = max_bucket_size
-        cls.read_only = read_only
-        cls.lock = Lock()
-
-        return instance
+        self.max_bucket_size = max_bucket_size
+        self.read_only = read_only
+        self.lock = Lock()
 
     def make_read_only(self):
+        """Disables all mutation of this HAMT. When enabled, the HAMT will throw errors if set or delete are called. When a HAMT is only in read only mode, it allows for safe multithreaded reads, increasing performance."""
         self.lock.acquire(blocking=True)
         self.read_only = True
         self.lock.release()
@@ -134,17 +182,16 @@ class HAMT:
         self.read_only = False
         self.lock.release()
 
-    """
-    For internal use
-    This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
-    Takes a stack of nodes, we represent a stack with a list where the first element is the root element and the last element is the top of the stack
-    Each element in the list is a tuple where the first element is the ID from the store and the second element is the Node in python
-    If a node ends up being empty, then it is deleted entirely, unless it is the root node
-    Modifies in place
-    """
-
-    async def _reserialize_and_link(self, node_stack: list[tuple[bytes, Node]]):
-        # Iterate in the reverse direction
+    def _reserialize_and_link(self, node_stack: list[tuple[bytes, Node]]):
+        """
+        For internal use
+        This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
+        Takes a stack of nodes, we represent a stack with a list where the first element is the root element and the last element is the top of the stack
+        Each element in the list is a tuple where the first element is the ID from the store and the second element is the Node in python
+        If a node ends up being empty, then it is deleted entirely, unless it is the root node
+        Modifies in place
+        """
+        # Iterate in the reverse direction, imitating going deeper into a stack
         for stack_index in range(len(node_stack) - 1, -1, -1):
             old_store_id, node = node_stack[stack_index]
 
@@ -162,7 +209,7 @@ class HAMT:
                 node_stack.pop(stack_index)
             else:
                 # Reserialize
-                new_store_id = await self.store.save(node.serialize())
+                new_store_id = self.store.save(node.serialize())
                 node_stack[stack_index] = (new_store_id, node)
 
                 # If this is not the last i.e. root node, we need to change the linking of the node prior in the list
@@ -170,7 +217,15 @@ class HAMT:
                     _, prev_node = node_stack[stack_index - 1]
                     prev_node._replace_link(old_store_id, new_store_id)
 
-    async def set(self, key_to_insert: str, val_to_insert: bytes):
+    def __setitem__(self, key_to_insert: str, val_to_insert: bytes):
+        """
+        Create or update a key-value mapping. This is thread safe, as it will wait until other set or delete operations are done before changing things.
+
+        Not allowed in read-only mode, and it will raise an Exception.
+        ```
+        hamt.set("foo", bytes([0b11]))
+        ```
+        """
         if self.read_only:
             raise Exception("Cannot call set on a read only HAMT")
 
@@ -178,7 +233,7 @@ class HAMT:
             self.lock.acquire(blocking=True)
 
         node_stack: list[tuple[bytes, Node]] = []
-        root_node = Node.deserialize(await self.store.load(self.root_node_id))
+        root_node = Node.deserialize(self.store.load(self.root_node_id))
         node_stack.append((self.root_node_id, root_node))
 
         # FIFO queue to keep track of all the KVs we need to insert
@@ -240,7 +295,7 @@ class HAMT:
 
                     # Create a new link to a new node so that we can reflow these KVs into new buckets
                     new_node = Node()
-                    new_node_id = await self.store.save(new_node.serialize())
+                    new_node_id = self.store.save(new_node.serialize())
 
                     links[map_key] = new_node_id
 
@@ -257,13 +312,13 @@ class HAMT:
 
         # Finally, reserialize and fix all links, deleting empty nodes as needed
         if created_change:
-            await self._reserialize_and_link(node_stack)
+            self._reserialize_and_link(node_stack)
             self.root_node_id = node_stack[0][0]
 
         if not self.read_only:
             self.lock.release()
 
-    async def delete(self, key: str):
+    def __delitem__(self, key: str):
         if self.read_only:
             raise Exception("Cannot call delete on a read only HAMT")
 
@@ -273,7 +328,7 @@ class HAMT:
         raw_hash = self.hash_fn(bytes(key, "utf-8"))  # type: ignore
 
         node_stack: list[tuple[bytes, Node]] = []
-        root_node = Node.deserialize(await self.store.load(self.root_node_id))
+        root_node = Node.deserialize(self.store.load(self.root_node_id))
         node_stack.append((self.root_node_id, root_node))
 
         created_change = False
@@ -309,7 +364,7 @@ class HAMT:
                 break
             elif map_key in links:
                 link = links[map_key]
-                next_node = Node.deserialize(await self.store.load(link))
+                next_node = Node.deserialize(self.store.load(link))
                 node_stack.append((link, next_node))
                 continue
 
@@ -319,14 +374,17 @@ class HAMT:
 
         # Finally, reserialize and fix all links, deleting empty nodes as needed
         if created_change:
-            await self._reserialize_and_link(node_stack)
+            self._reserialize_and_link(node_stack)
             self.key_count -= 1
             self.root_node_id = node_stack[0][0]
 
         if not self.read_only:
             self.lock.release()
 
-    async def get(self, key: str) -> bytes | None:
+        if not created_change:
+            raise KeyError
+
+    def __getitem__(self, key: str):
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
@@ -338,7 +396,7 @@ class HAMT:
         result: bytes | None = None
         while True:
             top_id = node_id_stack[-1]
-            top_node = Node.deserialize(await self.store.load(top_id))
+            top_node = Node.deserialize(self.store.load(top_id))
             map_key = str(extract_bits(raw_hash, len(node_id_stack), 8))
 
             # Check if this node is in one of the buckets
@@ -363,14 +421,12 @@ class HAMT:
         if not self.read_only:
             self.lock.release()
 
-        return result
+        if result is None:
+            raise KeyError
+        else:
+            return result
 
-    async def has(self, key: str) -> bool:
-        result = await self.get(key)
-
-        return result is not None
-
-    def size(self) -> int:
+    def __len__(self) -> int:
         """Total number of keys"""
         if not self.read_only:
             self.lock.acquire(blocking=True)
@@ -382,20 +438,23 @@ class HAMT:
 
         return key_count
 
-    async def keys(self):
-        """Async generator of all keys"""
+    def __iter__(self):
+        """Generator of all string keys. When initially called, this will freeze the root node and then start iteration, so subsequent sets and deletes that mutate will not be reflected in the keys returned in this iteration."""
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
         node_id_stack = []
         node_id_stack.append(self.root_node_id)
 
+        if not self.read_only:
+            self.lock.release()
+
         while True:
             if len(node_id_stack) == 0:
                 break
 
             id_top = node_id_stack.pop()
-            top = await self.store.load(id_top)
+            top = self.store.load(id_top)
             node = Node.deserialize(top)
 
             # Collect all keys from all buckets
@@ -405,41 +464,28 @@ class HAMT:
                     for k in kv:
                         yield k
 
-            # Traverse down list of CIDs
+            # Traverse down list of links
             cids: dict[str, bytes] = node.data["c"]  # type: ignore
             for cid in cids.values():
                 node_id_stack.append(cid)
 
-        if not self.read_only:
-            self.lock.release()
-
-    async def ids(self):
-        """Async generator of all IDs as the store uses"""
+    def ids(self):
+        """Generator of all IDs the backing store uses"""
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
         node_id_stack = []
         node_id_stack.append(self.root_node_id)
 
+        if not self.read_only:
+            self.lock.release()
+
         while len(node_id_stack) > 0:
             top_id = node_id_stack.pop()
             yield top_id
-            top_node = Node.deserialize(await self.store.load(top_id))
+            top_node = Node.deserialize(self.store.load(top_id))
 
             # Traverse down list of ids that are the store's links'
             links: dict[str, bytes] = top_node.data["c"]  # type: ignore
             for link in links.values():
                 node_id_stack.append(link)
-
-        if not self.read_only:
-            self.lock.release()
-
-
-b3 = multihash.get("blake3")
-
-
-def blake3_hashfn(self: HAMT, input_bytes: bytes) -> bytes:
-    # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
-    digest = b3.digest(input_bytes, size=32)
-    raw_bytes = b3.unwrap(digest)
-    return raw_bytes
