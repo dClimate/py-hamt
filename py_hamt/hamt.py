@@ -102,23 +102,29 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
 
 class HAMT(MutableMapping):
     """
-    This represents the HAMT and is what the end user should be instantiating. Here is some sample code for how to use it.
+    This represents the HAMT and is what the end user should be instantiating. It inherits from MutableMapping and so can be used with the same syntax as a normal python dictionary. Here is some sample example code:
     ```python
-    from py_hamt import HAMT, blake3_hashfn, DictStore
+    from py_hamt import HAMT, DictStore
 
     in_memory_store = DictStore()
-    hamt = HAMT.create(store=in_memory_store)
-    hamt["foo"] = bytes("bar", "utf-8")
-    assert b"bar" == hamt.get("foo")
-    assert hamt.size() == 1
+    hamt = HAMT(store=in_memory_store)
+    hamt["foo"] = b"bar"
+    assert b"bar" == hamt["foo"]
+    assert len(hamt) == 1
+    hamt["foo"] = b"bar1"
+    hamt["foo2"] = b"bar2"
+    assert len(hamt) == 2
+    for key in hamt:
+        print(key)
+    print (list(hamt)) # [foo, foo2], order depending on hash function
+    del hamt["foo"]
+    assert len(hamt) == 1
     ```
-    A HAMT is mutable, so you can just keep calling operations on that one class instance.
+    A HAMT is mutable, so you can just keep calling operations on that class instance.
 
-    Some notes about thread safety. Since modifying a HAMT changes all parts of the tree, due to reserializing and saving to the backing store, modificiations are not thread safe. Thus, we offer read-only mode, or write enabled mode. You can see what type it is from the `read_only` variable.
+    Some notes about thread safety. Since modifying a HAMT changes all parts of the tree, due to reserializing and saving to the backing store, modificiations are not thread safe. Thus, we offer a read-only mode, or write enabled mode. You can see what type it is from the `read_only` variable. HAMTs default to write enabled mode on creation. Calling mutating operations in read only mode will raise Exceptions.
 
-    In write enabled mode, all operations block and wait, so multiple threads can write to the HAMT but the operations will in reality happen one after the other. Read only mode allows for no modifications but it has the advantages that reads can now be parallelized, as reads don't modify the HAMT. Normally, reads are done only after a write is finished so that it is not reading an invalid tree.
-
-    Almost all of a HAMT's operations are also
+    In write enabled mode, all operations block and wait, so multiple threads can write to the HAMT but the operations will in reality happen one after the other. Read-only mode allows for no modifications but it has the advantages that reads can now be parallelized, as reads don't modify the HAMT. Normally, reads are done only after a write is finished so that it is not reading an invalid tree.
     """
 
     store: Store
@@ -143,7 +149,7 @@ class HAMT(MutableMapping):
 
     read_only: bool
     """
-    DO NOT modify this directly.
+    DO NOT modify this directly. This is here for you to read and check.
 
     You can modify the read status of a HAMT through the `make_read_only` or `enable_write` functions, so that the HAMT will block on making a change until all mutating operations are done.
     """
@@ -218,14 +224,6 @@ class HAMT(MutableMapping):
                     prev_node._replace_link(old_store_id, new_store_id)
 
     def __setitem__(self, key_to_insert: str, val_to_insert: bytes):
-        """
-        Create or update a key-value mapping. This is thread safe, as it will wait until other set or delete operations are done before changing things.
-
-        Not allowed in read-only mode, and it will raise an Exception.
-        ```
-        hamt.set("foo", bytes([0b11]))
-        ```
-        """
         if self.read_only:
             raise Exception("Cannot call set on a read only HAMT")
 
