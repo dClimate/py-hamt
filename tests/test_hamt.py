@@ -16,9 +16,8 @@ key_value_lists = st.lists(
 )
 
 
-@pytest.mark.asyncio
 @given(key_value_lists)
-async def test_fuzz(kvs):
+def test_fuzz(kvs):
     """Test that all inserted items can be retrieved correctly."""
     # Use a smaller max bucket size to make overfull buckets more likely
     for bucket_size in [1, 2]:
@@ -80,8 +79,7 @@ async def test_fuzz(kvs):
 
 
 # Mostly for complete code coverage's sake
-@pytest.mark.asyncio
-async def test_remaining_exceptions():
+def test_remaining_exceptions():
     with pytest.raises(Exception, match="ID not found in store"):
         memory_store.load(b"foo")
 
@@ -112,8 +110,7 @@ async def test_remaining_exceptions():
         del bad_hamt["foo"]
 
 
-@pytest.mark.asyncio
-async def test_key_rewrite():
+def test_key_rewrite():
     hamt = HAMT(store=memory_store)
     hamt["foo"] = b"bar"
     assert b"bar" == hamt["foo"]
