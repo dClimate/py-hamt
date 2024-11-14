@@ -89,10 +89,13 @@ class Node:
 b3 = multihash.get("blake3")
 
 
-# _ ignores the self that will always be put in
 def blake3_hashfn(input_bytes: bytes) -> bytes:
     """
-    This is provided as a default recommended hash function by py-hamt. It uses the blake3 hash function and uses 32 bytes as the hash size. For more about bringing your own hash function, read the `HAMT` class documentation.
+    This is provided as a default recommended hash function by py-hamt. It uses the blake3 hash function and uses 32 bytes as the hash size.
+
+    To bring your own hash function, just create a function that takes in bytes and returns the hash bytes, and use that in the HAMT init method.
+
+    It's important to note that the resulting hash must must always be a multiple of 8 bits since python bytes object can only represent in segments of bytes, and thus 8 bits.
     """
     # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
     digest = b3.digest(input_bytes, size=32)
@@ -120,6 +123,8 @@ class HAMT(MutableMapping):
     del hamt["foo"]
     assert len(hamt) == 1
     ```
+    py-hamt uses blake3 with a 32 byte wide hash by default, but to bring your own, read more in the documentation of `blake3_hashfn`
+
     A HAMT is mutable, so you can just keep calling operations on that class instance.
 
     Some notes about thread safety. Since modifying a HAMT changes all parts of the tree, due to reserializing and saving to the backing store, modificiations are not thread safe. Thus, we offer a read-only mode, or write enabled mode. You can see what type it is from the `read_only` variable. HAMTs default to write enabled mode on creation. Calling mutating operations in read only mode will raise Exceptions.
