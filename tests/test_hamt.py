@@ -1,4 +1,5 @@
 from copy import deepcopy
+import random
 from typing_extensions import MutableMapping
 
 import dag_cbor
@@ -21,66 +22,72 @@ key_value_lists = st.lists(
 @given(key_value_lists)
 def test_fuzz(kvs):
     """Test that all inserted items can be retrieved correctly."""
-    # Use a smaller max bucket size to make overfull buckets more likely
-    for bucket_size in [1, 2]:
-        hamt = HAMT(
-            store=memory_store,
-            hash_fn=blake3_hashfn,
-            max_bucket_size=bucket_size,
-            read_only=False,
-        )
-        assert isinstance(hamt, MutableMapping)
+    hamt = HAMT(
+        store=memory_store,
+        hash_fn=blake3_hashfn,
+        read_only=False,
+    )
+    assert isinstance(hamt, MutableMapping)
 
-        # Insert all items
-        for key, value in kvs:
-            hamt[key] = value
+    # Delete and reinsert but this time with varying bucket size while inserting
+    # The HAMT should be able to withstand its bucket size changing randomly while working
+    for key, value in kvs:
+        hamt.max_bucket_size = random.randint(1, 10)
+        hamt[key] = value
+    assert len(hamt) == len(kvs)
+    for key, _ in kvs:
+        del hamt[key]
+    assert len(hamt) == 0
+    # Re insert all items but now with a bucket size that forces linking, which actually runs the link following code branches, otherwise we would miss 100% code coverage
+    hamt.max_bucket_size = 1
+    for key, value in kvs:
+        hamt[key] = value
+    assert len(hamt) == len(kvs)
 
-        assert len(hamt) == len(kvs)
+    ks = [k for k, _ in kvs]
+    key_that_cannot_exist = "".join(ks).join(
+        "string to account for empty string key case"
+    )
+    with pytest.raises(KeyError):
+        hamt[key_that_cannot_exist]
+    with pytest.raises(KeyError):
+        del hamt[key_that_cannot_exist]
 
-        ks = [k for k, _ in kvs]
-        key_that_cannot_exist = "".join(ks).join(
-            "string to account for empty string key case"
-        )
-        with pytest.raises(KeyError):
-            hamt[key_that_cannot_exist]
-        with pytest.raises(KeyError):
-            del hamt[key_that_cannot_exist]
+    for key, value in kvs:
+        assert hamt[key] == value
 
-        for key, value in kvs:
-            assert hamt[key] == value
+    hamt_keys = list(hamt)
+    assert len(hamt_keys) == len(kvs)
 
-        hamt_keys = list(hamt)
-        assert len(hamt_keys) == len(kvs)
+    hamt_key_set = set(hamt_keys)
+    keys_set = set()
+    for key, _ in kvs:
+        keys_set.add(key)
 
-        hamt_key_set = set(hamt_keys)
-        keys_set = set()
-        for key, _ in kvs:
-            keys_set.add(key)
+    assert hamt_key_set == keys_set
 
-        assert hamt_key_set == keys_set
+    # Make sure all ids actually exist in the store, this should not raies any exceptions
+    store_ids = list(hamt.ids())
+    for id in store_ids:
+        memory_store.load(id)
 
-        # Make sure all ids actually exist in the store, this should not raies any exceptions
-        store_ids = list(hamt.ids())
-        for id in store_ids:
-            memory_store.load(id)
+    hamt.make_read_only()
+    with pytest.raises(Exception, match="Cannot call set on a read only HAMT"):
+        hamt["foo"] = b"bar"
+    hamt.enable_write()
 
-        hamt.make_read_only()
-        with pytest.raises(Exception, match="Cannot call set on a read only HAMT"):
-            hamt["foo"] = b"bar"
-        hamt.enable_write()
+    hamt.make_read_only()
+    with pytest.raises(Exception, match="Cannot call delete on a read only HAMT"):
+        del hamt["foo"]
+    hamt.enable_write()
 
-        hamt.make_read_only()
-        with pytest.raises(Exception, match="Cannot call delete on a read only HAMT"):
-            del hamt["foo"]
-        hamt.enable_write()
+    copy_hamt = deepcopy(hamt)
 
-        copy_hamt = deepcopy(hamt)
-
-        # Now delete all keys
-        for key, _ in kvs:
-            del hamt[key]
-        assert len(hamt) == 0
-        assert len(copy_hamt) == len(kvs)
+    # Modify our current hamt and since the copy is a deep copy, they should be different
+    for key, _ in kvs:
+        del hamt[key]
+    assert len(hamt) == 0
+    assert len(copy_hamt) == len(kvs)
 
 
 # Mostly for complete code coverage's sake
