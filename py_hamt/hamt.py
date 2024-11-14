@@ -102,7 +102,7 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
 
 class HAMT(MutableMapping):
     """
-    This represents the HAMT and is what the end user should be instantiating. It inherits from MutableMapping and so can be used with the same syntax as a normal python dictionary. Here is some sample example code:
+    This HAMT presents key value interface like a normal python dictionary, except keys can only be strings and values can only be bytes. See some sample usage code here:
     ```python
     from py_hamt import HAMT, DictStore
 
@@ -177,6 +177,24 @@ class HAMT(MutableMapping):
         self.read_only = read_only
         self.lock = Lock()
 
+    def __deepcopy__(self, memo) -> "HAMT":
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
+
+        copy_hamt = HAMT(
+            store=self.store,
+            hash_fn=self.hash_fn,
+            max_bucket_size=self.max_bucket_size,
+            read_only=self.read_only,
+            root_node_id=self.root_node_id,
+        )
+        copy_hamt.key_count = self.key_count
+
+        if not self.read_only:
+            self.lock.release()
+
+        return copy_hamt
+
     def make_read_only(self):
         """Disables all mutation of this HAMT. When enabled, the HAMT will throw errors if set or delete are called. When a HAMT is only in read only mode, it allows for safe multithreaded reads, increasing performance."""
         self.lock.acquire(blocking=True)
@@ -205,8 +223,9 @@ class HAMT(MutableMapping):
             buckets: dict[str, list[dict[str, bytes]]] = node.data["b"]  # type: ignore
             links: dict[str, bytes] = node.data["c"]  # type: ignore
             is_empty = len(buckets) == 0 and len(links) == 0
+            is_not_root = stack_index > 0
 
-            if is_empty and stack_index > 0:
+            if is_empty and is_not_root:
                 # Unlink from the rest of the tree
                 _, prev_node = node_stack[stack_index - 1]
                 prev_node._remove_link(old_store_id)
@@ -256,13 +275,13 @@ class HAMT(MutableMapping):
                 raise Exception(
                     "Key in both buckets and links of the node, invariant violated"
                 )
-            # We do not need to check this since new nodes that are created when buckets are too full are pushed on top of the stuck, as if we had traversed down the links already
-            # elif map_key in links:
+            elif map_key in links:
+                next_node_id = links[map_key]
+                next_node = Node.deserialize(self.store.load(next_node_id))
+                node_stack.append((next_node_id, next_node))
             elif map_key in buckets:
-                created_change = True
                 bucket = buckets[map_key]
-
-                bucket_has_space = len(bucket) < self.max_bucket_size
+                created_change = True
 
                 # If this bucket already has this same key, just rewrite the value
                 # Since we can't use continues to go back to the top of the while loop, use this boolean flag instead
@@ -276,6 +295,7 @@ class HAMT(MutableMapping):
                 if should_continue_at_while:
                     continue
 
+                bucket_has_space = len(bucket) < self.max_bucket_size
                 if bucket_has_space:
                     bucket.append({curr_key: curr_val})
                     kvs_queue.pop(0)

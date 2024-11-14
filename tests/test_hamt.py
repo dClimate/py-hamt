@@ -1,4 +1,6 @@
+from copy import deepcopy
 from typing_extensions import MutableMapping
+
 import dag_cbor
 from hypothesis import given, strategies as st
 import pytest
@@ -72,10 +74,13 @@ def test_fuzz(kvs):
             del hamt["foo"]
         hamt.enable_write()
 
+        copy_hamt = deepcopy(hamt)
+
         # Now delete all keys
         for key, _ in kvs:
             del hamt[key]
         assert len(hamt) == 0
+        assert len(copy_hamt) == len(kvs)
 
 
 # Mostly for complete code coverage's sake
@@ -119,3 +124,15 @@ def test_key_rewrite():
     hamt["foo"] = bytes("something else", "utf-8")
     assert len(hamt) == 1
     assert b"something else" == hamt["foo"]
+
+
+# Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
+def test_link_following():
+    hamt = HAMT(store=memory_store, max_bucket_size=1)
+    kvs = [("\x0e", b""), ("Ù\x9aÛôå", b""), ("\U000e1d41\U000fef3e\x89", b"")]
+    for k, v in kvs:
+        hamt[k] = v
+    assert len(hamt) == 3
+    for k, _ in kvs:
+        del hamt[k]
+    assert len(hamt) == 0
