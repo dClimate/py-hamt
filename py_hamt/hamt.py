@@ -272,7 +272,7 @@ class HAMT(MutableMapping):
             _, top_node = node_stack[-1]
             curr_key, curr_val = kvs_queue[0]
 
-            raw_hash = self.hash_fn(bytes(curr_key, "utf-8"))  # type: ignore
+            raw_hash = self.hash_fn(curr_key.encode())
             map_key = str(extract_bits(raw_hash, len(node_stack), 8))
 
             buckets: dict[str, list[dict[str, bytes]]] = top_node.data["b"]  # type: ignore
@@ -351,7 +351,7 @@ class HAMT(MutableMapping):
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
-        raw_hash = self.hash_fn(bytes(key, "utf-8"))  # type: ignore
+        raw_hash = self.hash_fn(key.encode())
 
         node_stack: list[tuple[bytes, Node]] = []
         root_node = Node.deserialize(self.store.load(self.root_node_id))
@@ -414,7 +414,7 @@ class HAMT(MutableMapping):
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
-        raw_hash = self.hash_fn(bytes(key, "utf-8"))  # type: ignore
+        raw_hash = self.hash_fn(key.encode())
 
         node_id_stack: list[bytes] = []
         node_id_stack.append(self.root_node_id)
