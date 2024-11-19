@@ -200,6 +200,7 @@ class HAMT(MutableMapping):
         self.read_only = read_only
         self.lock = Lock()
 
+    # dunder for the python deepcopy module
     def __deepcopy__(self, memo) -> "HAMT":
         if not self.read_only:
             self.lock.acquire(blocking=True)

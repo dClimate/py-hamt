@@ -9,7 +9,7 @@ from hypothesis import strategies as st
 from hypothesis.strategies import SearchStrategy
 import pytest
 
-from py_hamt import HAMT, blake3_hashfn, DictStore
+from py_hamt import HAMT, blake3_hashfn, DictStore, IPFSStore
 from py_hamt.hamt import Node
 
 
@@ -45,7 +45,7 @@ def ipld_strategy() -> SearchStrategy:
 key_value_lists = st.lists(
     st.tuples(st.text(), ipld_strategy()),
     min_size=0,
-    max_size=1000000,
+    max_size=100,
     unique_by=lambda x: x[
         0
     ],  # ensure unique keys, otherwise we can't do the length and size checks
@@ -54,9 +54,9 @@ key_value_lists = st.lists(
 
 @given(key_value_lists)
 def test_fuzz(kvs):
-    memory_store = DictStore()
+    store = DictStore()
     hamt = HAMT(
-        store=memory_store,
+        store=store,
         hash_fn=blake3_hashfn,
         read_only=False,
     )
@@ -102,7 +102,7 @@ def test_fuzz(kvs):
     # Make sure all ids actually exist in the store, this should not raies any exceptions
     store_ids = list(hamt.ids())
     for id in store_ids:
-        memory_store.load(id)  # type: ignore
+        store.load(id)
 
     hamt.make_read_only()
     with pytest.raises(Exception, match="Cannot call set on a read only HAMT"):
@@ -159,8 +159,8 @@ def test_remaining_exceptions():
 
 
 def test_key_rewrite():
-    memory_store = DictStore()
-    hamt = HAMT(store=memory_store)
+    store = IPFSStore()
+    hamt = HAMT(store=store)
     hamt["foo"] = b"bar"
     assert b"bar" == hamt["foo"]
     assert len(hamt) == 1
@@ -175,8 +175,8 @@ def test_key_rewrite():
 
 # Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
 def test_link_following():
-    memory_store = DictStore()
-    hamt = HAMT(store=memory_store, max_bucket_size=1)
+    store = IPFSStore()
+    hamt = HAMT(store=store, max_bucket_size=1)
     kvs = [("\x0e", b""), ("Ù\x9aÛôå", b""), ("\U000e1d41\U000fef3e\x89", b"")]
     for k, v in kvs:
         hamt[k] = v

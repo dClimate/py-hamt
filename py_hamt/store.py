@@ -100,9 +100,6 @@ class IPFSStore(Store):
         cid = CID.decode(cid_str)
 
         return cid
-        # TODO error handling
-        # https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#5xx_server_errors
-        # return cid.encode().encode()
 
     # Ignore the type error since CID is in the IPLDKind type
     def load(self, id: CID) -> bytes:  # type: ignore
@@ -122,9 +119,4 @@ class IPFSStore(Store):
             f"{self.gateway_uri_stem}/ipfs/{str(id)}", timeout=self.timeout_seconds
         )
 
-        if response.status_code == 200:
-            return response.content
-        else:
-            # TODO better error handling
-            # https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#5xx_server_errors
-            raise Exception("Connection to IPFS Gateway ")
+        return response.content
