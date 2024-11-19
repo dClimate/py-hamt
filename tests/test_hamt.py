@@ -1,27 +1,60 @@
 from copy import deepcopy
 import random
-from typing_extensions import MutableMapping
+from collections.abc import MutableMapping
 
 import dag_cbor
-from hypothesis import given, strategies as st
+from multiformats import CID
+from hypothesis import given
+from hypothesis import strategies as st
+from hypothesis.strategies import SearchStrategy
 import pytest
 
 from py_hamt import HAMT, blake3_hashfn, DictStore
 from py_hamt.hamt import Node
 
-memory_store = DictStore()
+
+def cid_strategy() -> SearchStrategy:
+    """Generate random CIDs for testing."""
+
+    # Strategy for generating random hash digests
+    digests = st.binary(min_size=32, max_size=32).map(
+        lambda d: bytes.fromhex("1220") + d  # 0x12 = sha2-256, 0x20 = 32 bytes
+    )
+
+    # Generate CIDv1 (more flexible)
+    cidv1 = st.tuples(st.just("base32"), st.just(1), st.just("dag-cbor"), digests)
+
+    # Combine the strategies and create CIDs
+    return cidv1.map(lambda args: CID(*args))
+
+
+def ipld_strategy() -> SearchStrategy:
+    return st.one_of(
+        [
+            st.none(),
+            st.booleans(),
+            st.integers(min_value=-9223372036854775808, max_value=9223372036854775807),
+            st.floats(allow_infinity=False, allow_nan=False),
+            st.text(),
+            st.binary(),
+            cid_strategy(),
+        ]
+    )
+
 
 key_value_lists = st.lists(
-    st.tuples(st.text(), st.binary()),
+    st.tuples(st.text(), ipld_strategy()),
     min_size=0,
     max_size=1000000,
-    unique_by=lambda x: x[0],  # ensure unique keys
+    unique_by=lambda x: x[
+        0
+    ],  # ensure unique keys, otherwise we can't do the length and size checks
 )
 
 
 @given(key_value_lists)
 def test_fuzz(kvs):
-    """Test that all inserted items can be retrieved correctly."""
+    memory_store = DictStore()
     hamt = HAMT(
         store=memory_store,
         hash_fn=blake3_hashfn,
@@ -69,7 +102,7 @@ def test_fuzz(kvs):
     # Make sure all ids actually exist in the store, this should not raies any exceptions
     store_ids = list(hamt.ids())
     for id in store_ids:
-        memory_store.load(id)
+        memory_store.load(id)  # type: ignore
 
     hamt.make_read_only()
     with pytest.raises(Exception, match="Cannot call set on a read only HAMT"):
@@ -92,6 +125,7 @@ def test_fuzz(kvs):
 
 # Mostly for complete code coverage's sake
 def test_remaining_exceptions():
+    memory_store = DictStore()
     with pytest.raises(Exception, match="ID not found in store"):
         memory_store.load(b"foo")
 
@@ -102,9 +136,9 @@ def test_remaining_exceptions():
     hamt = HAMT(
         store=memory_store,
     )
-    root_node = Node.deserialize(memory_store.load(hamt.root_node_id))
-    buckets: dict[str, list[dict[str, bytes]]] = root_node.data["b"]  # type: ignore
-    links: dict[str, bytes] = root_node.data["c"]  # type: ignore
+    root_node = Node.deserialize(memory_store.load(hamt.root_node_id))  # type: ignore
+    buckets = root_node.get_buckets()
+    links = root_node.get_links()
     # 224 was found by just testing the hamt with blake3 hash function to see what the hash and thus map key ends up being
     buckets["224"] = []
     links["224"] = b"bar"
@@ -112,17 +146,20 @@ def test_remaining_exceptions():
     bad_hamt = HAMT(store=memory_store, root_node_id=bad_node_id)
 
     with pytest.raises(
-        Exception, match="Key in both buckets and links of the node, invariant violated"
+        Exception,
+        match="Key in both buckets and links of the node, invariant violated",
     ):
         bad_hamt["foo"] = b"bar2"
 
     with pytest.raises(
-        Exception, match="Key in both buckets and links of the node, invariant violated"
+        Exception,
+        match="Key in both buckets and links of the node, invariant violated",
     ):
         del bad_hamt["foo"]
 
 
 def test_key_rewrite():
+    memory_store = DictStore()
     hamt = HAMT(store=memory_store)
     hamt["foo"] = b"bar"
     assert b"bar" == hamt["foo"]
@@ -132,9 +169,13 @@ def test_key_rewrite():
     assert len(hamt) == 1
     assert b"something else" == hamt["foo"]
 
+    hamt["foo"] = CID("base32", 1, "dag-cbor", ("blake3", bytes(32)))
+    assert len(hamt) == 1
+
 
 # Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
 def test_link_following():
+    memory_store = DictStore()
     hamt = HAMT(store=memory_store, max_bucket_size=1)
     kvs = [("\x0e", b""), ("Ù\x9aÛôå", b""), ("\U000e1d41\U000fef3e\x89", b"")]
     for k, v in kvs:

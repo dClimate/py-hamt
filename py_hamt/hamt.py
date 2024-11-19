@@ -38,6 +38,11 @@ def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
     return result
 
 
+# Used for readability, since a HAMT also stores IPLDKind objects
+# Store IDs are also IPLDKind, which makes the code harder to read if only using IPLDKind rather than this type alias
+type Link = IPLDKind
+
+
 class Node:
     # Use a dict for easy serializability with dag_cbor
     data: dict[str, IPLDKind]
@@ -46,21 +51,30 @@ class Node:
         data = {}
 
         # Each "string" key for both buckets and CIDs is the bits as a string, e.g. str(0b1101) = '13'
-        buckets: dict[str, list[dict[str, bytes]]] = {}
-        data["b"] = buckets
-        links: dict[str, bytes] = {}
-        data["c"] = links
+        buckets: dict[str, list[dict[str, IPLDKind]]] = {}
+        data["B"] = buckets
+        links: dict[str, Link] = {}
+        data["L"] = links
         self.data = data
 
-    def _replace_link(self, old_link: bytes, new_link: bytes):
-        links: dict[str, bytes] = self.data["c"]  # type: ignore
+    # By having these two methods, the HAMT class has to know less about Node's internal structure and we get better type checking since we don't need to put #type:ignore everywhere
+    def get_buckets(self) -> dict[str, list[dict[str, IPLDKind]]]:
+        buckets: dict[str, list[dict[str, IPLDKind]]] = self.data["B"]  # type: ignore
+        return buckets
+
+    def get_links(self) -> dict[str, Link]:
+        links: dict[str, Link] = self.data["L"]  # type: ignore
+        return links
+
+    def _replace_link(self, old_link: Link, new_link: Link):
+        links = self.get_links()
         for str_key in list(links.keys()):
             link = links[str_key]
             if link == old_link:
                 links[str_key] = new_link
 
-    def _remove_link(self, old_link: bytes):
-        links: dict[str, bytes] = self.data["c"]  # type: ignore
+    def _remove_link(self, old_link: Link):
+        links = self.get_links()
         for str_key in list(links.keys()):
             link = links[str_key]
             if link == old_link:
@@ -74,10 +88,10 @@ class Node:
         decoded = dag_cbor.decode(data)
         if (
             isinstance(decoded, dict)
-            and "b" in decoded
-            and isinstance(decoded["b"], dict)
-            and "c" in decoded
-            and isinstance(decoded["c"], dict)
+            and "B" in decoded
+            and isinstance(decoded["B"], dict)
+            and "L" in decoded
+            and isinstance(decoded["L"], dict)
         ):
             node = cls()
             node.data = decoded
@@ -111,7 +125,7 @@ class HAMT(MutableMapping):
 
     in_memory_store = DictStore()
     hamt = HAMT(store=in_memory_store)
-    hamt["foo"] = b"bar"
+    hamt["foo"] = "bar"
     assert b"bar" == hamt["foo"]
     assert len(hamt) == 1
     hamt["foo"] = b"bar1"
@@ -141,7 +155,8 @@ class HAMT(MutableMapping):
     max_bucket_size: int
     """@private"""
 
-    root_node_id: bytes
+    # Don't use the type alias here since this is exposed in the documentation
+    root_node_id: IPLDKind
     """DO NOT modify this directly.
 
     This is the ID that the store returns for the root node of the HAMT. This is exposed since it is sometimes useful to read this for storing to construct other HAMTs later if using a persistent store.
@@ -168,7 +183,7 @@ class HAMT(MutableMapping):
         hash_fn: Callable[[bytes], bytes] = blake3_hashfn,
         max_bucket_size: int = 4,
         read_only: bool = False,
-        root_node_id=None,
+        root_node_id: IPLDKind = None,
     ):
         self.store = store
         self.hash_fn = hash_fn
@@ -214,7 +229,7 @@ class HAMT(MutableMapping):
         self.read_only = False
         self.lock.release()
 
-    def _reserialize_and_link(self, node_stack: list[tuple[bytes, Node]]):
+    def _reserialize_and_link(self, node_stack: list[tuple[Link, Node]]):
         """
         For internal use
         This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
@@ -228,8 +243,8 @@ class HAMT(MutableMapping):
             old_store_id, node = node_stack[stack_index]
 
             # If this node is empty, and its not the root node, then we can delete it entirely from the list
-            buckets: dict[str, list[dict[str, bytes]]] = node.data["b"]  # type: ignore
-            links: dict[str, bytes] = node.data["c"]  # type: ignore
+            buckets = node.get_buckets()
+            links = node.get_links()
             is_empty = len(buckets) == 0 and len(links) == 0
             is_not_root = stack_index > 0
 
@@ -250,20 +265,20 @@ class HAMT(MutableMapping):
                     _, prev_node = node_stack[stack_index - 1]
                     prev_node._replace_link(old_store_id, new_store_id)
 
-    def __setitem__(self, key_to_insert: str, val_to_insert: bytes):
+    def __setitem__(self, key_to_insert: str, val_to_insert: IPLDKind):
         if self.read_only:
             raise Exception("Cannot call set on a read only HAMT")
 
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
-        node_stack: list[tuple[bytes, Node]] = []
+        node_stack: list[tuple[Link, Node]] = []
         root_node = Node.deserialize(self.store.load(self.root_node_id))
         node_stack.append((self.root_node_id, root_node))
 
         # FIFO queue to keep track of all the KVs we need to insert
         # This is important for if any buckets overflow and thus we need to reinsert all those KVs
-        kvs_queue: list[tuple[str, bytes]] = []
+        kvs_queue: list[tuple[str, IPLDKind]] = []
         kvs_queue.append((key_to_insert, val_to_insert))
 
         created_change = False
@@ -275,8 +290,8 @@ class HAMT(MutableMapping):
             raw_hash = self.hash_fn(curr_key.encode())
             map_key = str(extract_bits(raw_hash, len(node_stack), 8))
 
-            buckets: dict[str, list[dict[str, bytes]]] = top_node.data["b"]  # type: ignore
-            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+            buckets = top_node.get_buckets()
+            links = top_node.get_links()
 
             if map_key in links and map_key in buckets:
                 self.lock.release()
@@ -329,7 +344,7 @@ class HAMT(MutableMapping):
                     node_stack.append((new_node_id, new_node))
             else:
                 # If there is no link and no bucket, then we can create a new bucket, insert, and be done with this key
-                bucket: list[dict[str, bytes]] = []
+                bucket: list[dict[str, IPLDKind]] = []
                 bucket.append({curr_key: curr_val})
                 kvs_queue.pop(0)
                 buckets[map_key] = bucket
@@ -339,7 +354,8 @@ class HAMT(MutableMapping):
         # Finally, reserialize and fix all links, deleting empty nodes as needed
         if created_change:
             self._reserialize_and_link(node_stack)
-            self.root_node_id = node_stack[0][0]
+            node_stack_top_id = node_stack[0][0]
+            self.root_node_id = node_stack_top_id
 
         if not self.read_only:
             self.lock.release()
@@ -353,7 +369,7 @@ class HAMT(MutableMapping):
 
         raw_hash = self.hash_fn(key.encode())
 
-        node_stack: list[tuple[bytes, Node]] = []
+        node_stack: list[tuple[Link, Node]] = []
         root_node = Node.deserialize(self.store.load(self.root_node_id))
         node_stack.append((self.root_node_id, root_node))
 
@@ -362,8 +378,8 @@ class HAMT(MutableMapping):
             top_id, top_node = node_stack[-1]
             map_key = str(extract_bits(raw_hash, len(node_stack), 8))
 
-            buckets: dict[str, list[dict[str, bytes]]] = top_node.data["b"]  # type: ignore
-            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+            buckets = top_node.get_buckets()
+            links = top_node.get_links()
 
             if map_key in buckets and map_key in links:
                 self.lock.release()
@@ -402,7 +418,8 @@ class HAMT(MutableMapping):
         if created_change:
             self._reserialize_and_link(node_stack)
             self.key_count -= 1
-            self.root_node_id = node_stack[0][0]
+            node_stack_top_id = node_stack[0][0]
+            self.root_node_id = node_stack_top_id
 
         if not self.read_only:
             self.lock.release()
@@ -410,32 +427,35 @@ class HAMT(MutableMapping):
         if not created_change:
             raise KeyError
 
-    def __getitem__(self, key: str):
+    def __getitem__(self, key: str) -> IPLDKind:
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
         raw_hash = self.hash_fn(key.encode())
 
-        node_id_stack: list[bytes] = []
+        node_id_stack: list[Link] = []
         node_id_stack.append(self.root_node_id)
 
-        result: bytes | None = None
+        # Don't check if result is none but use a boolean to indicate finding something, this is because None is a possible value the HAMT can store
+        result: IPLDKind = None
+        found_a_result: bool = False
         while True:
             top_id = node_id_stack[-1]
             top_node = Node.deserialize(self.store.load(top_id))
             map_key = str(extract_bits(raw_hash, len(node_id_stack), 8))
 
             # Check if this node is in one of the buckets
-            buckets: dict[str, list[dict[str, bytes]]] = top_node.data["b"]  # type: ignore
+            buckets = top_node.get_buckets()
             if map_key in buckets:
                 bucket = buckets[map_key]
                 for kv in bucket:
                     if key in kv:
                         result = kv[key]
+                        found_a_result = True
                         break
 
             # If it isn't in one of the buckets, check if there's a link to another serialized node id
-            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+            links = top_node.get_links()
             if map_key in links:
                 link_id = links[map_key]
                 node_id_stack.append(link_id)
@@ -447,10 +467,10 @@ class HAMT(MutableMapping):
         if not self.read_only:
             self.lock.release()
 
-        if result is None:
+        if not found_a_result:
             raise KeyError
-        else:
-            return result
+
+        return result
 
     def __len__(self) -> int:
         """Total number of keys"""
@@ -484,23 +504,23 @@ class HAMT(MutableMapping):
             node = Node.deserialize(top)
 
             # Collect all keys from all buckets
-            buckets: dict[str, list[dict[str, bytes]]] = node.data["b"]  # type: ignore
+            buckets = node.get_buckets()
             for bucket in buckets.values():
                 for kv in bucket:
                     for k in kv:
                         yield k
 
             # Traverse down list of links
-            cids: dict[str, bytes] = node.data["c"]  # type: ignore
-            for cid in cids.values():
-                node_id_stack.append(cid)
+            links = node.get_links()
+            for link in links.values():
+                node_id_stack.append(link)
 
     def ids(self):
         """Generator of all IDs the backing store uses"""
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
-        node_id_stack = []
+        node_id_stack: list[Link] = []
         node_id_stack.append(self.root_node_id)
 
         if not self.read_only:
@@ -512,6 +532,6 @@ class HAMT(MutableMapping):
             top_node = Node.deserialize(self.store.load(top_id))
 
             # Traverse down list of ids that are the store's links'
-            links: dict[str, bytes] = top_node.data["c"]  # type: ignore
+            links = top_node.get_links()
             for link in links.values():
                 node_id_stack.append(link)
