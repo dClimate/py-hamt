@@ -18,6 +18,13 @@ jobs:
       - name: Create project environment
         run: uv sync
 
+      - name: Install IPFS
+        uses: ibnesayeed/setup-ipfs@master
+        with:
+          ipfs_version: "0.32.1"
+          run_daemon: true
+        id: ipfs_setup
+
       - name: Run pytest with coverage
         run: uv run pytest --cov=py_hamt tests/
 
