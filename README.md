@@ -30,6 +30,7 @@ uv sync
 to create the project virtual environment at `.venv` based on the lockfile `uv.lock`. Don't worry about activating this virtual environment to run tests or formatting and linting, uv will automatically take care of that.
 
 ## Run tests, formatting, linting
+First, make sure you have the ipfs kubo daemon installed so that you can run the tests that utilize IPFS as a backing store. e.g. `ipfs daemon`. If needed, configure the test with your custom HTTP gateway and RPC API endpoints. Then run the script
 ```sh
 bash run-checks.sh
 ```

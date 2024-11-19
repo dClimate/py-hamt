@@ -8,11 +8,14 @@ from multiformats.multihash import Multihash
 
 
 class Store(ABC):
-    """This is an Abstract Base Class that represents a storage mechanism the HAMT can use for keeping data."""
+    """This is an Abstract Base Class that represents a storage mechanism the HAMT can use for keeping data.
+
+    The return type of save and input to load is really type IPLDKind, but the documentation generates this strange type instead since IPLDKind is a type union.
+    """
 
     @abstractmethod
     def save(self, data: bytes) -> IPLDKind:
-        """Take any set of bytes, save it to the storage mechanism, and return an ID that can be used to retrieve those bytes later."""
+        """Take any set of bytes, save it to the storage mechanism, and return an ID in the type of IPLDKind that can be used to retrieve those bytes later."""
 
     @abstractmethod
     def load(self, id: IPLDKind) -> bytes:
