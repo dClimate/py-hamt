@@ -61,6 +61,7 @@ class IPFSStore(Store):
         timeout_seconds=30,
         gateway_uri_stem="http://127.0.0.1:8080",
         rpc_uri_stem="http://127.0.0.1:5001",
+        cid_codec="dag-cbor",
         mhtype="blake3",
         mhlen="32",
     ):
@@ -75,6 +76,7 @@ class IPFSStore(Store):
         URI stem of the IPFS HTTP gateway that IPFSStore will retrieve blocks from.
         """
         self.rpc_uri_stem = rpc_uri_stem
+        self.cid_codec = cid_codec
         """URI Stem of the IPFS RPC API that IPFSStore will send data to save to."""
         self.mhtype = mhtype
         """The Multihash hash function that the RPC requests send. This is used by the IPFS daemon to generate the CID."""
@@ -95,7 +97,7 @@ class IPFSStore(Store):
         ```
         """
         rpc_response = requests.post(
-            f"{self.rpc_uri_stem}/api/v0/block/put?cid-codec=dag-cbor&mhtype={self.mhtype}&mhlen={self.mhlen}&pin=true",
+            f"{self.rpc_uri_stem}/api/v0/block/put?cid-codec={self.cid_codec}&mhtype={self.mhtype}&mhlen={self.mhlen}&pin=true",
             files={"file": data},
         )
 
