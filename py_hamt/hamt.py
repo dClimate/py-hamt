@@ -1,10 +1,14 @@
-from threading import Lock
-from typing import Callable
 from collections.abc import MutableMapping
+from copy import deepcopy
+from sys import getsizeof
+from threading import Lock
+import time
+from typing import Callable
 
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
+from sortedcontainers import SortedKeyList
 
 from .store import Store
 
@@ -41,6 +45,7 @@ def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
 # Used for readability, since a HAMT also stores IPLDKind objects
 # Store IDs are also IPLDKind, which makes the code harder to read if only using IPLDKind rather than this type alias
 type Link = IPLDKind
+type StoreID = IPLDKind
 
 
 class Node:
@@ -188,6 +193,66 @@ class HAMT(MutableMapping):
     You can modify the read status of a HAMT through the `make_read_only` or `enable_write` functions, so that the HAMT will block on making a change until all mutating operations are done.
     """
 
+    # Goes from dag_cbor encoding bytes of a Store ID, which is just IPLDKind type
+    cache: dict[IPLDKind, Node]
+    id_to_time: dict[IPLDKind, float]
+    # Stores a list of tuples like (time: float, id: IPLDKind)
+    last_accessed_times: SortedKeyList
+    max_cache_size_bytes: int
+
+    def clear_cache_lru(self):
+        # The last condition is to check if anything is even in the cache. This is important for times when the cache size is so small that the size of the empty objects is larger than the cache limit
+        while (
+            getsizeof(self.cache)
+            + getsizeof(self.id_to_time)
+            + getsizeof(self.last_accessed_times)
+        ) > self.max_cache_size_bytes and len(self.last_accessed_times) > 0:
+            least_recently_used: tuple[float, IPLDKind] = self.last_accessed_times.pop(
+                0
+            )
+            least_recently_used_id = least_recently_used[1]
+            del self.cache[least_recently_used_id]
+            del self.id_to_time[least_recently_used_id]
+
+    def update_node_cachetime(self, node_id: IPLDKind):
+        previous_time = self.id_to_time[node_id]
+        self.last_accessed_times.remove((previous_time, node_id))
+
+        current_time = time.time()
+        self.id_to_time[node_id] = current_time
+        self.last_accessed_times.add((current_time, node_id))
+
+    def add_node_to_cache(self, node_id: IPLDKind, node: Node):
+        current_time = time.time()
+        self.cache[node_id] = node
+        self.id_to_time[node_id] = current_time
+        self.last_accessed_times.add((current_time, node_id))
+
+    def write_node(self, node: Node) -> IPLDKind:
+        node_id = self.store.save_dag_cbor(node.serialize())
+        if node_id in self.cache:
+            self.update_node_cachetime(node_id)
+        else:
+            self.add_node_to_cache(node_id, node)
+        self.clear_cache_lru()
+
+        return node_id
+
+    def read_node(self, node_id: IPLDKind) -> Node:
+        result: Node
+        # Cache Hit
+        if node_id in self.cache:
+            result = self.cache[node_id]
+            self.update_node_cachetime(node_id)
+        # Cache Miss
+        else:
+            result = Node.deserialize(self.store.load(node_id))
+            self.add_node_to_cache(node_id, result)
+            self.clear_cache_lru()
+
+        # If we don't deepcopy, then we return a reference that other functions can modify, which means this cache will immediately become inconsistent with the backing store
+        return deepcopy(result)
+
     def __init__(
         self,
         store: Store,
@@ -195,15 +260,24 @@ class HAMT(MutableMapping):
         max_bucket_size: int = 4,
         read_only: bool = False,
         root_node_id: IPLDKind = None,
+        max_cache_size_bytes=10000000,  # default to 10 megabytes
     ):
         self.store = store
         self.hash_fn = hash_fn
 
+        self.cache = {}
+        self.id_to_time = {}
+        # Sort by the time float value which is the first in the tuple in this sorted collection
+        self.last_accessed_times = SortedKeyList(key=lambda x: x[0])
+        self.max_cache_size_bytes = max_cache_size_bytes
+
         if root_node_id is None:
             root_node = Node()
-            self.root_node_id = store.save(root_node.serialize())
+            self.root_node_id = self.write_node(root_node)
         else:
             self.root_node_id = root_node_id
+            # Make sure the cache has our root node
+            self.read_node(self.root_node_id)
 
         self.key_count = 0
 
@@ -257,7 +331,7 @@ class HAMT(MutableMapping):
             # If this node is empty, and its not the root node, then we can delete it entirely from the list
             buckets = node.get_buckets()
             links = node.get_links()
-            is_empty = len(buckets) == 0 and len(links) == 0
+            is_empty = buckets == {} and links == {}
             is_not_root = stack_index > 0
 
             if is_empty and is_not_root:
@@ -269,7 +343,7 @@ class HAMT(MutableMapping):
                 node_stack.pop(stack_index)
             else:
                 # Reserialize
-                new_store_id = self.store.save(node.serialize())
+                new_store_id = self.write_node(node)
                 node_stack[stack_index] = (new_store_id, node)
 
                 # If this is not the last i.e. root node, we need to change the linking of the node prior in the list
@@ -284,14 +358,16 @@ class HAMT(MutableMapping):
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
+        val_ptr = self.store.save_raw(dag_cbor.encode(val_to_insert))
+
         node_stack: list[tuple[Link, Node]] = []
-        root_node = Node.deserialize(self.store.load(self.root_node_id))
+        root_node = self.read_node(self.root_node_id)
         node_stack.append((self.root_node_id, root_node))
 
         # FIFO queue to keep track of all the KVs we need to insert
         # This is important for if any buckets overflow and thus we need to reinsert all those KVs
         kvs_queue: list[tuple[str, IPLDKind]] = []
-        kvs_queue.append((key_to_insert, val_to_insert))
+        kvs_queue.append((key_to_insert, val_ptr))
 
         created_change = False
         # Keep iterating until we have no more KVs to insert
@@ -312,7 +388,7 @@ class HAMT(MutableMapping):
                 )
             elif map_key in links:
                 next_node_id = links[map_key]
-                next_node = Node.deserialize(self.store.load(next_node_id))
+                next_node = self.read_node(next_node_id)
                 node_stack.append((next_node_id, next_node))
             elif map_key in buckets:
                 bucket = buckets[map_key]
@@ -348,7 +424,7 @@ class HAMT(MutableMapping):
 
                     # Create a new link to a new node so that we can reflow these KVs into new buckets
                     new_node = Node()
-                    new_node_id = self.store.save(new_node.serialize())
+                    new_node_id = self.write_node(new_node)
 
                     links[map_key] = new_node_id
 
@@ -382,7 +458,7 @@ class HAMT(MutableMapping):
         raw_hash = self.hash_fn(key.encode())
 
         node_stack: list[tuple[Link, Node]] = []
-        root_node = Node.deserialize(self.store.load(self.root_node_id))
+        root_node = self.read_node(self.root_node_id)
         node_stack.append((self.root_node_id, root_node))
 
         created_change = False
@@ -418,7 +494,7 @@ class HAMT(MutableMapping):
                 break
             elif map_key in links:
                 link = links[map_key]
-                next_node = Node.deserialize(self.store.load(link))
+                next_node = self.read_node(link)
                 node_stack.append((link, next_node))
                 continue
 
@@ -449,11 +525,11 @@ class HAMT(MutableMapping):
         node_id_stack.append(self.root_node_id)
 
         # Don't check if result is none but use a boolean to indicate finding something, this is because None is a possible value the HAMT can store
-        result: IPLDKind = None
+        result_ptr: IPLDKind = None
         found_a_result: bool = False
         while True:
             top_id = node_id_stack[-1]
-            top_node = Node.deserialize(self.store.load(top_id))
+            top_node = self.read_node(top_id)
             map_key = str(extract_bits(raw_hash, len(node_id_stack), 8))
 
             # Check if this node is in one of the buckets
@@ -462,7 +538,7 @@ class HAMT(MutableMapping):
                 bucket = buckets[map_key]
                 for kv in bucket:
                     if key in kv:
-                        result = kv[key]
+                        result_ptr = kv[key]
                         found_a_result = True
                         break
 
@@ -482,7 +558,7 @@ class HAMT(MutableMapping):
         if not found_a_result:
             raise KeyError
 
-        return result
+        return dag_cbor.decode(self.store.load(result_ptr))
 
     def __len__(self) -> int:
         """Total number of keys"""
@@ -511,9 +587,8 @@ class HAMT(MutableMapping):
             if len(node_id_stack) == 0:
                 break
 
-            id_top = node_id_stack.pop()
-            top = self.store.load(id_top)
-            node = Node.deserialize(top)
+            top_id = node_id_stack.pop()
+            node = self.read_node(top_id)
 
             # Collect all keys from all buckets
             buckets = node.get_buckets()
@@ -541,7 +616,7 @@ class HAMT(MutableMapping):
         while len(node_id_stack) > 0:
             top_id = node_id_stack.pop()
             yield top_id
-            top_node = Node.deserialize(self.store.load(top_id))
+            top_node = self.read_node(top_id)
 
             # Traverse down list of ids that are the store's links'
             links = top_node.get_links()

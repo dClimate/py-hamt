@@ -10,12 +10,18 @@ from multiformats.multihash import Multihash
 class Store(ABC):
     """This is an Abstract Base Class that represents a storage mechanism the HAMT can use for keeping data.
 
+    TODO include information about expecting different IDs for different data, like an immutable data store basically
+
     The return type of save and input to load is really type IPLDKind, but the documentation generates this strange type instead since IPLDKind is a type union.
     """
 
     @abstractmethod
-    def save(self, data: bytes) -> IPLDKind:
+    def save_raw(self, data: bytes) -> IPLDKind:
         """Take any set of bytes, save it to the storage mechanism, and return an ID in the type of IPLDKind that can be used to retrieve those bytes later."""
+
+    @abstractmethod
+    def save_dag_cbor(self, data: bytes) -> IPLDKind:
+        """TODO documentation"""
 
     @abstractmethod
     def load(self, id: IPLDKind) -> bytes:
@@ -40,6 +46,12 @@ class DictStore(Store):
         self.store[hash] = data
         return hash
 
+    def save_raw(self, data: bytes) -> bytes:
+        return self.save(data)
+
+    def save_dag_cbor(self, data: bytes) -> bytes:
+        return self.save(data)
+
     # Ignore the type error since bytes is in the IPLDKind type
     def load(self, id: bytes) -> bytes:  # type: ignore
         if id in self.store:
@@ -61,9 +73,7 @@ class IPFSStore(Store):
         timeout_seconds=30,
         gateway_uri_stem="http://127.0.0.1:8080",
         rpc_uri_stem="http://127.0.0.1:5001",
-        cid_codec="dag-cbor",
-        mhtype="blake3",
-        mhlen="32",
+        hasher="blake3",
     ):
         self.timeout_seconds = timeout_seconds
         """
@@ -76,42 +86,44 @@ class IPFSStore(Store):
         URI stem of the IPFS HTTP gateway that IPFSStore will retrieve blocks from.
         """
         self.rpc_uri_stem = rpc_uri_stem
-        self.cid_codec = cid_codec
-        """URI Stem of the IPFS RPC API that IPFSStore will send data to save to."""
-        self.mhtype = mhtype
-        """The Multihash hash function that the RPC requests send. This is used by the IPFS daemon to generate the CID."""
-        self.mhlen = mhlen
-        """The length of the hash. Necessary for some hash functions like blake3, which has variable hash size."""
+        """URI Stem of the IPFS RPC API that IPFSStore will send data to."""
+        self.hasher = hasher
 
-    def save(self, data: bytes) -> CID:
+    def save(self, data: bytes, cid_codec: str) -> CID:
         """
         This saves the data to an ipfs daemon by calling the RPC API, and then returns the CID. By default, `save` pins content it adds.
 
         To get and print the CID, do a decode.
         ```python
-        from ipldstore import IPFSStore
+        from py_hamt import IPFSStore
 
         ipfs_store = IPFSStore()
         cid = ipfs_store.save("foo".encode())
         print(cid.human_readable)
         ```
         """
-        rpc_response = requests.post(
-            f"{self.rpc_uri_stem}/api/v0/block/put?cid-codec={self.cid_codec}&mhtype={self.mhtype}&mhlen={self.mhlen}&pin=true",
+        response = requests.post(
+            f"{self.rpc_uri_stem}/api/v0/add?cid-codec={cid_codec}&hash={self.hasher}&pin=true",
             files={"file": data},
         )
 
-        cid_str: str = json.decode(rpc_response.content)["Key"]  # type: ignore
+        cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
         cid = CID.decode(cid_str)
 
         return cid
+
+    def save_raw(self, data: bytes) -> CID:
+        return self.save(data, "raw")
+
+    def save_dag_cbor(self, data: bytes) -> CID:
+        return self.save(data, "dag-cbor")
 
     # Ignore the type error since CID is in the IPLDKind type
     def load(self, id: CID) -> bytes:  # type: ignore
         """
         This retrieves the raw bytes by calling the provided HTTP gateway.
         ```python
-        from ipldstore import IPFSStore
+        from py_hamt import IPFSStore
         from multiformats import CID
 
         ipfs_store = IPFSStore()
