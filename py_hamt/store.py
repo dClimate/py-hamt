@@ -10,7 +10,7 @@ from multiformats.multihash import Multihash
 class Store(ABC):
     """This is an Abstract Base Class that represents a storage mechanism the HAMT can use for keeping data.
 
-    TODO include information about expecting different IDs for different data, like an immutable data store basically
+    This should be some sort of immutable store. So different ids should be returned for different data, as opposed to one id being mutated.
 
     The return type of save and input to load is really type IPLDKind, but the documentation generates this strange type instead since IPLDKind is a type union.
     """
@@ -21,7 +21,7 @@ class Store(ABC):
 
     @abstractmethod
     def save_dag_cbor(self, data: bytes) -> IPLDKind:
-        """TODO documentation"""
+        """Take a set of bytes and save it just like `save_raw`, except this method has additional context that the data is in a dag-cbor format."""
 
     @abstractmethod
     def load(self, id: IPLDKind) -> bytes:
@@ -47,13 +47,16 @@ class DictStore(Store):
         return hash
 
     def save_raw(self, data: bytes) -> bytes:
+        """"""
         return self.save(data)
 
     def save_dag_cbor(self, data: bytes) -> bytes:
+        """"""
         return self.save(data)
 
     # Ignore the type error since bytes is in the IPLDKind type
     def load(self, id: bytes) -> bytes:  # type: ignore
+        """"""
         if id in self.store:
             return self.store[id]
         else:
@@ -64,7 +67,7 @@ class IPFSStore(Store):
     """
     Use IPFS as a backing store for a HAMT. The IDs returned from save and used by load are IPFS CIDs.
 
-    Save uses the RPC API but Load uses the HTTP Gateway, so read-only on HAMTs will only access HTTP Gateways.
+    save methods use the RPC API but Load uses the HTTP Gateway, so read-only on HAMTs will only access HTTP Gateways.
     If only doing reads, then the RPC API will never be called.
     """
 
@@ -79,7 +82,7 @@ class IPFSStore(Store):
         """
         You can modify this variable directly if you choose.
 
-        This sets the timeout in seconds for an HTTP request in both `save` and `load`.
+        This sets the timeout in seconds for all HTTP requests.
         """
         self.gateway_uri_stem = gateway_uri_stem
         """
@@ -88,17 +91,17 @@ class IPFSStore(Store):
         self.rpc_uri_stem = rpc_uri_stem
         """URI Stem of the IPFS RPC API that IPFSStore will send data to."""
         self.hasher = hasher
+        """The hash function to send to IPFS when storing bytes."""
 
     def save(self, data: bytes, cid_codec: str) -> CID:
         """
         This saves the data to an ipfs daemon by calling the RPC API, and then returns the CID. By default, `save` pins content it adds.
 
-        To get and print the CID, do a decode.
         ```python
         from py_hamt import IPFSStore
 
         ipfs_store = IPFSStore()
-        cid = ipfs_store.save("foo".encode())
+        cid = ipfs_store.save("foo".encode(), "raw")
         print(cid.human_readable)
         ```
         """
@@ -127,6 +130,7 @@ class IPFSStore(Store):
         from multiformats import CID
 
         ipfs_store = IPFSStore()
+        # This is just an example CID
         cid = CID.decode("bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze")
         data = ipfs_store.load(cid)
         print(data)

@@ -195,12 +195,16 @@ class HAMT(MutableMapping):
 
     # Goes from dag_cbor encoding bytes of a Store ID, which is just IPLDKind type
     cache: dict[IPLDKind, Node]
+    """@private"""
     id_to_time: dict[IPLDKind, float]
+    """@private"""
     # Stores a list of tuples like (time: float, id: IPLDKind)
     last_accessed_times: SortedKeyList
+    """@private"""
     max_cache_size_bytes: int
 
     def clear_cache_lru(self):
+        """@private"""
         # The last condition is to check if anything is even in the cache. This is important for times when the cache size is so small that the size of the empty objects is larger than the cache limit
         while (
             getsizeof(self.cache)
@@ -215,6 +219,7 @@ class HAMT(MutableMapping):
             del self.id_to_time[least_recently_used_id]
 
     def update_node_cachetime(self, node_id: IPLDKind):
+        """@private"""
         previous_time = self.id_to_time[node_id]
         self.last_accessed_times.remove((previous_time, node_id))
 
@@ -223,12 +228,14 @@ class HAMT(MutableMapping):
         self.last_accessed_times.add((current_time, node_id))
 
     def add_node_to_cache(self, node_id: IPLDKind, node: Node):
+        """@private"""
         current_time = time.time()
         self.cache[node_id] = node
         self.id_to_time[node_id] = current_time
         self.last_accessed_times.add((current_time, node_id))
 
     def write_node(self, node: Node) -> IPLDKind:
+        """@private"""
         node_id = self.store.save_dag_cbor(node.serialize())
         if node_id in self.cache:
             self.update_node_cachetime(node_id)
@@ -239,6 +246,7 @@ class HAMT(MutableMapping):
         return node_id
 
     def read_node(self, node_id: IPLDKind) -> Node:
+        """@private"""
         result: Node
         # Cache Hit
         if node_id in self.cache:
