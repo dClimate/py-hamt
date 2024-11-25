@@ -106,12 +106,14 @@ class IPFSStore(Store):
         ```
         """
         response = requests.post(
-            f"{self.rpc_uri_stem}/api/v0/add?cid-codec={cid_codec}&hash={self.hasher}&pin=true",
+            f"{self.rpc_uri_stem}/api/v0/add?hash={self.hasher}&pin=true",
             files={"file": data},
         )
 
         cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
         cid = CID.decode(cid_str)
+        # This API always returns raw encoded CIDs, change the encoding to the user specified one
+        cid = cid.set(codec=cid_codec)
 
         return cid
 
