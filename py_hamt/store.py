@@ -112,8 +112,11 @@ class IPFSStore(Store):
 
         cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
         cid = CID.decode(cid_str)
-        # This API always returns raw encoded CIDs, change the encoding to the user specified one
-        cid = cid.set(codec=cid_codec)
+        # If it's dag-pb it means we should not reset the cid codec, since this is a UnixFS entry for a large file that had to be sharded
+        # We don't worry about HAMT nodes being larger than 1 MB since, with a conservative calculation of 256 map keys * 10 bucket size of 9 and 1 link per map key*100 bytes huge size for a cid=0.256 MB, so we can always safely recodec those as dag-cbor, which is what they are
+        # 0x70 means dag-pb
+        if cid.codec.code != 0x70:
+            cid = cid.set(codec=cid_codec)
 
         return cid
 
