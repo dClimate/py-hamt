@@ -8,11 +8,9 @@ from multiformats.multihash import Multihash
 
 
 class Store(ABC):
-    """This is an Abstract Base Class that represents a storage mechanism the HAMT can use for keeping data.
+    """Abstract class that represents a storage mechanism the HAMT can use for keeping data.
 
-    This should be some sort of immutable store. So different ids should be returned for different data, as opposed to one id being mutated.
-
-    The return type of save and input to load is really type IPLDKind, but the documentation generates this strange type instead since IPLDKind is a type union.
+    The return type of save and input to load is really type IPLDKind, but the documentation generates something a bit strange since IPLDKind is a type union.
     """
 
     @abstractmethod
@@ -67,8 +65,7 @@ class IPFSStore(Store):
     """
     Use IPFS as a backing store for a HAMT. The IDs returned from save and used by load are IPFS CIDs.
 
-    save methods use the RPC API but Load uses the HTTP Gateway, so read-only on HAMTs will only access HTTP Gateways.
-    If only doing reads, then the RPC API will never be called.
+    Save methods use the RPC API but `load` uses the HTTP Gateway, so read-only HAMTs will only access the HTTP Gateway. This allows for connection to remote gateways as well.
     """
 
     def __init__(
@@ -95,7 +92,9 @@ class IPFSStore(Store):
 
     def save(self, data: bytes, cid_codec: str) -> CID:
         """
-        This saves the data to an ipfs daemon by calling the RPC API, and then returns the CID. By default, `save` pins content it adds.
+        This saves the data to an ipfs daemon by calling the RPC API, and then returns the CID, with a multicodec set by the input cid_codec. We need to do this since the API always returns either a multicodec of raw or dag-pb if it had to shard the input data.
+
+        By default, `save` pins content it adds.
 
         ```python
         from py_hamt import IPFSStore
@@ -122,9 +121,11 @@ class IPFSStore(Store):
         return cid
 
     def save_raw(self, data: bytes) -> CID:
+        """See `save`"""
         return self.save(data, "raw")
 
     def save_dag_cbor(self, data: bytes) -> CID:
+        """See `save`"""
         return self.save(data, "dag-cbor")
 
     # Ignore the type error since CID is in the IPLDKind type

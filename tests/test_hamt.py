@@ -227,7 +227,8 @@ def test_cache_clear():
 # Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
 def test_link_following():
     store = DictStore()
-    hamt = HAMT(store=store, max_bucket_size=1)
+    hamt = HAMT(store=store)
+    hamt.max_bucket_size = 1
     kvs = [("\x0e", b""), ("Ù\x9aÛôå", b""), ("\U000e1d41\U000fef3e\x89", b"")]
     for k, v in kvs:
         hamt[k] = v
