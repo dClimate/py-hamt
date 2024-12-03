@@ -10,7 +10,7 @@ from hypothesis import strategies as st
 from hypothesis.strategies import SearchStrategy
 import pytest
 
-from py_hamt import HAMT, DictStore, IPFSStore
+from py_hamt import HAMT, DictStore
 from py_hamt.hamt import Node
 from py_hamt.store import Store
 
@@ -139,6 +139,35 @@ def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     assert len(hamt) == 0
     assert len(copy_hamt) == len(kvs)
 
+    # Test that when a hamt has its root manually initialized by a user, that the key count is accurate
+    hamt_re_initialized = HAMT(store=store, root_node_id=copy_hamt.root_node_id)
+    assert len(hamt_re_initialized) == len(kvs)
+
+
+class BadStore(Store):
+    """ "
+    Bad store implementation that should cause errors
+    """
+
+    def save_raw(self, data: bytes) -> IPLDKind:
+        return 0
+
+    def save_dag_cbor(self, data: bytes) -> IPLDKind:
+        return 0
+
+    def load(self, id: IPLDKind) -> bytes:
+        return bytes(0)
+
+
+def test_bad_store():
+    bad_store = BadStore()
+    hamt = HAMT(store=bad_store, max_cache_size_bytes=0)
+    with pytest.raises(
+        Exception,
+        match="Invalid dag-cbor encoded data from the store was attempted to be decoded",
+    ):
+        hamt["test"] = 3
+
 
 # Mostly for complete code coverage's sake
 def test_remaining_exceptions():
@@ -175,34 +204,8 @@ def test_remaining_exceptions():
         del bad_hamt["foo"]
 
 
-class BadStore(Store):
-    """ "
-    Bad store implementation that should cause errors
-    """
-
-    def save_raw(self, data: bytes) -> IPLDKind:
-        return 0
-
-    def save_dag_cbor(self, data: bytes) -> IPLDKind:
-        return 0
-
-    def load(self, id: IPLDKind) -> bytes:
-        return bytes(0)
-
-
-def test_bad_store():
-    bad_store = BadStore()
-    hamt = HAMT(store=bad_store, max_cache_size_bytes=0)
-    with pytest.raises(
-        Exception,
-        match="Invalid dag-cbor encoded data from the store was attempted to be decoded",
-    ):
-        hamt["test"] = 3
-
-
 def test_key_rewrite():
-    store = IPFSStore()
-    hamt = HAMT(store=store)
+    hamt = HAMT(store=DictStore())
     hamt["foo"] = b"bar"
     assert b"bar" == hamt["foo"]
     assert len(hamt) == 1

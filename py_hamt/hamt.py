@@ -182,8 +182,6 @@ class HAMT(MutableMapping):
 
     This is really type IPLDKind, but the documentation generates this strange type instead since IPLDKind is a type union.
     """
-    key_count: int
-    """@private"""
 
     lock: Lock
     """
@@ -284,6 +282,10 @@ class HAMT(MutableMapping):
         self.last_accessed_times = SortedKeyList(key=lambda x: x[0])
         self.max_cache_size_bytes = max_cache_size_bytes
 
+        self.max_bucket_size = max_bucket_size
+        self.read_only = read_only
+        self.lock = Lock()
+
         if root_node_id is None:
             root_node = Node()
             self.root_node_id = self.write_node(root_node)
@@ -291,12 +293,6 @@ class HAMT(MutableMapping):
             self.root_node_id = root_node_id
             # Make sure the cache has our root node
             self.read_node(self.root_node_id)
-
-        self.key_count = 0
-
-        self.max_bucket_size = max_bucket_size
-        self.read_only = read_only
-        self.lock = Lock()
 
     # dunder for the python deepcopy module
     def __deepcopy__(self, memo) -> "HAMT":
@@ -310,7 +306,6 @@ class HAMT(MutableMapping):
             read_only=self.read_only,
             root_node_id=self.root_node_id,
         )
-        copy_hamt.key_count = self.key_count
 
         if not self.read_only:
             self.lock.release()
@@ -423,14 +418,12 @@ class HAMT(MutableMapping):
                 if bucket_has_space:
                     bucket.append({curr_key: curr_val})
                     kvs_queue.pop(0)
-                    self.key_count += 1
                 # If bucket is full and we need to add, then all these KVs need to be taken out of this bucket and reinserted throughout the tree
                 else:
                     # Empty the bucket of KVs into the queue
                     for kv in bucket:
                         for k, v in kv.items():
                             kvs_queue.append((k, v))
-                            self.key_count -= 1
 
                     # Delete empty bucket, there should only be a link now
                     del buckets[map_key]
@@ -449,7 +442,6 @@ class HAMT(MutableMapping):
                 bucket.append({curr_key: curr_val})
                 kvs_queue.pop(0)
                 buckets[map_key] = bucket
-                self.key_count += 1
                 created_change = True
 
         # Finally, reserialize and fix all links, deleting empty nodes as needed
@@ -518,7 +510,6 @@ class HAMT(MutableMapping):
         # Finally, reserialize and fix all links, deleting empty nodes as needed
         if created_change:
             self._reserialize_and_link(node_stack)
-            self.key_count -= 1
             node_stack_top_id = node_stack[0][0]
             self.root_node_id = node_stack_top_id
 
@@ -574,14 +565,10 @@ class HAMT(MutableMapping):
         return dag_cbor.decode(self.store.load(result_ptr))
 
     def __len__(self) -> int:
-        """Total number of keys"""
-        if not self.read_only:
-            self.lock.acquire(blocking=True)
-
-        key_count = self.key_count
-
-        if not self.read_only:
-            self.lock.release()
+        """Total number of keys. Note that this will have to scan the entire tree in order to count, which can take a while depending on the speed of the store retrieval."""
+        key_count = 0
+        for key in self:
+            key_count += 1
 
         return key_count
 
