@@ -12,6 +12,7 @@ import pytest
 
 from py_hamt import HAMT, DictStore, IPFSStore
 from py_hamt.hamt import Node
+from py_hamt.store import Store
 
 
 def cid_strategy() -> SearchStrategy:
@@ -172,6 +173,31 @@ def test_remaining_exceptions():
         match="Key in both buckets and links of the node, invariant violated",
     ):
         del bad_hamt["foo"]
+
+
+class BadStore(Store):
+    """ "
+    Bad store implementation that should cause errors
+    """
+
+    def save_raw(self, data: bytes) -> IPLDKind:
+        return 0
+
+    def save_dag_cbor(self, data: bytes) -> IPLDKind:
+        return 0
+
+    def load(self, id: IPLDKind) -> bytes:
+        return bytes(0)
+
+
+def test_bad_store():
+    bad_store = BadStore()
+    hamt = HAMT(store=bad_store, max_cache_size_bytes=0)
+    with pytest.raises(
+        Exception,
+        match="Invalid dag-cbor encoded data from the store was attempted to be decoded",
+    ):
+        hamt["test"] = 3
 
 
 def test_key_rewrite():

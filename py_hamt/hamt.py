@@ -90,7 +90,12 @@ class Node:
 
     @classmethod
     def deserialize(cls, data: bytes) -> "Node":
-        decoded = dag_cbor.decode(data)
+        try:
+            decoded = dag_cbor.decode(data)
+        except:  # noqa: E722
+            raise Exception(
+                "Invalid dag-cbor encoded data from the store was attempted to be decoded"
+            )
         if (
             isinstance(decoded, dict)
             and "B" in decoded
