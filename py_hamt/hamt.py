@@ -574,7 +574,7 @@ class HAMT(MutableMapping):
 
     def __len__(self) -> int:
         key_count = 0
-        for key in self:
+        for _ in self:
             key_count += 1
 
         return key_count
