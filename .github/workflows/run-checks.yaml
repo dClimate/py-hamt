@@ -1,0 +1,38 @@
+name: Run checks
+run-name: Triggered on push from ${{ github.actor }} to branch/tag ${{ github.ref_name }}
+on: push
+# Should be the same as py-hamt/run-checks.sh
+
+jobs:
+  run_checks:
+    name: Create project environment, run all checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Create project environment
+        run: uv sync
+
+      - name: Install IPFS
+        uses: ibnesayeed/setup-ipfs@master
+        with:
+          ipfs_version: "0.32.1"
+          run_daemon: true
+        id: ipfs_setup
+
+      - name: Run pytest with coverage
+        run: uv run pytest --cov=py_hamt tests/
+
+      - name: Check coverage
+        run: uv run coverage report --fail-under=100 --show-missing
+
+      - name: Check linting with ruff
+        run: uv run ruff check
+
+      - name: Check formatting with ruff
+        run: uv run ruff format --check
