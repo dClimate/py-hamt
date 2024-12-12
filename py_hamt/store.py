@@ -74,6 +74,7 @@ class IPFSStore(Store):
         gateway_uri_stem="http://127.0.0.1:8080",
         rpc_uri_stem="http://127.0.0.1:5001",
         hasher="blake3",
+        pin_on_add=False,
     ):
         self.timeout_seconds = timeout_seconds
         """
@@ -89,6 +90,8 @@ class IPFSStore(Store):
         """URI Stem of the IPFS RPC API that IPFSStore will send data to."""
         self.hasher = hasher
         """The hash function to send to IPFS when storing bytes."""
+        self.pin_on_add: bool = pin_on_add
+        """Whether IPFSStore should tell the daemon to pin the generated CIDs in API calls. This can be changed in between usage, but should be kept the same value for the lifetime of the program."""
 
     def save(self, data: bytes, cid_codec: str) -> CID:
         """
@@ -104,16 +107,19 @@ class IPFSStore(Store):
         print(cid.human_readable)
         ```
         """
+        pin_string: str = "true" if self.pin_on_add else "false"
+
         response = requests.post(
-            f"{self.rpc_uri_stem}/api/v0/add?hash={self.hasher}&pin=true",
+            f"{self.rpc_uri_stem}/api/v0/add?hash={self.hasher}&pin={pin_string}",
             files={"file": data},
         )
         response.raise_for_status()
 
         cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
         cid = CID.decode(cid_str)
-        # If it's dag-pb it means we should not reset the cid codec, since this is a UnixFS entry for a large value of a KV that had to be sharded
-        # We don't worry about HAMT nodes being larger than 1 MB since, with a conservative calculation of 256 map keys * 10 bucket size of 9 and 1 link per map key*100 bytes huge size for a cid=0.256 MB, so we can always safely recodec those as dag-cbor, which is what they are
+        # If it's dag-pb it means we should not reset the cid codec, since this is a UnixFS entry for a large amount of data that thus had to be sharded
+        # We don't worry about HAMT nodes being larger than 1 MB
+        # with a conservative calculation of 256 map keys * 10 (bucket size of 9 and 1 link per map key)*100 bytes huge size for a cid=0.256 MB, so we can always safely recodec those as dag-cbor, which is what they are
         # 0x70 means dag-pb
         if cid.codec.code != 0x70:
             cid = cid.set(codec=cid_codec)
