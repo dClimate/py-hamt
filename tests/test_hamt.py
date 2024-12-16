@@ -48,11 +48,9 @@ key_value_lists = st.lists(
     st.tuples(st.text(), ipld_strategy()),
     min_size=0,
     max_size=10000,
-    unique_by=lambda x: x[
-        0
-    ],  # ensure unique keys, otherwise we can't do the length and size checks
+    # ensure unique keys, otherwise we can't do the length and size checks
+    unique_by=lambda x: x[0],
 )
-
 
 # Sometimes useful to lace throughout the test lines when debugging cache problems
 # def find_cache_incosistency(hamt: HAMT):
@@ -144,22 +142,37 @@ def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     assert len(hamt_re_initialized) == len(kvs)
 
 
-class BadStore(Store):
-    """ "
-    Bad store implementation that should cause errors
-    """
+@given(key_value_lists)
+def test_merge(kvs: list[tuple[str, IPLDKind]]):
+    first_half = HAMT(store=DictStore())
+    second_half = HAMT(store=DictStore())
+    midpoint_index = len(kvs) // 2
+    for i in range(0, len(kvs)):
+        k, v = kvs[i]
+        if i < midpoint_index:
+            first_half[k] = v
+        else:
+            second_half[k] = v
+    first_half.merge(second_half)
+    merged = first_half
+    assert len(merged) == len(kvs)
+    for k, v in kvs:
+        assert merged[k] == v
 
-    def save_raw(self, data: bytes) -> IPLDKind:
-        return 0
 
-    def save_dag_cbor(self, data: bytes) -> IPLDKind:
-        return 0
+def test_invalid_encoding():
+    class BadStore(Store):
+        # Bad store implementation that should cause errors
 
-    def load(self, id: IPLDKind) -> bytes:
-        return bytes(0)
+        def save_raw(self, data: bytes) -> IPLDKind:
+            return 0
 
+        def save_dag_cbor(self, data: bytes) -> IPLDKind:
+            return 0
 
-def test_bad_store():
+        def load(self, id: IPLDKind) -> bytes:
+            return bytes(0)
+
     bad_store = BadStore()
     hamt = HAMT(store=bad_store, max_cache_size_bytes=0)
     with pytest.raises(
@@ -236,28 +249,3 @@ def test_link_following():
     for k, _ in kvs:
         del hamt[k]
     assert len(hamt) == 0
-
-
-# Run this with varying cache sizes to see the impact on performance of the cache when using IPFSStore()
-# def test_and_print_perf():
-#     import time
-
-#     num_ops = 50
-
-#     # usual cache size
-#     hamt = HAMT(store=IPFSStore())
-#     start_time = time.time()
-#     for key_int in range(num_ops):
-#         hamt[str(key_int)] = key_int
-#     end_time = time.time()
-#     op_avg_cache = (end_time - start_time) / 100
-
-#     # no cache
-#     hamt = HAMT(store=IPFSStore(), max_cache_size_bytes=0)
-#     start_time = time.time()
-#     for key_int in range(num_ops):
-#         hamt[str(key_int)] = key_int
-#     end_time = time.time()
-#     op_avg_no_cache = (end_time - start_time) / 100
-
-#     print(f"Improvement of {(1 - op_avg_cache / op_avg_no_cache) * 100:.2f}%")
