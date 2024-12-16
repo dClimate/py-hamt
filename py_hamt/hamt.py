@@ -624,6 +624,12 @@ class HAMT(MutableMapping):
             yield top_id
             top_node = self.read_node(top_id)
 
+            buckets = top_node.get_buckets()
+            for bucket in buckets.values():
+                for kv in bucket:
+                    for k in kv:
+                        yield kv[k]
+
             # Traverse down list of ids that are the store's links'
             links = top_node.get_links()
             for link in links.values():
