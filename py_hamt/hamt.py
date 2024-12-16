@@ -643,9 +643,6 @@ class HAMT(MutableMapping):
         """
         This merges the contents of another HAMT, into the current one. This does not modify the other HAMT, but does modify this one.
         """
-        if self.read_only:
-            raise Exception("Cannot call merge on a read only HAMT")
-
         # We do not need to acquire a lock on this HAMT since the set operations will do that automatically
         for key in other:
             self[key] = other[key]
