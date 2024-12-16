@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import pytest
-import time
 
 from py_hamt import HAMT, IPFSStore
+from py_hamt.ensemble_hamt import EnsembleHAMT
 
 
 @pytest.fixture
@@ -58,6 +58,9 @@ def random_zarr_dataset():
 
     ds.to_zarr(zarr_path, mode="w")
 
+    print("Working with this xarray Dataset")
+    print(ds)
+
     yield zarr_path, ds
 
     # Cleanup
@@ -66,43 +69,20 @@ def random_zarr_dataset():
 
 def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     zarr_path, expected_ds = random_zarr_dataset
-    test_ds = xr.open_zarr(zarr_path)
+    test_ds = expected_ds
 
-    print("Writing this xarray Dataset to IPFS")
-    print(test_ds)
+    hamt = HAMT(store=IPFSStore(pin_on_add=False))
+    test_ds.to_zarr(store=hamt, mode="w")
 
-    start_time = time.time()
-    hamt1 = HAMT(store=IPFSStore(pin_on_add=False))
-    test_ds.to_zarr(store=hamt1, mode="w")
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"Adding without pinning took {total_time:.2f} seconds")
+    hamt_root: CID = hamt.root_node_id  # type: ignore
+    # Useful to print out sometimes for exploring in IPLD Explorer
+    # https://explore.ipld.io/
+    print(f"root CID: {hamt_root}")
 
-    start_time = time.time()
-    hamt2 = HAMT(store=IPFSStore(pin_on_add=True))
-    test_ds.to_zarr(store=hamt2, mode="w")
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"Adding with pinning took {total_time:.2f} seconds")
-
-    hamt1_root: CID = hamt1.root_node_id  # type: ignore
-    hamt2_root: CID = hamt2.root_node_id  # type: ignore
-    print(f"No pin on add root CID: {hamt1_root}")
-    print(f"Pin on add root CID: {hamt2_root}")
-
-    print("Reading in from IPFS")
-    hamt1_read = HAMT(store=IPFSStore(), root_node_id=hamt1_root, read_only=True)
-    hamt2_read = HAMT(store=IPFSStore(), root_node_id=hamt2_root, read_only=True)
-    start_time = time.time()
-    loaded_ds1 = xr.open_zarr(store=hamt1_read)
-    loaded_ds2 = xr.open_zarr(store=hamt2_read)
-    end_time = time.time()
-    xr.testing.assert_identical(loaded_ds1, loaded_ds2)
+    print("Reading in from IPFS with a new HAMT")
+    hamt_read = HAMT(store=IPFSStore(), root_node_id=hamt_root, read_only=True)
+    loaded_ds1 = xr.open_zarr(store=hamt_read)
     xr.testing.assert_identical(loaded_ds1, expected_ds)
-    total_time = (end_time - start_time) / 2
-    print(
-        f"Took {total_time:.2f} seconds on average to load between the two loaded datasets"
-    )
 
     assert "temp" in loaded_ds1
     assert "precip" in loaded_ds1
@@ -110,8 +90,20 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     assert loaded_ds1.temp.shape == expected_ds.temp.shape
 
-    assert "temp" in loaded_ds2
-    assert "precip" in loaded_ds2
-    assert loaded_ds2.temp.attrs["units"] == "celsius"
 
-    assert loaded_ds2.temp.shape == expected_ds.temp.shape
+def test_ensemble(random_zarr_dataset: tuple[str, xr.Dataset]):
+    zarr_path, expected_ds = random_zarr_dataset
+    test_ds = expected_ds
+
+    ensemble_size = 8
+    ensemble_hamts = []
+    for i in range(0, ensemble_size):
+        ensemble_hamts.append(HAMT(store=IPFSStore()))
+    ensemble = EnsembleHAMT(ensemble=ensemble_hamts)
+    test_ds.to_zarr(store=ensemble)
+    consolidated_hamt = HAMT(store=IPFSStore())
+    ensemble.consolidate(consolidated_hamt)
+
+    print("Reading in from IPFS to verify correctness...")
+    loaded_ds = xr.open_zarr(store=consolidated_hamt)
+    xr.testing.assert_identical(expected_ds, loaded_ds)
