@@ -1,5 +1,6 @@
 import multiprocessing
 from collections.abc import MutableMapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 
 from dag_cbor.ipld import IPLDKind
@@ -34,8 +35,6 @@ class EnsembleHAMT(MutableMapping):
 
     ensemble: list[HAMT]
     """@private"""
-    max_workers: int
-    """@private"""
 
     def __init__(self, ensemble: list[HAMT]):
         """The ensemble should be a nonempty length list of HAMTs. They will be deepcopied, so the original objects will not be mutated."""
@@ -45,7 +44,6 @@ class EnsembleHAMT(MutableMapping):
 
         for hamt in self.ensemble:
             hamt.enable_write()
-        self.max_workers = multiprocessing.cpu_count()
 
     def __setitem__(self, key: str, val: IPLDKind):
         index = hash(key) % len(self.ensemble)
@@ -63,10 +61,8 @@ class EnsembleHAMT(MutableMapping):
         return chosen_hamt[key]
 
     def __len__(self):
-        key_count = 0
-        for hamt in self.ensemble:
-            key_count += len(hamt)
-        return key_count
+        with ThreadPoolExecutor() as executor:
+            return sum(executor.map(len, self.ensemble))
 
     def __iter__(self):
         for hamt in self.ensemble:
