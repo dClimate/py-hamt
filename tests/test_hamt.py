@@ -11,6 +11,7 @@ from hypothesis.strategies import SearchStrategy
 import pytest
 
 from py_hamt import HAMT, DictStore
+from py_hamt.ensemble_hamt import EnsembleHAMT
 from py_hamt.hamt import Node
 from py_hamt.store import Store
 
@@ -158,6 +159,33 @@ def test_merge(kvs: list[tuple[str, IPLDKind]]):
     assert len(merged) == len(kvs)
     for k, v in kvs:
         assert merged[k] == v
+
+
+# We only put a max limit on the ensemble size to keep test times reasonable
+@given(key_value_lists, st.integers(min_value=1, max_value=8))
+def test_ensemble(kvs: list[tuple[str, IPLDKind]], ensemble_size: int):
+    ensemble_hamts = []
+    for _ in range(ensemble_size):
+        ensemble_hamts.append(HAMT(store=DictStore()))
+    ensemble = EnsembleHAMT(ensemble=ensemble_hamts)
+    assert isinstance(ensemble, MutableMapping)
+    for key, value in kvs:
+        ensemble[key] = value
+        assert ensemble[key] == value
+    assert len(ensemble) == len(kvs)
+    for key, _ in kvs:
+        del ensemble[key]
+    assert len(ensemble) == 0
+    for key, value in kvs:
+        ensemble[key] = value
+        assert ensemble[key] == value
+    assert len(ensemble) == len(kvs)
+
+    consolidated_hamt = HAMT(store=DictStore())
+    ensemble.consolidate(consolidated_hamt)
+    for key, value in kvs:
+        assert consolidated_hamt[key] == value
+    assert len(consolidated_hamt) == len(kvs)
 
 
 def test_invalid_encoding():
