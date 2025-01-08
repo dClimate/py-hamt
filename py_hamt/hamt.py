@@ -1,14 +1,11 @@
 from collections.abc import MutableMapping
-from copy import deepcopy
 from sys import getsizeof
 from threading import Lock
-import time
 from typing import Callable
 
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
-from sortedcontainers import SortedKeyList
 
 from .store import Store
 
@@ -207,76 +204,44 @@ class HAMT(MutableMapping):
     You can modify the read status of a HAMT through the `make_read_only` or `enable_write` functions, so that the HAMT will block on making a change until all mutating operations are done.
     """
 
-    # Goes from dag_cbor encoding bytes of a Store ID, which is just IPLDKind type
-    cache: dict[IPLDKind, Node]
-    """@private"""
-    id_to_time: dict[IPLDKind, float]
-    """@private"""
-    # Stores a list of tuples like (time: float, id: IPLDKind)
-    last_accessed_times: SortedKeyList
+    cache: dict[StoreID, Node]
     """@private"""
     max_cache_size_bytes: int
     """The maximum size of the internal cache of nodes. We expect that some Stores will be high latency, so it is useful to cache parts of the datastructure.
 
     Set to 0 if you want no cache at all."""
 
-    def clear_cache_lru(self):
-        """@private"""
-        # The last condition is to check if anything is even in the cache. This is important for times when the cache size is so small that the size of the empty objects is larger than the cache limit
-        while (
-            getsizeof(self.cache)
-            + getsizeof(self.id_to_time)
-            + getsizeof(self.last_accessed_times)
-        ) > self.max_cache_size_bytes and len(self.last_accessed_times) > 0:
-            least_recently_used: tuple[float, IPLDKind] = self.last_accessed_times.pop(
-                0
-            )
-            least_recently_used_id = least_recently_used[1]
-            del self.cache[least_recently_used_id]
-            del self.id_to_time[least_recently_used_id]
-
-    def update_node_cachetime(self, node_id: IPLDKind):
-        """@private"""
-        previous_time = self.id_to_time[node_id]
-        self.last_accessed_times.remove((previous_time, node_id))
-
-        current_time = time.time()
-        self.id_to_time[node_id] = current_time
-        self.last_accessed_times.add((current_time, node_id))
-
-    def add_node_to_cache(self, node_id: IPLDKind, node: Node):
-        """@private"""
-        current_time = time.time()
-        self.cache[node_id] = node
-        self.id_to_time[node_id] = current_time
-        self.last_accessed_times.add((current_time, node_id))
+    # We rely on python 3.7+'s dicts which keep insertion order of elements to do a basic LRU
+    def cache_eviction_lru(self):
+        while getsizeof(self.cache) > self.max_cache_size_bytes:
+            if len(self.cache) == 0:
+                return
+            stalest_node_id = next(iter(self.cache.keys()))
+            del self.cache[stalest_node_id]
 
     def write_node(self, node: Node) -> IPLDKind:
         """@private"""
         node_id = self.store.save_dag_cbor(node.serialize())
-        if node_id in self.cache:
-            self.update_node_cachetime(node_id)
-        else:
-            self.add_node_to_cache(node_id, node)
-        self.clear_cache_lru()
-
+        self.cache[node_id] = node
+        self.cache_eviction_lru()
         return node_id
 
     def read_node(self, node_id: IPLDKind) -> Node:
         """@private"""
-        result: Node
-        # Cache Hit
+        node: Node
+        # cache hit
         if node_id in self.cache:
-            result = self.cache[node_id]
-            self.update_node_cachetime(node_id)
-        # Cache Miss
+            node = self.cache[node_id]
+            # Reinsert to put this key as the most recently used and last in the dict insertion order
+            del self.cache[node_id]
+            self.cache[node_id] = node
+            # cache miss
         else:
-            result = Node.deserialize(self.store.load(node_id))
-            self.add_node_to_cache(node_id, result)
-            self.clear_cache_lru()
+            node = Node.deserialize(self.store.load(node_id))
+            self.cache[node_id] = node
+            self.cache_eviction_lru()
 
-        # If we don't deepcopy, then we return a reference that other functions can modify, which means this cache will immediately become inconsistent with the backing store
-        return deepcopy(result)
+        return node
 
     def __init__(
         self,
@@ -284,15 +249,12 @@ class HAMT(MutableMapping):
         hash_fn: Callable[[bytes], bytes] = blake3_hashfn,
         read_only: bool = False,
         root_node_id: IPLDKind = None,
-        max_cache_size_bytes=10000000,  # default to 10 megabytes
+        max_cache_size_bytes=10_000_000,  # default to 10 megabytes
     ):
         self.store = store
         self.hash_fn = hash_fn
 
         self.cache = {}
-        self.id_to_time = {}
-        # Sort by the time float value which is the first in the tuple in this sorted collection
-        self.last_accessed_times = SortedKeyList(key=lambda x: x[0])
         self.max_cache_size_bytes = max_cache_size_bytes
 
         self.max_bucket_size = 4

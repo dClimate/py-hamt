@@ -559,7 +559,6 @@ dependencies = [
     { name = "msgspec" },
     { name = "multiformats", extra = ["full"] },
     { name = "requests" },
-    { name = "sortedcontainers" },
 ]
 
 [package.dev-dependencies]
@@ -583,7 +582,6 @@ requires-dist = [
     { name = "msgspec", specifier = ">=0.18.6" },
     { name = "multiformats", extras = ["full"], specifier = ">=0.3.1.post4" },
     { name = "requests", specifier = ">=2.32.3" },
-    { name = "sortedcontainers", specifier = ">=2.4.0" },
 ]
 
 [package.metadata.requires-dev]
