@@ -26,7 +26,12 @@ jobs:
         id: ipfs_setup
 
       - name: Run pytest with coverage
-        run: uv run pytest --cov=py_hamt tests/
+        run: uv run pytest --cov=py_hamt tests/ --cov-report=xml
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Check coverage
         run: uv run coverage report --fail-under=100 --show-missing
