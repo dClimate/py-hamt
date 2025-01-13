@@ -4,6 +4,8 @@
 </a>
 </p>
 
+[![codecov](https://codecov.io/gh/dClimate/py-hamt/graph/badge.svg?token=M6Y4D19Y38)](https://codecov.io/gh/dClimate/py-hamt)
+
 # py-hamt
 This is a python implementation of a HAMT, adapted from [rvagg's IAMap project written in JavaScript](https://github.com/rvagg/iamap).
 Like IAMap, py-hamt abstracts over a backing storage layer which lets you store any arbitrary amount of data but does not let you set a key, it returns its own ID. e.g. content-addressed systems.
