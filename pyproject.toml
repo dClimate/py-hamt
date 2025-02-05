@@ -29,3 +29,8 @@ dev = [
     "xarray>=2024.11.0",
     "zarr>=2.18.3",
 ]
+
+[tool.uv]
+dev-dependencies = [
+    "pycryptodome",
+]

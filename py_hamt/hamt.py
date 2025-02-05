@@ -6,7 +6,6 @@ from typing import Callable
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
-
 from .store import Store
 
 
@@ -122,6 +121,17 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
     digest = b3.digest(input_bytes, size=32)
     raw_bytes = b3.unwrap(digest)
     return raw_bytes
+
+
+class HamtFactory:
+    @classmethod
+    def create(cls, store, transformer=None, **kwargs):
+        """
+        Returns an instance of HAMT or TransformedHamt depending on whether a transformer is provided.
+        """
+        if transformer:
+            return TransformedHamt(store=store, transformer=transformer, **kwargs)
+        return HAMT(store=store, **kwargs)
 
 
 class HAMT(MutableMapping):
@@ -600,3 +610,28 @@ class HAMT(MutableMapping):
             links = top_node.get_links()
             for link in links.values():
                 node_id_stack.append(link)
+
+
+class TransformedHamt(HAMT):
+    """
+    A wrapper around the HAMT class that applies a transformation function
+    when setting or getting items, except for specific keys like ".attributes".
+    """
+
+    def __init__(self, *args, transformer=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.transformer = transformer
+
+    def __setitem__(self, key, value):
+        if self.transformer and key != ".zarray":
+            value = self.transformer.encode(value)
+
+        super().__setitem__(key, value)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+
+        if self.transformer and key != ".attributes":
+            value = self.transformer.decode(value)
+
+        return value
