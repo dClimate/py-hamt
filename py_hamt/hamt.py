@@ -686,7 +686,16 @@ class TransformedHamt(HAMTOriginal):
                 return False  # Don't transform single index keys like lat/0 . The downside is that this can't be used on 1 dimensional data arrays.
                 # I think this alligns with xarray since is recognizes these as coordinates and not data variables
                 # If those were transformed it would limit xarrays ability to init any zarr as it fetches the bounds of the coordinate arrays which shouldn't be encrypted
-            
+            parts = key.split('/')
+            # Get the zarray for parts[0] and see if crypto exists
+            metadata = self[parts[0] + "/.zarray"]
+            if not metadata:
+                return False
+            metadata = json.loads(metadata.decode('utf-8'))
+            crypto = metadata.get("crypto", [])
+            # If no crypto then don't transform data
+            if not crypto:
+                return False
             return True  # Transform everything else (e.g., chunked data like precip/1.0.0)
 
     def __setitem__(self, key, value):
