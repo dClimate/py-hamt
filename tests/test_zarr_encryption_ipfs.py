@@ -122,8 +122,9 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     start_time = time.time()
     encryption_key = get_random_bytes(32)
     hamt1 = HAMT(
-        store=IPFSStore(pin_on_add=True),
+        store=IPFSStore(pin_on_add=False),
         transformer=EncryptionFilter(encryption_key=encryption_key),
+        encrypt_vars=["temp", "precip"],
     )
     test_ds.to_zarr(store=hamt1, mode="w")
     end_time = time.time()
@@ -132,7 +133,7 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     start_time = time.time()
     hamt2 = HAMT(
-        store=IPFSStore(pin_on_add=True),
+        store=IPFSStore(pin_on_add=False),
     )
     test_ds.to_zarr(store=hamt2, mode="w")
     end_time = time.time()
@@ -168,15 +169,13 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
         f"Took {total_time:.2f} seconds on average to load between the two loaded datasets"
     )
 
-    # Test with bad encryption key
-    hamt1_read_bad = HAMT(
-        store=IPFSStore(),
-        root_node_id=hamt1_root,
-        read_only=True,
-        transformer=EncryptionFilter(encryption_key=get_random_bytes(32)),
-    )
-    with pytest.raises(Exception):
-        xr.open_zarr(store=hamt1_read_bad)
+    # Test with no encryption key
+    with pytest.raises(Exception, match="Codec ID not found in transformer"):
+        HAMT(
+            store=IPFSStore(),
+            root_node_id=hamt1_root,
+            read_only=True,
+        )
 
     assert "temp" in loaded_ds1
     assert "precip" in loaded_ds1

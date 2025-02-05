@@ -2,6 +2,8 @@ from collections.abc import MutableMapping
 from sys import getsizeof
 from threading import Lock
 from typing import Callable
+import re
+import json
 
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
@@ -278,6 +280,32 @@ class HAMTOriginal(MutableMapping):
             self.root_node_id = root_node_id
             # Make sure the cache has our root node
             self.read_node(self.root_node_id)
+            self.check_crypto()
+
+    def check_crypto(self):
+        """
+        Checks if any crypto exist in the HAMT's `.zarray` metadata and validates them against the transformer's codec_id.
+        
+        Raises:
+            Exception: If a transformer is required but not present.
+            Exception: If a codec_id exists but no crypto are found.
+            Exception: If crypto exist but the codec_id does not match.
+        """
+        has_codec_id = hasattr(self, "codec_id")
+        found_filter = False
+        for key in self:
+            if key.endswith("/.zarray"):
+                metadata_bytes = self[key]
+                metadata = json.loads(metadata_bytes.decode("utf-8"))
+                crypto = metadata.get("crypto", None)
+                if crypto:
+                    found_filter = True
+                    if not has_codec_id:
+                        raise Exception("Codec ID not found in transformer")
+                    if crypto[0]["id"] != self.codec_id:
+                        raise Exception("Codec ID does not match transformer")
+        if not found_filter and has_codec_id:
+            raise Exception("Codec ID found in transformer but no crypto found in metadata")
 
     # dunder for the python deepcopy module
     def __deepcopy__(self, memo) -> "HAMT":
@@ -615,23 +643,65 @@ class HAMTOriginal(MutableMapping):
 class TransformedHamt(HAMTOriginal):
     """
     A wrapper around the HAMT class that applies a transformation function
-    when setting or getting items, except for specific keys like ".attributes".
+    when setting or getting items, except for specific Zarr metadata keys.
     """
 
-    def __init__(self, *args, transformer=None, **kwargs):
-        super().__init__(*args, **kwargs)
+    ZARR_METADATA_KEYS = {".zarray", ".zgroup", ".zattrs", ".zmetadata"}
+    INDEX_KEY_PATTERN = re.compile(r".*/\d+$")  # Matches keys like lat/0, lon/0, time/0
+
+    def __init__(self, *args, transformer=None, encrypt_vars=[], **kwargs):
         self.transformer = transformer
+        self.codec_id = transformer.codec_id
+        self.encrypt_vars = encrypt_vars
+        super().__init__(*args, **kwargs)
+
+    def _update_metadata_crypto(self, value):
+        """Update the metadata to include the codec in the crypto list."""
+        try:
+            # Decode bytes to JSON dict
+            metadata = json.loads(value.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            return value  # Return original if not decodable
+        
+        codec_filter = {'id': self.codec_id}
+        if "crypto" not in metadata.keys():
+            metadata['crypto'] = []
+        # Append codec filter if not already present
+        if codec_filter not in metadata['crypto']:
+            metadata['crypto'].append(codec_filter)
+        # Encode back to JSON bytes
+        return json.dumps(metadata).encode('utf-8')
+    
+    def _is_data_var_metadata(self, key):
+        """Check if the key corresponds to a data variable's metadata (e.g., "precip/.zarray")."""
+        parts = key.split('/')
+        return len(parts) == 2 and parts[1] in ".zarray" and parts[0] in self.encrypt_vars
+
+    def _should_transform_key(self, key):
+            """Determines whether the key should be transformed."""
+            if any(meta_key in key for meta_key in self.ZARR_METADATA_KEYS):
+                return False  # Don't transform metadata keys
+            
+            if self.INDEX_KEY_PATTERN.fullmatch(key):
+                return False  # Don't transform single index keys like lat/0 . The downside is that this can't be used on 1 dimensional data arrays.
+                # I think this alligns with xarray since is recognizes these as coordinates and not data variables
+                # If those were transformed it would limit xarrays ability to init any zarr as it fetches the bounds of the coordinate arrays which shouldn't be encrypted
+            
+            return True  # Transform everything else (e.g., chunked data like precip/1.0.0)
 
     def __setitem__(self, key, value):
-        if self.transformer and key != ".zarray":
-            value = self.transformer.encode(value)
-
+        # If the item being set is a zarr data key like precip/.zarray then we want to include the codec_id in the crypto like crypto: [ {id: "codec_id"} ] if not set
+        # The problem, is that we don't know what is the data variable ahead of time, so we can't just check if the key is in the metadata keys
+        # My current fallback is requiring the user to indicate what data variables they are encrypting, and then we can check if the key is in that list
+        if self.transformer:
+            if self._should_transform_key(key):
+                value = self.transformer.encode(value)
+            elif self._is_data_var_metadata(key):
+                value = self._update_metadata_crypto(value)
         super().__setitem__(key, value)
 
     def __getitem__(self, key):
         value = super().__getitem__(key)
-
-        if self.transformer and key != ".attributes":
+        if self.transformer and self._should_transform_key(key):
             value = self.transformer.decode(value)
-
         return value
