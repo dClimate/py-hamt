@@ -9,7 +9,7 @@ import xarray as xr
 import pytest
 import time
 
-from py_hamt import HAMT, IPFSStore
+from py_hamt import HAMT, IPFSStore, create_zarr_encryption_transformers
 
 
 @pytest.fixture
@@ -104,3 +104,36 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     print(f"Total time in seconds: {total_time:.2f}")
     print(f"Sent bytes: {ipfs_store_read.total_sent}")
     print(f"Received bytes: {ipfs_store_read.total_received}")
+
+
+def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
+    zarr_path, expected_ds = random_zarr_dataset
+    test_ds = xr.open_zarr(zarr_path)
+
+    with pytest.raises(ValueError, match="Encryption key is not 32 bytes"):
+        create_zarr_encryption_transformers(bytes(), bytes())
+
+    encryption_key = bytes(32)
+    # Encrypt only precipitation, not temperature
+    encrypt, decrypt = create_zarr_encryption_transformers(
+        encryption_key, header="sample-header".encode(), exclude_vars=["temp"]
+    )
+    hamt = HAMT(
+        store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
+    )
+    test_ds.to_zarr(store=hamt, mode="w")
+
+    hamt.make_read_only()
+    loaded_ds = xr.open_zarr(store=hamt)
+    xr.testing.assert_identical(loaded_ds, expected_ds)
+
+    # Now trying to load without a decryptor, xarray should be able to read the metadata and still perform operations on the unencrypted variable
+    print("Attempting to read and print metadata of partially encrypted zarr")
+    ds = xr.open_zarr(
+        store=HAMT(store=IPFSStore(), root_node_id=hamt.root_node_id, read_only=True)
+    )
+    print(ds)
+    assert ds.temp.sum() == expected_ds.temp.sum()
+    # We should be unable to read precipitation values which are still encrypted
+    with pytest.raises(Exception):
+        ds.precip.sum()
