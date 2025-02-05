@@ -123,18 +123,18 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
     return raw_bytes
 
 
-class HamtFactory:
-    @classmethod
-    def create(cls, store, transformer=None, **kwargs):
+class HAMT:
+    def __new__(cls, store, transformer=None, **kwargs):
         """
-        Returns an instance of HAMT or TransformedHamt depending on whether a transformer is provided.
+        Instantiating HAMT directly returns an instance of HAMT or TransformedHamt,
+        depending on whether a transformer is provided.
         """
         if transformer:
             return TransformedHamt(store=store, transformer=transformer, **kwargs)
-        return HAMT(store=store, **kwargs)
+        return HAMTOriginal(store=store, **kwargs)
 
 
-class HAMT(MutableMapping):
+class HAMTOriginal(MutableMapping):
     """
     This HAMT presents a key value interface, like a python dictionary. The only limits are that keys can only be strings, and values can only be types amenable with [IPLDKind](https://dag-cbor.readthedocs.io/en/stable/api/dag_cbor.ipld.html#dag_cbor.ipld.IPLDKind). IPLDKind is a fairly flexible data model, but do note that integers are must be within the bounds of a signed 64-bit integer.
 
@@ -612,7 +612,7 @@ class HAMT(MutableMapping):
                 node_id_stack.append(link)
 
 
-class TransformedHamt(HAMT):
+class TransformedHamt(HAMTOriginal):
     """
     A wrapper around the HAMT class that applies a transformation function
     when setting or getting items, except for specific keys like ".attributes".

@@ -14,7 +14,7 @@ import io
 from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
 
-from py_hamt import HamtFactory, IPFSStore
+from py_hamt import HAMT, IPFSStore
 
 
 class EncryptionFilter:
@@ -121,7 +121,7 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     start_time = time.time()
     encryption_key = get_random_bytes(32)
-    hamt1 = HamtFactory.create(
+    hamt1 = HAMT(
         store=IPFSStore(pin_on_add=True),
         transformer=EncryptionFilter(encryption_key=encryption_key),
     )
@@ -131,7 +131,7 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     print(f"Adding with encryption took {total_time:.2f} seconds")
 
     start_time = time.time()
-    hamt2 = HamtFactory.create(
+    hamt2 = HAMT(
         store=IPFSStore(pin_on_add=True),
     )
     test_ds.to_zarr(store=hamt2, mode="w")
@@ -145,13 +145,13 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     print(f"Pin on add root CID: {hamt2_root}")
 
     print("Reading in from IPFS")
-    hamt1_read = HamtFactory.create(
+    hamt1_read = HAMT(
         store=IPFSStore(),
         root_node_id=hamt1_root,
         read_only=True,
         transformer=EncryptionFilter(encryption_key=encryption_key),
     )
-    hamt2_read = HamtFactory.create(
+    hamt2_read = HAMT(
         store=IPFSStore(),
         root_node_id=hamt2_root,
         read_only=True,
@@ -169,7 +169,7 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     )
 
     # Test with bad encryption key
-    hamt1_read_bad = HamtFactory.create(
+    hamt1_read_bad = HAMT(
         store=IPFSStore(),
         root_node_id=hamt1_root,
         read_only=True,
