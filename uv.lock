@@ -252,12 +252,8 @@ dependencies = [
     { name = "dag-cbor" },
     { name = "msgspec" },
     { name = "multiformats", extra = ["full"] },
-    { name = "requests" },
-]
-
-[distribution.dev-dependencies]
-dev = [
     { name = "pycryptodome" },
+    { name = "requests" },
 ]
 
 [[distribution]]
