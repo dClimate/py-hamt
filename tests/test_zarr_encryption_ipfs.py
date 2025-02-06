@@ -152,7 +152,8 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     zarr_path, expected_ds = random_zarr_dataset
     test_ds = xr.open_zarr(zarr_path)
 
-    # update precip and temp to have crypto: ["chacha"]
+    # update precip and temp to have crypto: ["chacha"] 
+    # TODO: THIS SHOULD BE DONE IN THE ZARRAY but it doesn't appear like xarray allows this
     test_ds["precip"].attrs["crypto"] = ["xchacha20poly1305"]
     test_ds["temp"].attrs["crypto"] = ["xchacha20poly1305"]
 
