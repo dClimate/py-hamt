@@ -1,6 +1,5 @@
 from typing import Callable
 from pathlib import Path
-import re
 
 
 import io
@@ -42,17 +41,11 @@ def create_zarr_encryption_transformers(
 
     # codec_id = "xchacha20poly1305"
     header = b"dClimate-Zarr"
-    INDEX_KEY_PATTERN = re.compile(r".*/\d+$")
 
     def _should_transform_key(key: str) -> bool:
         if Path(key).name in encryption_exclude_files:
             return False
-        if INDEX_KEY_PATTERN.fullmatch(key):
-            return False
         return key.split("/")[0] in encrypted_vars
-
-    def __init__(self, encryption_key: str):
-        self.encryption_key = encryption_key
 
     def encode(key: str, val: bytes) -> bytes:
         if not _should_transform_key(key):
