@@ -24,7 +24,7 @@ pip install 'git+https://github.com/dClimate/py-hamt'
 ```python
     from py_hamt import HAMT, DictStore
 
-    # Setup a HAMT with an in memory store, 
+    # Setup a HAMT with an in memory store 
     in_memory_store = DictStore()
     hamt = HAMT(store=in_memory_store)
 
@@ -52,12 +52,21 @@ pip install 'git+https://github.com/dClimate/py-hamt'
 ### Reading a CID from IPFS 
 ```python
     from py_hamt import HAMT, IPFSStore
+    from multiformats import CID
+
+    # Get the CID you wish to read whether from a blog post, a smart contract, or a friend
+    dataset_cid = "baf..."
+
+    # Use the multiformats library to decode the CID into an object
+    root_cid = CID.decode(dataset_cid)
 
     # Create HAMT instance using the IPFSStore connecting to your locally 
-    # running IPFS Gateway from your local running IPFS Node, Change the IP
-    # port for your running IPFS instance
-    hamt = HAMT(store=IPFSStore(gateway_uri_stem="http://0.0.0.0:8080"), root_node_id=root_cid)
-    # Do something with the keys 
+    # running IPFS Gateway from your local running IPFS Node, If you wish 
+    # you can change the default IPFS gateway
+    hamt = HAMT(store=IPFSStore(root_node_id=root_cid) # You can optionally pass your own gateway instead of defaults with the argument gateway_uri_stem="http://<IP>:<PORT>",
+
+    # Do something with the hamt key/values
+    ... 
 ```
 
 See the [code documentation](https://dclimate.github.io/py-hamt/py_hamt.html) for more on usage. Looking at the test files, namely `test_hamt.py` is also quite helpful. You can also see this library used in notebooks for data analysis here [dClimate Jupyter Notebooks](https://github.com/dClimate/jupyter-notebooks)
