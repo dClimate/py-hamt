@@ -129,18 +129,18 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     end_time = time.time()
     # Assert the values are the same
     # Check if the values of 'temp' and 'precip' are equal in all datasets
-    assert np.array_equal(
-        loaded_ds1["temp"].values, expected_ds["temp"].values
-    ), "Temp values in loaded_ds1 and expected_ds are not identical!"
-    assert np.array_equal(
-        loaded_ds1["precip"].values, expected_ds["precip"].values
-    ), "Precip values in loaded_ds1 and expected_ds are not identical!"
-    assert np.array_equal(
-        loaded_ds2["temp"].values, expected_ds["temp"].values
-    ), "Temp values in loaded_ds2 and expected_ds are not identical!"
-    assert np.array_equal(
-        loaded_ds2["precip"].values, expected_ds["precip"].values
-    ), "Precip values in loaded_ds2 and expected_ds are not identical!"
+    assert np.array_equal(loaded_ds1["temp"].values, expected_ds["temp"].values), (
+        "Temp values in loaded_ds1 and expected_ds are not identical!"
+    )
+    assert np.array_equal(loaded_ds1["precip"].values, expected_ds["precip"].values), (
+        "Precip values in loaded_ds1 and expected_ds are not identical!"
+    )
+    assert np.array_equal(loaded_ds2["temp"].values, expected_ds["temp"].values), (
+        "Temp values in loaded_ds2 and expected_ds are not identical!"
+    )
+    assert np.array_equal(loaded_ds2["precip"].values, expected_ds["precip"].values), (
+        "Precip values in loaded_ds2 and expected_ds are not identical!"
+    )
     # xr.testing.assert_identical(loaded_ds1, loaded_ds2)
     # xr.testing.assert_identical(loaded_ds1, expected_ds)
     total_time = (end_time - start_time) / 2
