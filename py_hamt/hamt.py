@@ -122,6 +122,7 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
     raw_bytes = b3.unwrap(digest)
     return raw_bytes
 
+
 class HAMT(MutableMapping):
     """
     This HAMT presents a key value interface, like a python dictionary. The only limits are that keys can only be strings, and values can only be types amenable with [IPLDKind](https://dag-cbor.readthedocs.io/en/stable/api/dag_cbor.ipld.html#dag_cbor.ipld.IPLDKind). IPLDKind is a fairly flexible data model, but do note that integers are must be within the bounds of a signed 64-bit integer.

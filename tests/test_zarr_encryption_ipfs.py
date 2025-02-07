@@ -15,7 +15,6 @@ from Crypto.Random import get_random_bytes
 from py_hamt import HAMT, IPFSStore, create_zarr_encryption_transformers
 
 
-
 @pytest.fixture
 def random_zarr_dataset():
     """Creates a random xarray Dataset and saves it to a temporary zarr store.
@@ -72,7 +71,7 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     zarr_path, expected_ds = random_zarr_dataset
     test_ds = xr.open_zarr(zarr_path)
 
-    # update precip and temp to have crypto: ["chacha"] 
+    # update precip and temp to have crypto: ["chacha"]
     # TODO: THIS SHOULD BE DONE IN THE ZARRAY but it doesn't appear like xarray allows this
     test_ds["precip"].attrs["crypto"] = ["xchacha20poly1305"]
     test_ds["temp"].attrs["crypto"] = ["xchacha20poly1305"]
@@ -130,10 +129,18 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     end_time = time.time()
     # Assert the values are the same
     # Check if the values of 'temp' and 'precip' are equal in all datasets
-    assert np.array_equal(loaded_ds1["temp"].values, expected_ds["temp"].values), "Temp values in loaded_ds1 and expected_ds are not identical!"
-    assert np.array_equal(loaded_ds1["precip"].values, expected_ds["precip"].values), "Precip values in loaded_ds1 and expected_ds are not identical!"
-    assert np.array_equal(loaded_ds2["temp"].values, expected_ds["temp"].values), "Temp values in loaded_ds2 and expected_ds are not identical!"
-    assert np.array_equal(loaded_ds2["precip"].values, expected_ds["precip"].values), "Precip values in loaded_ds2 and expected_ds are not identical!"
+    assert np.array_equal(
+        loaded_ds1["temp"].values, expected_ds["temp"].values
+    ), "Temp values in loaded_ds1 and expected_ds are not identical!"
+    assert np.array_equal(
+        loaded_ds1["precip"].values, expected_ds["precip"].values
+    ), "Precip values in loaded_ds1 and expected_ds are not identical!"
+    assert np.array_equal(
+        loaded_ds2["temp"].values, expected_ds["temp"].values
+    ), "Temp values in loaded_ds2 and expected_ds are not identical!"
+    assert np.array_equal(
+        loaded_ds2["precip"].values, expected_ds["precip"].values
+    ), "Precip values in loaded_ds2 and expected_ds are not identical!"
     # xr.testing.assert_identical(loaded_ds1, loaded_ds2)
     # xr.testing.assert_identical(loaded_ds1, expected_ds)
     total_time = (end_time - start_time) / 2

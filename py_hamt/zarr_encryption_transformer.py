@@ -9,7 +9,6 @@ from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
 
 
-
 # Metadata files to avoid encrypting (and decrypting)
 encryption_exclude_files = [
     # top level meta data
