@@ -132,18 +132,27 @@ class HAMT(MutableMapping):
     ```python
     from py_hamt import HAMT, DictStore
 
+    # Setup a HAMT with an in memory store, one could also use IPFSStore or any other store that implements the Store interface
     in_memory_store = DictStore()
     hamt = HAMT(store=in_memory_store)
+
+    # Set and get one value
     hamt["foo"] = "bar"
     assert "bar" == hamt["foo"]
     assert len(hamt) == 1
+
+    # Set and get multiple values
     hamt["foo"] = "bar1"
     hamt["foo2"] = 2
     assert 2 == hamt["foo2"]
     assert len(hamt) == 2
+
+    # Iterate over keys
     for key in hamt:
         print(key)
     print (list(hamt)) # [foo, foo2], order depends on the hash function used
+
+    # Delete a value
     del hamt["foo"]
     assert len(hamt) == 1
     ```
