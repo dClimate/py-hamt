@@ -63,7 +63,7 @@ root_cid = CID.decode(dataset_cid)
 # Create HAMT instance using the IPFSStore connecting to your locally 
 # running IPFS Gateway from your local running IPFS Node, If you wish 
 # you can change the default IPFS gateway
-hamt = HAMT(store=IPFSStore(root_node_id=root_cid) # You can optionally pass your own gateway instead of defaults with the argument gateway_uri_stem="http://<IP>:<PORT>",
+hamt = HAMT(store=IPFSStore(root_node_id=root_cid)) # You can optionally pass your own gateway instead of defaults with the argument gateway_uri_stem="http://<IP>:<PORT>",
 
 # Do something with the hamt key/values
 ... 
