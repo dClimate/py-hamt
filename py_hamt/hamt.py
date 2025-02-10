@@ -203,11 +203,6 @@ class HAMT(MutableMapping):
     You can modify the read status of a HAMT through the `make_read_only` or `enable_write` functions, so that the HAMT will block on making a change until all mutating operations are done.
     """
 
-    transformer_encode: None | Callable[[str, bytes], bytes]
-    """This function is called to transform a value being inserted right before it gets sent to the Store."""
-    transformer_decode: None | Callable[[str, bytes], bytes]
-    """This function is called to decode a value being retrieved after it is returned from the Store."""
-
     cache: dict[StoreID, Node]
     """@private"""
     max_cache_size_bytes: int
@@ -254,8 +249,6 @@ class HAMT(MutableMapping):
         read_only: bool = False,
         root_node_id: IPLDKind = None,
         max_cache_size_bytes=10_000_000,  # default to 10 megabytes
-        transformer_encode: None | Callable[[str, bytes], bytes] = None,
-        transformer_decode: None | Callable[[str, bytes], bytes] = None,
     ):
         self.store = store
         self.hash_fn = hash_fn
@@ -266,9 +259,6 @@ class HAMT(MutableMapping):
         self.max_bucket_size = 4
         self.read_only = read_only
         self.lock = Lock()
-
-        self.transformer_encode = transformer_encode
-        self.transformer_decode = transformer_decode
 
         if root_node_id is None:
             root_node = Node()
@@ -349,10 +339,7 @@ class HAMT(MutableMapping):
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
-        val = dag_cbor.encode(val_to_insert)
-        if self.transformer_encode is not None:
-            val = self.transformer_encode(key_to_insert, val)
-        val_ptr = self.store.save_raw(val)
+        val_ptr = self.store.save_raw(dag_cbor.encode(val_to_insert))
 
         node_stack: list[tuple[Link, Node]] = []
         root_node = self.read_node(self.root_node_id)
@@ -548,10 +535,7 @@ class HAMT(MutableMapping):
         if not found_a_result:
             raise KeyError
 
-        result_bytes = self.store.load(result_ptr)
-        if self.transformer_decode is not None:
-            result_bytes = self.transformer_decode(key, result_bytes)
-        return dag_cbor.decode(result_bytes)
+        return dag_cbor.decode(self.store.load(result_ptr))
 
     def __len__(self) -> int:
         key_count = 0

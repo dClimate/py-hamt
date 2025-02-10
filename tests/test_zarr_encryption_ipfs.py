@@ -8,11 +8,16 @@ import pandas as pd
 import xarray as xr
 import pytest
 import time
-
+import numcodecs 
+from numcodecs import register_codec
 
 from Crypto.Random import get_random_bytes
 
-from py_hamt import HAMT, IPFSStore, create_zarr_encryption_transformers
+from py_hamt import (
+    HAMT,
+    IPFSStore,
+    EncryptionCodec,
+)
 
 
 @pytest.fixture
@@ -59,7 +64,22 @@ def random_zarr_dataset():
         attrs={"description": "Test dataset with random weather data"},
     )
 
-    ds.to_zarr(zarr_path, mode="w")
+
+    # Generate Random Key
+    encryption_key = get_random_bytes(32).hex()
+    # Set the encryption key for the class
+    EncryptionCodec.set_encryption_key(encryption_key)
+    # Register the codec
+    register_codec(EncryptionCodec(header="dClimate-Zarr"))
+
+    # Apply the encryption codec to the dataset with a selected header
+    encoding = {
+        'temp': {
+            'filters': [EncryptionCodec(header="dClimate-Zarr")],  # Add the Delta filter
+        }
+    }
+    # Write the dataset to the zarr store with the encoding on the temp
+    ds.to_zarr(zarr_path, mode="w", encoding=encoding)
 
     yield zarr_path, ds
 
@@ -69,105 +89,63 @@ def random_zarr_dataset():
 
 def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     zarr_path, expected_ds = random_zarr_dataset
+
+    # Open the zarr store
     test_ds = xr.open_zarr(zarr_path)
 
-    # update precip and temp to have crypto: ["chacha"]
-    # TODO: THIS SHOULD BE DONE IN THE ZARRAY but it doesn't appear like xarray allows this
-    test_ds["precip"].attrs["crypto"] = ["xchacha20poly1305"]
-    test_ds["temp"].attrs["crypto"] = ["xchacha20poly1305"]
-    print("Writing this xarray Dataset to IPFS")
-    print(test_ds)
+    # Check if encryption applied to temp but not to precip
+    assert test_ds["temp"].encoding["filters"][0].header == "dClimate-Zarr"
+    assert test_ds["precip"].encoding["filters"] == None
 
-    start_time = time.time()
-    encryption_key = get_random_bytes(32)
-
-    encode, decode = create_zarr_encryption_transformers(
-        encryption_key, ["temp", "precip"]
-    )
+    # Prepare Writing to IPFS
     hamt1 = HAMT(
         store=IPFSStore(pin_on_add=False),
-        transformer_encode=encode,
-        transformer_decode=decode,
     )
-    test_ds.to_zarr(store=hamt1, mode="w")
 
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"Adding with encryption took {total_time:.2f} seconds")
-
-    start_time = time.time()
-    hamt2 = HAMT(
-        store=IPFSStore(pin_on_add=False),
+    # Reusing the same encryption key as its still stored in the class in numcodecs
+    test_ds.to_zarr(
+        store=hamt1,
+        mode="w",
     )
-    test_ds.to_zarr(store=hamt2, mode="w")
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"Adding without encryption took {total_time:.2f} seconds")
 
     hamt1_root: CID = hamt1.root_node_id  # type: ignore
-    hamt2_root: CID = hamt2.root_node_id  # type: ignore
-    print(f"No pin on add root CID: {hamt1_root}")
-    print(f"Pin on add root CID: {hamt2_root}")
 
-    print("Reading in from IPFS")
+    # Read the dataset from IPFS
     hamt1_read = HAMT(
         store=IPFSStore(),
         root_node_id=hamt1_root,
         read_only=True,
-        transformer_encode=encode,
-        transformer_decode=decode,
     )
-    hamt2_read = HAMT(
-        store=IPFSStore(),
-        root_node_id=hamt2_root,
-        read_only=True,
-    )
-    start_time = time.time()
+
+    # Open the zarr store thats encrypted on IPFS
     loaded_ds1 = xr.open_zarr(store=hamt1_read)
-    print(loaded_ds1)
-    loaded_ds2 = xr.open_zarr(store=hamt2_read)
-    end_time = time.time()
     # Assert the values are the same
     # Check if the values of 'temp' and 'precip' are equal in all datasets
-    assert np.array_equal(loaded_ds1["temp"].values, expected_ds["temp"].values), (
-        "Temp values in loaded_ds1 and expected_ds are not identical!"
-    )
-    assert np.array_equal(loaded_ds1["precip"].values, expected_ds["precip"].values), (
-        "Precip values in loaded_ds1 and expected_ds are not identical!"
-    )
-    assert np.array_equal(loaded_ds2["temp"].values, expected_ds["temp"].values), (
-        "Temp values in loaded_ds2 and expected_ds are not identical!"
-    )
-    assert np.array_equal(loaded_ds2["precip"].values, expected_ds["precip"].values), (
-        "Precip values in loaded_ds2 and expected_ds are not identical!"
-    )
-    # xr.testing.assert_identical(loaded_ds1, loaded_ds2)
-    # xr.testing.assert_identical(loaded_ds1, expected_ds)
-    total_time = (end_time - start_time) / 2
-    print(
-        f"Took {total_time:.2f} seconds on average to load between the two loaded datasets"
-    )
+    assert np.array_equal(
+        loaded_ds1["temp"].values, expected_ds["temp"].values
+    ), "Temp values in loaded_ds1 and expected_ds are not identical!"
+    assert np.array_equal(
+        loaded_ds1["precip"].values, expected_ds["precip"].values
+    ), "Precip values in loaded_ds1 and expected_ds are not identical!"
+   
 
-    # Test with no encryption key
+    # Create new encryption filter but with a different encryption key
+    encryption_key = get_random_bytes(32).hex()
+    EncryptionCodec.set_encryption_key(encryption_key)
+    register_codec(EncryptionCodec(header="dClimate-Zarr"))
 
-    encrypted_no_transformer = HAMT(
-        store=IPFSStore(),
-        root_node_id=hamt1_root,
-        read_only=True,
-    )
-    loaded_failure = xr.open_zarr(store=encrypted_no_transformer)
+    loaded_failure = xr.open_zarr(store=hamt1_read)
     # Accessing data should raise an exception since we don't have the encryption key or the transformer
     with pytest.raises(Exception):
         loaded_failure["temp"].values
+    
+    # Check that you can still read the precip since it was not encrypted
+    assert np.array_equal(
+        loaded_failure["precip"].values, expected_ds["precip"].values
+    ), "Precip values in loaded_failure and expected_ds are not identical!"
 
     assert "temp" in loaded_ds1
     assert "precip" in loaded_ds1
     assert loaded_ds1.temp.attrs["units"] == "celsius"
 
     assert loaded_ds1.temp.shape == expected_ds.temp.shape
-
-    assert "temp" in loaded_ds2
-    assert "precip" in loaded_ds2
-    assert loaded_ds2.temp.attrs["units"] == "celsius"
-
-    assert loaded_ds2.temp.shape == expected_ds.temp.shape
