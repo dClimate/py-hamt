@@ -48,7 +48,3 @@ class EncryptionCodec(Codec):
         """Prevent requiring encryption key from metadata."""
         header = config.get("header", "dClimate-Zarr")
         return cls(header=header) 
-
-class MissingKeyError(Exception):
-    def __init__(self, key):
-        super().__init__(f"Cannot find encryption key with hash: {key}")

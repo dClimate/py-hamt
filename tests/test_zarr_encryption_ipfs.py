@@ -87,6 +87,21 @@ def random_zarr_dataset():
     shutil.rmtree(temp_dir)
 
 
+def test_bad_encryption_keys():
+    # Assert failure Encryption key must be set before using EncryptionCodec
+    with pytest.raises(ValueError):
+        EncryptionCodec(header="dClimate-Zarr")
+    # Assert failure Encryption key must be a string 
+    with pytest.raises(ValueError):
+        EncryptionCodec.set_encryption_key(123)
+    # Assert failure Encryption key must be a hexadecimal string
+    with pytest.raises(ValueError):
+        EncryptionCodec.set_encryption_key("123Z")
+    # Assert failure Encryption key must be 32 bytes (64 hex characters)
+    with pytest.raises(ValueError):
+        EncryptionCodec.set_encryption_key("1234567890")
+
+
 def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     zarr_path, expected_ds = random_zarr_dataset
 
