@@ -1,23 +1,7 @@
-from typing import Callable
-from pathlib import Path
-
-
 import io
-
 from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
-
-import functools
-import hashlib
-import io
-
-from Crypto.Cipher import ChaCha20_Poly1305
-from Crypto.Random import get_random_bytes
-
-from numcodecs import register_codec
 from numcodecs.abc import Codec
-from typing import Any
-import xarray as xr
 
 
 class EncryptionCodec(Codec):
@@ -34,6 +18,12 @@ class EncryptionCodec(Codec):
     @classmethod
     def set_encryption_key(cls, encryption_key: str):
         """Set the encryption key dynamically (once per runtime)."""
+        if not isinstance(encryption_key, str):
+            raise ValueError("Encryption key must be a string")
+        if not all(c in '0123456789abcdefABCDEF' for c in encryption_key):
+            raise ValueError("Encryption key must be a hexadecimal string")
+        if len(encryption_key) != 64:  # 32 bytes = 64 hex chars
+            raise ValueError("Encryption key must be 32 bytes (64 hex characters)")
         cls._encryption_key = bytes.fromhex(encryption_key)
 
     def encode(self, buf):
