@@ -6,7 +6,7 @@ from numcodecs.abc import Codec
 
 class EncryptionCodec(Codec):
     codec_id = "xchacha20poly1305"
-    _encryption_key = None 
+    _encryption_key = None
     _encoded_header = None
 
     def __init__(self, header: str):
@@ -20,7 +20,7 @@ class EncryptionCodec(Codec):
         """Set the encryption key dynamically (once per runtime)."""
         if not isinstance(encryption_key, str):
             raise ValueError("Encryption key must be a string")
-        if not all(c in '0123456789abcdefABCDEF' for c in encryption_key):
+        if not all(c in "0123456789abcdefABCDEF" for c in encryption_key):
             raise ValueError("Encryption key must be a hexadecimal string")
         if len(encryption_key) != 64:  # 32 bytes = 64 hex chars
             raise ValueError("Encryption key must be 32 bytes (64 hex characters)")
@@ -47,4 +47,4 @@ class EncryptionCodec(Codec):
     def from_config(cls, config):
         """Prevent requiring encryption key from metadata."""
         header = config.get("header", "dClimate-Zarr")
-        return cls(header=header) 
+        return cls(header=header)

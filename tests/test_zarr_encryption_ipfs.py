@@ -7,8 +7,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import pytest
-import time
-import numcodecs 
 from numcodecs import register_codec
 
 from Crypto.Random import get_random_bytes
@@ -64,7 +62,6 @@ def random_zarr_dataset():
         attrs={"description": "Test dataset with random weather data"},
     )
 
-
     # Generate Random Key
     encryption_key = get_random_bytes(32).hex()
     # Set the encryption key for the class
@@ -74,8 +71,10 @@ def random_zarr_dataset():
 
     # Apply the encryption codec to the dataset with a selected header
     encoding = {
-        'temp': {
-            'filters': [EncryptionCodec(header="dClimate-Zarr")],  # Add the Delta filter
+        "temp": {
+            "filters": [
+                EncryptionCodec(header="dClimate-Zarr")
+            ],  # Add the Delta filter
         }
     }
     # Write the dataset to the zarr store with the encoding on the temp
@@ -91,7 +90,7 @@ def test_bad_encryption_keys():
     # Assert failure Encryption key must be set before using EncryptionCodec
     with pytest.raises(ValueError):
         EncryptionCodec(header="dClimate-Zarr")
-    # Assert failure Encryption key must be a string 
+    # Assert failure Encryption key must be a string
     with pytest.raises(ValueError):
         EncryptionCodec.set_encryption_key(123)
     # Assert failure Encryption key must be a hexadecimal string
@@ -110,7 +109,7 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     # Check if encryption applied to temp but not to precip
     assert test_ds["temp"].encoding["filters"][0].header == "dClimate-Zarr"
-    assert test_ds["precip"].encoding["filters"] == None
+    assert test_ds["precip"].encoding["filters"] is None
 
     # Prepare Writing to IPFS
     hamt1 = HAMT(
@@ -136,13 +135,12 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     loaded_ds1 = xr.open_zarr(store=hamt1_read)
     # Assert the values are the same
     # Check if the values of 'temp' and 'precip' are equal in all datasets
-    assert np.array_equal(
-        loaded_ds1["temp"].values, expected_ds["temp"].values
-    ), "Temp values in loaded_ds1 and expected_ds are not identical!"
-    assert np.array_equal(
-        loaded_ds1["precip"].values, expected_ds["precip"].values
-    ), "Precip values in loaded_ds1 and expected_ds are not identical!"
-   
+    assert np.array_equal(loaded_ds1["temp"].values, expected_ds["temp"].values), (
+        "Temp values in loaded_ds1 and expected_ds are not identical!"
+    )
+    assert np.array_equal(loaded_ds1["precip"].values, expected_ds["precip"].values), (
+        "Precip values in loaded_ds1 and expected_ds are not identical!"
+    )
 
     # Create new encryption filter but with a different encryption key
     encryption_key = get_random_bytes(32).hex()
