@@ -22,12 +22,10 @@ import xarray as xr
 
 class EncryptionCodec(Codec):
     codec_id = "xchacha20poly1305"
-    # header = b"dClimate-Zarr"
     _encryption_key = None 
     _encoded_header = None
 
     def __init__(self, header: str):
-        print(header, "BEING USED")
         self.header = header
         self._encoded_header = header.encode()
         if self._encryption_key is None:
@@ -58,8 +56,8 @@ class EncryptionCodec(Codec):
     @classmethod
     def from_config(cls, config):
         """Prevent requiring encryption key from metadata."""
-        header = config.get("header", b"dClimate-Zarr")
-        return cls(header=header)  # Just return an instance, without needing a key
+        header = config.get("header", "dClimate-Zarr")
+        return cls(header=header) 
 
 class MissingKeyError(Exception):
     def __init__(self, key):

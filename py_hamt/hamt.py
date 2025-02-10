@@ -6,6 +6,7 @@ from typing import Callable
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
+
 from .store import Store
 
 
