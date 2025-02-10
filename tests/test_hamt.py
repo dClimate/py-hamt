@@ -185,9 +185,9 @@ def test_remaining_exceptions():
     root_node = Node.deserialize(memory_store.load(hamt.root_node_id))  # type: ignore
     buckets = root_node.get_buckets()
     links = root_node.get_links()
-    # 224 was found by just testing the hamt with blake3 hash function to see what the hash and thus map key ends up being
-    buckets["224"] = []
-    links["224"] = b"bar"
+    # 4 is the map key for the string "foo"
+    buckets["4"] = []
+    links["4"] = b"bar"
     bad_node_id = memory_store.save(root_node.serialize())
     bad_hamt = HAMT(store=memory_store, root_node_id=bad_node_id)
 
@@ -229,7 +229,8 @@ def test_link_following():
     store = DictStore()
     hamt = HAMT(store=store)
     hamt.max_bucket_size = 1
-    kvs = [("\x0e", b""), ("Ù\x9aÛôå", b""), ("\U000e1d41\U000fef3e\x89", b"")]
+    # The first byte of the blake3 hash of each of these is 0b10110011
+    kvs = [(str(5), b""), (str(15), b""), (str(123), b"")]
     for k, v in kvs:
         hamt[k] = v
     assert len(hamt) == 3
@@ -239,6 +240,7 @@ def test_link_following():
 
 
 # Run this with varying cache sizes to see the impact on performance of the cache when using IPFSStore()
+# Commented out since this increases test time a lot
 # def test_and_print_perf():
 #     import time
 

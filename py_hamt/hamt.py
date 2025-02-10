@@ -367,7 +367,7 @@ class HAMT(MutableMapping):
             curr_key, curr_val = kvs_queue[0]
 
             raw_hash = self.hash_fn(curr_key.encode())
-            map_key = str(extract_bits(raw_hash, len(node_stack), 8))
+            map_key = str(extract_bits(raw_hash, len(node_stack) - 1, 8))
 
             buckets = top_node.get_buckets()
             links = top_node.get_links()
@@ -452,7 +452,7 @@ class HAMT(MutableMapping):
         created_change = False
         while True:
             top_id, top_node = node_stack[-1]
-            map_key = str(extract_bits(raw_hash, len(node_stack), 8))
+            map_key = str(extract_bits(raw_hash, len(node_stack) - 1, 8))
 
             buckets = top_node.get_buckets()
             links = top_node.get_links()
@@ -517,7 +517,7 @@ class HAMT(MutableMapping):
         while True:
             top_id = node_id_stack[-1]
             top_node = self.read_node(top_id)
-            map_key = str(extract_bits(raw_hash, len(node_id_stack), 8))
+            map_key = str(extract_bits(raw_hash, len(node_id_stack) - 1, 8))
 
             # Check if this node is in one of the buckets
             buckets = top_node.get_buckets()
