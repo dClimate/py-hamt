@@ -70,11 +70,12 @@ class IPFSStore(Store):
 
     def __init__(
         self,
-        timeout_seconds=30,
-        gateway_uri_stem="http://127.0.0.1:8080",
-        rpc_uri_stem="http://127.0.0.1:5001",
-        hasher="blake3",
-        pin_on_add=False,
+        timeout_seconds: int = 30,
+        gateway_uri_stem: str = "http://127.0.0.1:8080",
+        rpc_uri_stem: str = "http://127.0.0.1:5001",
+        hasher: str = "blake3",
+        pin_on_add: bool = False,
+        debug: bool = False,
     ):
         self.timeout_seconds = timeout_seconds
         """
@@ -92,6 +93,12 @@ class IPFSStore(Store):
         """The hash function to send to IPFS when storing bytes."""
         self.pin_on_add: bool = pin_on_add
         """Whether IPFSStore should tell the daemon to pin the generated CIDs in API calls. This can be changed in between usage, but should be kept the same value for the lifetime of the program."""
+        self.debug: bool = debug
+        """If true, this records the total number of bytes sent in and out of IPFSStore to the network. You can access this information in `total_sent` and `total_received`. Bytes are counted in terms of either how much was sent to IPFS to store a CID, or how much data was inside of a retrieved IPFS block. This does not include the overhead of the HTTP requests themselves."""
+        self.total_sent: None | int = 0 if debug else None
+        """Total bytes sent to IPFS. Used for debugging purposes."""
+        self.total_received: None | int = 0 if debug else None
+        """Total bytes in responses from IPFS for blocks. Used for debugging purposes."""
 
     def save(self, data: bytes, cid_codec: str) -> CID:
         """
@@ -124,6 +131,10 @@ class IPFSStore(Store):
         if cid.codec.code != 0x70:
             cid = cid.set(codec=cid_codec)
 
+        # if everything is succesful, record debug information
+        if self.debug:
+            self.total_sent += len(data)  # type: ignore
+
         return cid
 
     def save_raw(self, data: bytes) -> CID:
@@ -153,5 +164,8 @@ class IPFSStore(Store):
             f"{self.gateway_uri_stem}/ipfs/{str(id)}", timeout=self.timeout_seconds
         )
         response.raise_for_status()
+
+        if self.debug:
+            self.total_received += len(response.content)  # type: ignore
 
         return response.content

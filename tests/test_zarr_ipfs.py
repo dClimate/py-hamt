@@ -71,47 +71,36 @@ def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     print("Writing this xarray Dataset to IPFS")
     print(test_ds)
 
+    ipfs_store_write = IPFSStore(debug=True)
+    hamt_write = HAMT(store=ipfs_store_write)
     start_time = time.time()
-    hamt1 = HAMT(store=IPFSStore(pin_on_add=False))
-    test_ds.to_zarr(store=hamt1, mode="w")
+    test_ds.to_zarr(store=hamt_write, mode="w")
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"Adding without pinning took {total_time:.2f} seconds")
+    print("=== Write Stats ===")
+    print(f"Total time in seconds: {total_time:.2f}")
+    print(f"Sent bytes: {ipfs_store_write.total_sent}")
+    print(f"Received bytes: {ipfs_store_write.total_received}")
 
+    hamt_write_cid: CID = hamt_write.root_node_id  # type: ignore
+    print(f"Root CID: {hamt_write_cid}")
+
+    ipfs_store_read = IPFSStore(debug=True)
+    hamt_read = HAMT(store=ipfs_store_read, root_node_id=hamt_write_cid, read_only=True)
     start_time = time.time()
-    hamt2 = HAMT(store=IPFSStore(pin_on_add=True))
-    test_ds.to_zarr(store=hamt2, mode="w")
+    loaded_ds = xr.open_zarr(store=hamt_read)
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"Adding with pinning took {total_time:.2f} seconds")
 
-    hamt1_root: CID = hamt1.root_node_id  # type: ignore
-    hamt2_root: CID = hamt2.root_node_id  # type: ignore
-    print(f"No pin on add root CID: {hamt1_root}")
-    print(f"Pin on add root CID: {hamt2_root}")
+    xr.testing.assert_identical(loaded_ds, expected_ds)
 
-    print("Reading in from IPFS")
-    hamt1_read = HAMT(store=IPFSStore(), root_node_id=hamt1_root, read_only=True)
-    hamt2_read = HAMT(store=IPFSStore(), root_node_id=hamt2_root, read_only=True)
-    start_time = time.time()
-    loaded_ds1 = xr.open_zarr(store=hamt1_read)
-    loaded_ds2 = xr.open_zarr(store=hamt2_read)
-    end_time = time.time()
-    xr.testing.assert_identical(loaded_ds1, loaded_ds2)
-    xr.testing.assert_identical(loaded_ds1, expected_ds)
-    total_time = (end_time - start_time) / 2
-    print(
-        f"Took {total_time:.2f} seconds on average to load between the two loaded datasets"
-    )
+    assert "temp" in loaded_ds
+    assert "precip" in loaded_ds
+    assert loaded_ds.temp.attrs["units"] == "celsius"
 
-    assert "temp" in loaded_ds1
-    assert "precip" in loaded_ds1
-    assert loaded_ds1.temp.attrs["units"] == "celsius"
+    assert loaded_ds.temp.shape == expected_ds.temp.shape
 
-    assert loaded_ds1.temp.shape == expected_ds.temp.shape
-
-    assert "temp" in loaded_ds2
-    assert "precip" in loaded_ds2
-    assert loaded_ds2.temp.attrs["units"] == "celsius"
-
-    assert loaded_ds2.temp.shape == expected_ds.temp.shape
+    print("=== Read Stats ===")
+    print(f"Total time in seconds: {total_time:.2f}")
+    print(f"Sent bytes: {ipfs_store_read.total_sent}")
+    print(f"Received bytes: {ipfs_store_read.total_received}")
