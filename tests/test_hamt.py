@@ -54,19 +54,16 @@ key_value_lists = st.lists(
 )
 
 
-# Sometimes useful to lace throughout the test lines when debugging cache problems
-# def find_cache_incosistency(hamt: HAMT):
-#     for id in hamt.cache:
-#         cache_node = hamt.cache[id]
-#         store_node = Node.deserialize(hamt.store.load(id))
-#         if cache_node.data != store_node.data:
-#             print("*** Inconsistency found")
-#             print(f"Cache Node: {cache_node.data}")
-#             print(f"Store Node: {store_node.data}")
-#             print(f"HAMT cache: {hamt.cache}")
-#             print(f"HAMT id_to_time: {hamt.id_to_time}")
-#             print(f"HAMT last accessed time: {hamt.last_accessed_times}")
-#             raise Exception("Cache inconsistency")
+# Just enough to make it that reading back a hamt without the proper transformer will scramble things
+_x = "x".encode()
+
+
+def transformer_encode_minimal(key: str, val: bytes) -> bytes:
+    return _x + val
+
+
+def transformer_decode_minimal(key: str, val: bytes) -> bytes:
+    return val[1:]
 
 
 @given(key_value_lists)
@@ -74,6 +71,8 @@ def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     store = DictStore()
     hamt = HAMT(
         store=store,
+        transformer_encode=transformer_encode_minimal,
+        transformer_decode=transformer_decode_minimal,
     )
     assert isinstance(hamt, MutableMapping)
 
@@ -243,9 +242,7 @@ def test_link_following():
 # Commented out since this increases test time a lot
 # def test_and_print_perf():
 #     import time
-
 #     num_ops = 50
-
 #     # usual cache size
 #     hamt = HAMT(store=IPFSStore())
 #     start_time = time.time()
@@ -253,7 +250,6 @@ def test_link_following():
 #         hamt[str(key_int)] = key_int
 #     end_time = time.time()
 #     op_avg_cache = (end_time - start_time) / 100
-
 #     # no cache
 #     hamt = HAMT(store=IPFSStore(), max_cache_size_bytes=0)
 #     start_time = time.time()
@@ -261,5 +257,19 @@ def test_link_following():
 #         hamt[str(key_int)] = key_int
 #     end_time = time.time()
 #     op_avg_no_cache = (end_time - start_time) / 100
-
 #     print(f"Improvement of {(1 - op_avg_cache / op_avg_no_cache) * 100:.2f}%")
+
+
+# Sometimes useful to lace throughout the test lines when debugging cache problems
+# def find_cache_incosistency(hamt: HAMT):
+#     for id in hamt.cache:
+#         cache_node = hamt.cache[id]
+#         store_node = Node.deserialize(hamt.store.load(id))
+#         if cache_node.data != store_node.data:
+#             print("*** Inconsistency found")
+#             print(f"Cache Node: {cache_node.data}")
+#             print(f"Store Node: {store_node.data}")
+#             print(f"HAMT cache: {hamt.cache}")
+#             print(f"HAMT id_to_time: {hamt.id_to_time}")
+#             print(f"HAMT last accessed time: {hamt.last_accessed_times}")
+#             raise Exception("Cache inconsistency")
