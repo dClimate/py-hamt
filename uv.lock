@@ -552,7 +552,7 @@ wheels = [
 
 [[package]]
 name = "py-hamt"
-version = "2.0.4"
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "dag-cbor" },
