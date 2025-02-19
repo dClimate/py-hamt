@@ -72,6 +72,8 @@ hamt = HAMT(store=IPFSStore(), root_node_id=root_cid) # You can optionally pass 
 
 ## Partially encrypted zarrs
 ```python
+from py_hamt import HAMT, IPFSStore, create_zarr_encryption_transformers
+
 ds = ... # example ds with precip and temp data variables
 encryption_key = bytes(32) # change before using, only for demonstration purposes!
 header = "sample-header".encode()
