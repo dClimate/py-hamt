@@ -25,22 +25,6 @@ jobs:
           run_daemon: true
         id: ipfs_setup
 
-      - name: Configure IPFS with multiple authentication methods
-        run: |
-          # Set CORS headers
-          ipfs config --json API.HTTPHeaders.Access-Control-Allow-Origin '["*"]'
-          ipfs config --json Gateway.HTTPHeaders.Access-Control-Allow-Origin '["*"]'
-
-          # Configure authentication methods with test credentials
-          ipfs config --json Gateway.HTTPHeaders.Authorization "{\"Bearer\": \"test\"}"
-          ipfs config --json Gateway.HTTPHeaders.X-API-Key "\"test\""
-
-          # Basic auth with test:test
-          echo "test:test" > ~/.ipfs/credentials
-          BASIC_AUTH_BASE64=$(base64 ~/.ipfs/credentials | tr -d '\n')
-          ipfs config --json Gateway.HTTPHeaders.Basic-Auth "{\"Authorization\": \"Basic $BASIC_AUTH_BASE64\"}"
-
-
       - name: Run pytest with coverage
         run: uv run pytest --cov=py_hamt tests/ --cov-report=xml
 
