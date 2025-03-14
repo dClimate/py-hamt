@@ -153,10 +153,10 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     )
     hamt = HAMT(
         store=IPFSStore(
-            api_key="test",
-            bearer_token="Test",
-            basic_auth=("test", "test")
-        ), transformer_encode=encrypt, transformer_decode=decrypt
+            api_key="test", bearer_token="Test", basic_auth=("test", "test")
+        ),
+        transformer_encode=encrypt,
+        transformer_decode=decrypt,
     )
     test_ds.to_zarr(store=hamt, mode="w")
 
@@ -166,9 +166,9 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     # Test with just api key
     hamt = HAMT(
-        store=IPFSStore(
-            api_key="test"
-        ), transformer_encode=encrypt, transformer_decode=decrypt
+        store=IPFSStore(api_key="test"),
+        transformer_encode=encrypt,
+        transformer_decode=decrypt,
     )
     test_ds.to_zarr(store=hamt, mode="w")
 

@@ -66,7 +66,7 @@ class IPFSStore(Store):
     Use IPFS as a backing store for a HAMT. The IDs returned from save and used by load are IPFS CIDs.
 
     Save methods use the RPC API but `load` uses the HTTP Gateway, so read-only HAMTs will only access the HTTP Gateway. This allows for connection to remote gateways as well.
-    
+
     You can write to an authenticated IPFS node by providing credentials in the constructor. The following authentication methods are supported:
     - Basic Authentication: Provide a tuple of (username, password) to the `basic_auth` parameter.
     - Bearer Token: Provide a bearer token to the `bearer_token` parameter.
@@ -85,7 +85,7 @@ class IPFSStore(Store):
         basic_auth: tuple[str, str] | None = None,  # (username, password)
         bearer_token: str | None = None,
         api_key: str | None = None,
-        api_key_header: str = "X-API-Key"  # Customizable API key header
+        api_key_header: str = "X-API-Key",  # Customizable API key header
     ):
         self.timeout_seconds = timeout_seconds
         """
@@ -153,7 +153,7 @@ class IPFSStore(Store):
             files={"file": data},
             headers=headers,
             auth=auth,
-            timeout=self.timeout_seconds
+            timeout=self.timeout_seconds,
         )
         response.raise_for_status()
 
