@@ -124,6 +124,7 @@ class IPFSStore(Store):
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         elif self.api_key:
             headers[self.api_key_header] = self.api_key
+        return headers
 
     def save(self, data: bytes, cid_codec: str) -> CID:
         """
