@@ -164,13 +164,22 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     loaded_ds = xr.open_zarr(store=hamt)
     xr.testing.assert_identical(loaded_ds, expected_ds)
 
+    # Test with just api key
+    hamt = HAMT(
+        store=IPFSStore(
+            api_key="test"
+        ), transformer_encode=encrypt, transformer_decode=decrypt
+    )
+    test_ds.to_zarr(store=hamt, mode="w")
+
+    hamt.make_read_only()
+    loaded_ds = xr.open_zarr(store=hamt)
+    xr.testing.assert_identical(loaded_ds, expected_ds)
+
     # Now trying to load without a decryptor, xarray should be able to read the metadata and still perform operations on the unencrypted variable
     print("Attempting to read and print metadata of partially encrypted zarr")
     ds = xr.open_zarr(
-        store=HAMT(store=IPFSStore(          
-            api_key="test",
-            basic_auth=("test", "test")
-        ), root_node_id=hamt.root_node_id, read_only=True)
+        store=HAMT(store=IPFSStore(), root_node_id=hamt.root_node_id, read_only=True)
     )
     print(ds)
     assert ds.temp.sum() == expected_ds.temp.sum()
