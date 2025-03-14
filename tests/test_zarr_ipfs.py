@@ -169,7 +169,6 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     ds = xr.open_zarr(
         store=HAMT(store=IPFSStore(          
             api_key="test",
-            bearer_token="Test",
             basic_auth=("test", "test")
         ), root_node_id=hamt.root_node_id, read_only=True)
     )
