@@ -156,7 +156,7 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     hamt = HAMT(
         store=IPFSStore(
             # Reverse proxy on port 5002
-            rpc_uri_stem = "http://127.0.0.1:5002",
+            rpc_uri_stem="http://127.0.0.1:5002",
             api_key="test",
         ),
         transformer_encode=encrypt,
@@ -171,20 +171,19 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     # Test with wrong API Key
     with pytest.raises(Exception):
         hamt = HAMT(
-            store=IPFSStore(      
-                rpc_uri_stem = "http://127.0.0.1:5002",     
+            store=IPFSStore(
+                rpc_uri_stem="http://127.0.0.1:5002",
                 api_key="badKey",
             ),
             transformer_encode=encrypt,
             transformer_decode=decrypt,
         )
 
-
     # Test with just bearer_token key
     hamt = HAMT(
-        store=IPFSStore(           
+        store=IPFSStore(
             bearer_token="test",
-            rpc_uri_stem = "http://127.0.0.1:5002",
+            rpc_uri_stem="http://127.0.0.1:5002",
         ),
         transformer_encode=encrypt,
         transformer_decode=decrypt,
@@ -198,9 +197,9 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     # Test with wrong bearer
     with pytest.raises(Exception):
         hamt = HAMT(
-            store=IPFSStore(           
+            store=IPFSStore(
                 bearer_token="wrongBearer",
-                rpc_uri_stem = "http://127.0.0.1:5002",
+                rpc_uri_stem="http://127.0.0.1:5002",
             ),
             transformer_encode=encrypt,
             transformer_decode=decrypt,
@@ -208,9 +207,9 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     # Test with just basic auth
     hamt = HAMT(
-        store=IPFSStore(           
+        store=IPFSStore(
             basic_auth=("test", "test"),
-            rpc_uri_stem = "http://127.0.0.1:5002",
+            rpc_uri_stem="http://127.0.0.1:5002",
         ),
         transformer_encode=encrypt,
         transformer_decode=decrypt,
@@ -224,9 +223,9 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     # Test with wrong basic auth
     with pytest.raises(Exception):
         hamt = HAMT(
-            store=IPFSStore(           
+            store=IPFSStore(
                 basic_auth=("wrong", "wrong"),
-                rpc_uri_stem = "http://127.0.0.1:5002",
+                rpc_uri_stem="http://127.0.0.1:5002",
             ),
             transformer_encode=encrypt,
             transformer_decode=decrypt,
