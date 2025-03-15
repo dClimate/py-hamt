@@ -151,9 +151,13 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     encrypt, decrypt = create_zarr_encryption_transformers(
         encryption_key, header="sample-header".encode(), exclude_vars=["temp"]
     )
+
+    # Test with API Key
     hamt = HAMT(
         store=IPFSStore(
-            api_key="test", bearer_token="Test", basic_auth=("test", "test")
+            # Reverse proxy on port 5002
+            rpc_uri_stem = "http://127.0.0.1:5002",
+            api_key="test",
         ),
         transformer_encode=encrypt,
         transformer_decode=decrypt,
@@ -164,9 +168,29 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     loaded_ds = xr.open_zarr(store=hamt)
     xr.testing.assert_identical(loaded_ds, expected_ds)
 
+    # # Test with just bearer_token key
+    # hamt = HAMT(
+    #     store=IPFSStore(           
+    #         # api_key="test",
+    #         # basic_auth=("test", "test"),
+    #         bearer_token="test",
+    #     ),
+    #     transformer_encode=encrypt,
+    #     transformer_decode=decrypt,
+    # )
+    # test_ds.to_zarr(store=hamt, mode="w")
+
+    # hamt.make_read_only()
+    # loaded_ds = xr.open_zarr(store=hamt)
+    # xr.testing.assert_identical(loaded_ds, expected_ds)
+
+
     # Test with just api key
     hamt = HAMT(
-        store=IPFSStore(api_key="test"),
+        store=IPFSStore(      
+            rpc_uri_stem = "http://127.0.0.1:5002",     
+            api_key="test",
+        ),
         transformer_encode=encrypt,
         transformer_decode=decrypt,
     )
