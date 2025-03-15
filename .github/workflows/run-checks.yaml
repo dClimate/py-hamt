@@ -25,7 +25,6 @@ jobs:
           run_daemon: true
         id: ipfs_setup
 
-
       - name: Install and configure Nginx
         run: |
           # Install Nginx
@@ -38,10 +37,28 @@ jobs:
               listen 5002;
               server_name localhost;
 
+              # Default deny unless authenticated
+              set \$auth_valid 0;
+
               location /api/v0/ {
                   # Enforce X-API-Key for API key auth
-                  if (\$http_x_api_key != "test") {
-                      return 401 "Unauthorized: Invalid or missing X-API-Key";
+                  if (\$http_x_api_key = "test") {
+                      set \$auth_valid 1;
+                  }
+
+                  # Check Bearer token
+                  if (\$http_authorization = "Bearer test") {
+                      set \$auth_valid 1;
+                  }
+
+                  # Check Basic Auth (test:test = dGVzdDp0ZXN0)
+                  if (\$http_authorization = "Basic dGVzdDp0ZXN0") {
+                      set \$auth_valid 1;
+                  }
+
+                  # Deny if no valid auth method
+                  if (\$auth_valid = 0) {
+                      return 401 "Unauthorized: Invalid or missing authentication";
                   }
 
                   # Proxy to IPFS RPC API
