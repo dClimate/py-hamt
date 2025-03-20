@@ -145,14 +145,13 @@ class IPFSStore(Store):
 
         # Prepare request parameters
         url = f"{self.rpc_uri_stem}/api/v0/add?hash={self.hasher}&pin={pin_string}"
-        auth = self.basic_auth if self.basic_auth else None
 
         # Make the request with appropriate authentication
         response = requests.post(
             url,
             files={"file": data},
             headers=headers,
-            auth=auth,
+            auth=self.basic_auth,
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
