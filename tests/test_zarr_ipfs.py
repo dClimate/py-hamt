@@ -144,11 +144,11 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     zarr_path, test_ds = random_zarr_dataset
 
     def write_and_check(store: IPFSStore) -> bool:
-        store.rpc_uri_stem = "http://127.0.0.1:5002"  # 5002 is the port configured in the run-checks.yaml actions file for nginx to serve the proxy on
-        hamt = HAMT(store=store)
-        test_ds.to_zarr(store=hamt, mode="w")
-        loaded_ds = xr.open_zarr(store=hamt)
         try:
+            store.rpc_uri_stem = "http://127.0.0.1:5002"  # 5002 is the port configured in the run-checks.yaml actions file for nginx to serve the proxy on
+            hamt = HAMT(store=store)
+            test_ds.to_zarr(store=hamt, mode="w")
+            loaded_ds = xr.open_zarr(store=hamt)
             xr.testing.assert_identical(test_ds, loaded_ds)
             return True
         except Exception as _:
