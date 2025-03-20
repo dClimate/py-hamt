@@ -66,6 +66,11 @@ class IPFSStore(Store):
     Use IPFS as a backing store for a HAMT. The IDs returned from save and used by load are IPFS CIDs.
 
     Save methods use the RPC API but `load` uses the HTTP Gateway, so read-only HAMTs will only access the HTTP Gateway. This allows for connection to remote gateways as well.
+
+    You can write to an authenticated IPFS node by providing credentials in the constructor. The following authentication methods are supported:
+    - Basic Authentication: Provide a tuple of (username, password) to the `basic_auth` parameter.
+    - Bearer Token: Provide a bearer token to the `bearer_token` parameter.
+    - API Key: Provide an API key to the `api_key` parameter. You can customize the header name for the API key by setting the `api_key_header` parameter.
     """
 
     def __init__(
@@ -76,6 +81,11 @@ class IPFSStore(Store):
         hasher: str = "blake3",
         pin_on_add: bool = False,
         debug: bool = False,
+        # Authentication parameters
+        basic_auth: tuple[str, str] | None = None,  # (username, password)
+        bearer_token: str | None = None,
+        api_key: str | None = None,
+        api_key_header: str = "X-API-Key",  # Customizable API key header
     ):
         self.timeout_seconds = timeout_seconds
         """
@@ -100,6 +110,16 @@ class IPFSStore(Store):
         self.total_received: None | int = 0 if debug else None
         """Total bytes in responses from IPFS for blocks. Used for debugging purposes."""
 
+        # Authentication settings
+        self.basic_auth = basic_auth
+        """Tuple of (username, password) for Basic Authentication"""
+        self.bearer_token = bearer_token
+        """Bearer token for token-based authentication"""
+        self.api_key = api_key
+        """API key for API key-based authentication"""
+        self.api_key_header = api_key_header
+        """Header name to use for API key authentication"""
+
     def save(self, data: bytes, cid_codec: str) -> CID:
         """
         This saves the data to an ipfs daemon by calling the RPC API, and then returns the CID, with a multicodec set by the input cid_codec. We need to do this since the API always returns either a multicodec of raw or dag-pb if it had to shard the input data.
@@ -116,9 +136,23 @@ class IPFSStore(Store):
         """
         pin_string: str = "true" if self.pin_on_add else "false"
 
+        # Apply authentication based on provided credentials
+        headers = {}
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        elif self.api_key:
+            headers[self.api_key_header] = self.api_key
+
+        # Prepare request parameters
+        url = f"{self.rpc_uri_stem}/api/v0/add?hash={self.hasher}&pin={pin_string}"
+
+        # Make the request with appropriate authentication
         response = requests.post(
-            f"{self.rpc_uri_stem}/api/v0/add?hash={self.hasher}&pin={pin_string}",
+            url,
             files={"file": data},
+            headers=headers,
+            auth=self.basic_auth,
+            timeout=self.timeout_seconds,
         )
         response.raise_for_status()
 

@@ -25,6 +25,71 @@ jobs:
           run_daemon: true
         id: ipfs_setup
 
+      - name: Install and configure Nginx
+        run: |
+          # Install Nginx
+          sudo apt-get update
+          sudo apt-get install -y nginx
+
+          # Create Nginx config for reverse proxy with auth
+          cat <<EOF | sudo tee /etc/nginx/sites-available/ipfs
+          server {
+              listen 5002;
+              server_name localhost;
+
+              # Default deny unless authenticated
+              set \$auth_valid 0;
+
+              location /api/v0/ {
+                  # Enforce X-API-Key for API key auth
+                  if (\$http_x_api_key = "test") {
+                      set \$auth_valid 1;
+                  }
+
+                  # Check Bearer token
+                  if (\$http_authorization = "Bearer test") {
+                      set \$auth_valid 1;
+                  }
+
+                  # Check Basic Auth (test:test = dGVzdDp0ZXN0)
+                  if (\$http_authorization = "Basic dGVzdDp0ZXN0") {
+                      set \$auth_valid 1;
+                  }
+
+                  # Deny if no valid auth method
+                  if (\$auth_valid = 0) {
+                      return 401 "Unauthorized: Invalid or missing authentication";
+                  }
+
+                  # Proxy to IPFS RPC API
+                  proxy_pass http://127.0.0.1:5001;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          EOF
+
+          # Enable the site and remove default
+          sudo ln -s /etc/nginx/sites-available/ipfs /etc/nginx/sites-enabled/
+          sudo rm -f /etc/nginx/sites-enabled/default
+
+          # Test Nginx config
+          sudo nginx -t
+     
+      - name: Start Nginx and restart IPFS daemon
+        run: |
+          # Start Nginx
+          sudo systemctl start nginx
+
+          # Restart IPFS daemon to ensure it’s running
+          ipfs shutdown
+          ipfs daemon &
+
+          # Wait for IPFS and Nginx to be ready
+          sleep 5
+
       - name: Run pytest with coverage
         run: uv run pytest --cov=py_hamt tests/ --cov-report=xml
 
