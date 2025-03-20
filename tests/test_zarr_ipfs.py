@@ -64,17 +64,18 @@ def random_zarr_dataset():
 
 
 # This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
-def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
+@pytest.mark.asyncio
+async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     _, test_ds = random_zarr_dataset
     print("=== Writing this xarray Dataset to a Zarr v3 on IPFS ===")
     print(test_ds)
 
     ipfsstore = IPFSStore(debug=True)
     hamt = HAMT(store=ipfsstore)
-    start = time.perf_counter()
     ipfszarr3 = IPFSZarr3(hamt)
+    assert ipfszarr3.supports_writes
+    start = time.perf_counter()
     test_ds.to_zarr(store=ipfszarr3)  # type: ignore
-    from pathlib import Path
     end = time.perf_counter()
     elapsed = end - start
     print("=== Write Stats")
@@ -87,12 +88,20 @@ def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     print("=== Reading data back in and checking if identical")
     ipfsstore = IPFSStore(debug=True)
-    hamt = HAMT(store=ipfsstore, root_node_id=cid, read_only=True)
+    hamt = HAMT(store=ipfsstore, root_node_id=cid)
     start = time.perf_counter()
     ipfs_ds: xr.Dataset
-    ipfszarr3 = IPFSZarr3(hamt)
+    ipfszarr3 = IPFSZarr3(hamt, read_only=True)
     ipfs_ds = xr.open_zarr(store=ipfszarr3)
+
     xr.testing.assert_identical(test_ds, ipfs_ds)
+
+    # Tests for code coverage's sake
+    assert await ipfszarr3.exists("zarr.json")
+    # __eq__
+    assert ipfszarr3 == ipfszarr3
+    assert ipfszarr3 != hamt
+    assert not ipfszarr3.supports_writes
 
     end = time.perf_counter()
     print("=== Read Stats")
@@ -110,7 +119,9 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
     encryption_key = bytes(32)
     # Encrypt only precipitation, not temperature or the coordinate variables
     encrypt, decrypt = create_zarr_encryption_transformers(
-        encryption_key, header="sample-header".encode(), exclude_vars=["lat", "lon", "time", "temp"]
+        encryption_key,
+        header="sample-header".encode(),
+        exclude_vars=["lat", "lon", "time", "temp"],
     )
     hamt = HAMT(
         store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
