@@ -12,7 +12,7 @@ import time
 from py_hamt import HAMT, IPFSStore, create_zarr_encryption_transformers
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def random_zarr_dataset():
     """Creates a random xarray Dataset and saves it to a temporary zarr store.
 
@@ -139,105 +139,41 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
         ds.precip.sum()
 
 
+# This test assumes the other IPFSStore zarr ipfs tests are working fine, so if other things are breaking check those first
 def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
-    zarr_path, expected_ds = random_zarr_dataset
-    test_ds = xr.open_zarr(zarr_path)
+    zarr_path, test_ds = random_zarr_dataset
 
-    with pytest.raises(ValueError, match="Encryption key is not 32 bytes"):
-        create_zarr_encryption_transformers(bytes(), bytes())
-
-    encryption_key = bytes(32)
-    # Encrypt only precipitation, not temperature
-    encrypt, decrypt = create_zarr_encryption_transformers(
-        encryption_key, header="sample-header".encode(), exclude_vars=["temp"]
-    )
+    def write_and_check(store: IPFSStore) -> bool:
+        store.rpc_uri_stem = "http://127.0.0.1:5002"  # 5002 is the port configured in the run-checks.yaml actions file for nginx to serve the proxy on
+        hamt = HAMT(store=store)
+        test_ds.to_zarr(store=hamt, mode="w")
+        loaded_ds = xr.open_zarr(store=hamt)
+        try:
+            xr.testing.assert_identical(test_ds, loaded_ds)
+            return True
+        except AssertionError as _:
+            return False
 
     # Test with API Key
-    hamt = HAMT(
-        store=IPFSStore(
-            # Reverse proxy on port 5002
-            rpc_uri_stem="http://127.0.0.1:5002",
-            api_key="test",
-        ),
-        transformer_encode=encrypt,
-        transformer_decode=decrypt,
-    )
-    test_ds.to_zarr(store=hamt, mode="w")
+    api_key_store = IPFSStore(api_key="test")
+    assert write_and_check(api_key_store)
 
-    hamt.make_read_only()
-    loaded_ds = xr.open_zarr(store=hamt)
-    xr.testing.assert_identical(loaded_ds, expected_ds)
+    # Test that wrong API Key fails
+    bad_api_key_store = IPFSStore(api_key="badKey")
+    assert not write_and_check(bad_api_key_store)
 
-    # Test with wrong API Key
-    with pytest.raises(Exception):
-        hamt = HAMT(
-            store=IPFSStore(
-                rpc_uri_stem="http://127.0.0.1:5002",
-                api_key="badKey",
-            ),
-            transformer_encode=encrypt,
-            transformer_decode=decrypt,
-        )
-
-    # Test with just bearer_token key
-    hamt = HAMT(
-        store=IPFSStore(
-            bearer_token="test",
-            rpc_uri_stem="http://127.0.0.1:5002",
-        ),
-        transformer_encode=encrypt,
-        transformer_decode=decrypt,
-    )
-    test_ds.to_zarr(store=hamt, mode="w")
-
-    hamt.make_read_only()
-    loaded_ds = xr.open_zarr(store=hamt)
-    xr.testing.assert_identical(loaded_ds, expected_ds)
+    # Test just bearer token
+    bearer_ipfs_store = IPFSStore(bearer_token="test")
+    assert write_and_check(bearer_ipfs_store)
 
     # Test with wrong bearer
-    with pytest.raises(Exception):
-        hamt = HAMT(
-            store=IPFSStore(
-                bearer_token="wrongBearer",
-                rpc_uri_stem="http://127.0.0.1:5002",
-            ),
-            transformer_encode=encrypt,
-            transformer_decode=decrypt,
-        )
+    bad_bearer_store = IPFSStore(bearer_token="wrongBearer")
+    assert not write_and_check(bad_bearer_store)
 
     # Test with just basic auth
-    hamt = HAMT(
-        store=IPFSStore(
-            basic_auth=("test", "test"),
-            rpc_uri_stem="http://127.0.0.1:5002",
-        ),
-        transformer_encode=encrypt,
-        transformer_decode=decrypt,
-    )
-    test_ds.to_zarr(store=hamt, mode="w")
-
-    hamt.make_read_only()
-    loaded_ds = xr.open_zarr(store=hamt)
-    xr.testing.assert_identical(loaded_ds, expected_ds)
+    basic_auth_store = IPFSStore(basic_auth=("test", "test"))
+    assert write_and_check(basic_auth_store)
 
     # Test with wrong basic auth
-    with pytest.raises(Exception):
-        hamt = HAMT(
-            store=IPFSStore(
-                basic_auth=("wrong", "wrong"),
-                rpc_uri_stem="http://127.0.0.1:5002",
-            ),
-            transformer_encode=encrypt,
-            transformer_decode=decrypt,
-        )
-
-    # Now trying to load without a decryptor, xarray should be able to read the metadata and still perform operations on the unencrypted variable
-    print("Attempting to read and print metadata of partially encrypted zarr")
-    ds = xr.open_zarr(
-        store=HAMT(store=IPFSStore(), root_node_id=hamt.root_node_id, read_only=True)
-    )
-    print(ds)
-    assert ds.temp.sum() == expected_ds.temp.sum()
-    # We should be unable to read precipitation values which are still encrypted
-    with pytest.raises(Exception):
-        ds.precip.sum()
+    bad_basic_auth_store = IPFSStore(basic_auth=("wrong", "wrong"))
+    assert not write_and_check(bad_basic_auth_store)
