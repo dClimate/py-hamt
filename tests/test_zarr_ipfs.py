@@ -151,7 +151,7 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
         try:
             xr.testing.assert_identical(test_ds, loaded_ds)
             return True
-        except AssertionError as _:
+        except Exception as _:
             return False
 
     # Test with API Key
