@@ -36,31 +36,27 @@ class IPFSZarr3(zarr.abc.store.Store):
             return
         # We know this value will always be bytes since we only store bytes in the HAMT
         val: bytes = self.hamt[key]  # type: ignore
-        return prototype.buffer.from_bytes(val)  # type: ignore
+        return prototype.buffer.from_bytes(val)
 
-        subset: bytes
-        match byte_range:
-            case None:
-                subset = val
-            case zarr.abc.store.RangeByteRequest:
-                subset = val[byte_range.start : byte_range.end]
-            case zarr.abc.store.OffsetByteRequest:
-                subset = val[byte_range.offset :]
-            case zarr.abc.store.SuffixByteRequest:
-                subset = val[-byte_range.suffix :]
-        return prototype.buffer.from_bytes(subset)  # type: ignore
+        # Hypothetical code for supporting partial writes, but there is not much point since IPFS itself doesn't support partial write and reads
+        # Untested! If for some reason this is being uncommented and then used in the future, this needs to be tested
+        # subset: bytes
+        # match byte_range:
+        #     case None:
+        #         subset = val
+        #     case zarr.abc.store.RangeByteRequest:
+        #         subset = val[byte_range.start : byte_range.end]
+        #     case zarr.abc.store.OffsetByteRequest:
+        #         subset = val[byte_range.offset :]
+        #     case zarr.abc.store.SuffixByteRequest:
+        #         subset = val[-byte_range.suffix :]
 
     async def get_partial_values(
         self,
         prototype: zarr.core.buffer.BufferPrototype,
         key_ranges: Iterable[tuple[str, zarr.abc.store.ByteRequest | None]],
     ) -> list[zarr.core.buffer.Buffer | None]:
-        results: list[zarr.core.buffer.Buffer | None] = []
-
-        for key, ran in key_ranges:
-            results.append(await self.get(key, prototype, ran))
-
-        return results
+        raise NotImplementedError
 
     async def exists(self, key: str) -> bool:
         return key in self.hamt
