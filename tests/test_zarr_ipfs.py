@@ -106,6 +106,7 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     xr.testing.assert_identical(test_ds, ds2)
 
     end = time.perf_counter()
+    elapsed = end - start
     print("=== Read Stats")
     print(f"Total time in seconds: {elapsed:.2f}")
     print(f"Sent bytes: {ipfsstore.total_sent}")
