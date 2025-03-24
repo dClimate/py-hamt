@@ -78,7 +78,7 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     start = time.perf_counter()
     # Do an initial write along with an append
     test_ds.to_zarr(store=ipfszarr3)  # type: ignore
-    test_ds.to_zarr(store=ipfszarr3, mode="a", append_dim="time") # type: ignore
+    test_ds.to_zarr(store=ipfszarr3, mode="a", append_dim="time")  # type: ignore
     end = time.perf_counter()
     elapsed = end - start
     print("=== Write Stats")
@@ -104,7 +104,6 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     xr.testing.assert_identical(ds1, ds2)
     xr.testing.assert_identical(test_ds, ds1)
     xr.testing.assert_identical(test_ds, ds2)
-
 
     end = time.perf_counter()
     print("=== Read Stats")
@@ -220,7 +219,7 @@ def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
             store.rpc_uri_stem = "http://127.0.0.1:5002"  # 5002 is the port configured in the run-checks.yaml actions file for nginx to serve the proxy on
             hamt = HAMT(store=store)
             ipfszarr3 = IPFSZarr3(hamt)
-            test_ds.to_zarr(store=ipfszarr3, mode="w") # type: ignore
+            test_ds.to_zarr(store=ipfszarr3, mode="w")  # type: ignore
             loaded_ds = xr.open_zarr(store=ipfszarr3)
             xr.testing.assert_identical(test_ds, loaded_ds)
             return True
