@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import pytest
+import zarr.core.buffer
 
 from py_hamt import HAMT, IPFSStore, IPFSZarr3, create_zarr_encryption_transformers
 
@@ -96,18 +97,72 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     xr.testing.assert_identical(test_ds, ipfs_ds)
 
+    end = time.perf_counter()
+    print("=== Read Stats")
+    print(f"Total time in seconds: {elapsed:.2f}")
+    print(f"Sent bytes: {ipfsstore.total_sent}")
+    print(f"Received bytes: {ipfsstore.total_received}")
+
     # Tests for code coverage's sake
     assert await ipfszarr3.exists("zarr.json")
     # __eq__
     assert ipfszarr3 == ipfszarr3
     assert ipfszarr3 != hamt
     assert not ipfszarr3.supports_writes
+    assert not ipfszarr3.supports_partial_writes
+    assert not ipfszarr3.supports_deletes
 
-    end = time.perf_counter()
-    print("=== Read Stats")
-    print(f"Total time in seconds: {elapsed:.2f}")
-    print(f"Sent bytes: {ipfsstore.total_sent}")
-    print(f"Received bytes: {ipfsstore.total_received}")
+    hamt_keys = set(ipfszarr3.hamt.keys())
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list():
+        ipfszarr3_keys.add(k)
+    assert hamt_keys == ipfszarr3_keys
+
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list():
+        ipfszarr3_keys.add(k)
+    assert hamt_keys == ipfszarr3_keys
+
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list_prefix(""):
+        ipfszarr3_keys.add(k)
+    assert hamt_keys == ipfszarr3_keys
+
+    with pytest.raises(NotImplementedError):
+        await ipfszarr3.set_partial_values([])
+
+    with pytest.raises(NotImplementedError):
+        await ipfszarr3.get_partial_values(
+            zarr.core.buffer.default_buffer_prototype(), []
+        )
+
+    previous_zarr_json = await ipfszarr3.get(
+        "zarr.json", zarr.core.buffer.default_buffer_prototype()
+    )
+    assert previous_zarr_json is not None
+    # Setting a metadata file that should always exist should not change anything
+    await ipfszarr3.set_if_not_exists("zarr.json", np.array([b"a"], dtype=np.bytes_))  # type: ignore np.arrays, if dtype is bytes, is usable as a zarr buffer
+    zarr_json_now = await ipfszarr3.get(
+        "zarr.json", zarr.core.buffer.default_buffer_prototype()
+    )
+    assert zarr_json_now is not None
+    assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
+
+    # now remove that metadata file and then add it back
+    ipfszarr3 = IPFSZarr3(ipfszarr3.hamt, read_only=False)  # make a writable version
+    await ipfszarr3.delete("zarr.json")
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list():
+        ipfszarr3_keys.add(k)
+    assert hamt_keys != ipfszarr3_keys
+    assert "zarr.json" not in ipfszarr3_keys
+
+    await ipfszarr3.set_if_not_exists("zarr.json", previous_zarr_json)
+    zarr_json_now = await ipfszarr3.get(
+        "zarr.json", zarr.core.buffer.default_buffer_prototype()
+    )
+    assert zarr_json_now is not None
+    assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
 
 
 def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):

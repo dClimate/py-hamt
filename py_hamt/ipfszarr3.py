@@ -79,9 +79,7 @@ class IPFSZarr3(zarr.abc.store.Store):
     async def set_partial_values(
         self, key_start_values: Iterable[tuple[str, int, BytesLike]]
     ) -> None:
-        for key, range_start, val in key_start_values:
-            subset = val[range_start:]
-            self.hamt[key] = bytes(subset)
+        raise NotImplementedError
 
     @property
     def supports_deletes(self) -> bool:
