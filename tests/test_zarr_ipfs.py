@@ -76,7 +76,9 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     ipfszarr3 = IPFSZarr3(hamt)
     assert ipfszarr3.supports_writes
     start = time.perf_counter()
+    # Do an initial write along with an append
     test_ds.to_zarr(store=ipfszarr3)  # type: ignore
+    test_ds.to_zarr(store=ipfszarr3, mode="a", append_dim="time") # type: ignore
     end = time.perf_counter()
     elapsed = end - start
     print("=== Write Stats")
@@ -94,8 +96,15 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     ipfs_ds: xr.Dataset
     ipfszarr3 = IPFSZarr3(hamt, read_only=True)
     ipfs_ds = xr.open_zarr(store=ipfszarr3)
+    print(ipfs_ds)
 
-    xr.testing.assert_identical(test_ds, ipfs_ds)
+    # Check both halves, since each are an identical copy
+    ds1 = ipfs_ds.isel(time=slice(0, len(ipfs_ds.time) // 2))
+    ds2 = ipfs_ds.isel(time=slice(len(ipfs_ds.time) // 2, len(ipfs_ds.time)))
+    xr.testing.assert_identical(ds1, ds2)
+    xr.testing.assert_identical(test_ds, ds1)
+    xr.testing.assert_identical(test_ds, ds2)
+
 
     end = time.perf_counter()
     print("=== Read Stats")
