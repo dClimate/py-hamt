@@ -22,6 +22,32 @@ def create_zarr_encryption_transformers(
     zarr.json metadata files in a zarr v3 are always ignored, to allow for calculating an encrypted zarr's structure without having the encryption key.
 
     With `exclude_vars` you may also set some variables to be unencrypted. This allows for partially encrypted zarrs which can be loaded into xarray but the values of encrypted variables cannot be accessed (errors will be thrown). You should generally include your coordinate variables along with your data variables in here.
+
+    # Example code
+    ```python
+    from py_hamt import HAMT, IPFSStore, IPFSZarr3
+
+    ds = ... # example xarray Dataset with precip and temp data variables
+    encryption_key = bytes(32) # change before using, only for demonstration purposes!
+    header = "sample-header".encode()
+    encrypt, decrypt = create_zarr_encryption_transformers(
+        encryption_key, header, exclude_vars=["temp"]
+    )
+    hamt = HAMT(
+        store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
+    )
+    ipfszarr3 = IPFSZarr3(hamt)
+    ds.to_zarr(store=ipfszarr3, mode="w")
+
+    print("Attempting to read and print metadata of partially encrypted zarr")
+    enc_ds = xr.open_zarr(store=ipfszarr3, read_only=True)
+    print(enc_ds)
+    assert enc_ds.temp.sum() == ds.temp.sum()
+    try:
+        enc_ds.precip.sum()
+    except:
+        print("Couldn't read encrypted variable")
+    ```
     """
 
     if len(encryption_key) != 32:

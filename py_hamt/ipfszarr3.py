@@ -7,7 +7,36 @@ from py_hamt.hamt import HAMT
 
 
 class IPFSZarr3(zarr.abc.store.Store):
+    """
+    While Zarr v2 can use a generic key-value map (MutableMapping) that HAMT already conforms to, Zarr v3s require storage classes to conform to a new abstract class. IPFSZarr3 just wraps over a HAMT to provide this compatibility.
+
+    An example of how to write and read a zarr, using xarray, is provided below.
+    # Write and get CID
+    ```python
+    import xarray as xr
+    from py_hamt import IPFSStore, HAMT, IPFSZarr3
+
+    ds = ... # some xarray Dataset
+    ipfszarr3 = IPFSZarr3(HAMT(store=IPFSStore()))
+    xr.to_zarr(store=ipfszarr3)
+    print(ipfszarr3.hamt.root_node_id) # The CID of the root, which is used for reading
+    ```
+
+    # Read from CID
+    ```python
+    import xarray as xr
+    from multiformats import CID
+    from py_hamt import IPFSStore, HAMT, IPFSZarr3
+
+    cid = CID.decode("...") # the CID for the HAMT root
+    ipfszarr3 = IPFSZarr3(HAMT(store=IPFSStore(), root_node_id=cid), read_only=True)
+    ds = xr.open_zarr(store=ipfszarr3)
+    print(ds)
+    ```
+    """
+
     hamt: HAMT
+    """The internal HAMT. Safe to read the CID from, if done doing operations."""
 
     def __init__(self, hamt: HAMT, read_only: bool = False) -> None:
         super().__init__(read_only=read_only)
