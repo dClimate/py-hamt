@@ -72,7 +72,7 @@ hamt = HAMT(store=IPFSStore(), root_node_id=root_cid) # You can optionally pass 
 ...
 ```
 
-For an example on how to read and write Zarr v3, check the API documentation and look at the ``IPFSZarr3` class.
+For an example on how to read and write Zarr v3, check the API documentation and look at the `IPFSZarr3` class.
 
 For how to create partially encrypted zarrs, check the API documentation's `create_zarr_encryption_transformers` section.
 
