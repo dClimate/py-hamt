@@ -7,27 +7,26 @@
 [![codecov](https://codecov.io/gh/dClimate/py-hamt/graph/badge.svg?token=M6Y4D19Y38)](https://codecov.io/gh/dClimate/py-hamt)
 
 # py-hamt
-This is a python implementation of a HAMT, adapted from [rvagg's IAMap project written in JavaScript](https://github.com/rvagg/iamap).
-Like IAMap, py-hamt abstracts over a backing storage layer which lets you store any arbitrary amount of data but returns its own ID, e.g. content-addressed systems.
+This is a python implementation of a HAMT, inspired by [rvagg's IAMap project written in JavaScript](https://github.com/rvagg/iamap).
+Like IAMap, py-hamt abstracts over a content-addressed storage system, something that can keep arbitrary values but will return its own key, like IPFS.
 
-Key differences from IAMap is that the py-hamt data structure is mutable and not asynchronous. But the key idea of abstracting over a value store is the same.
+dClimate primarily created this for storing [zarr](https://zarr.dev/) on IPFS. To see this in action, see our [data ETLs](https://github.com/dClimate/etl-scripts).
 
-dClimate created this library to use IPFS to store [zarr](https://zarr.dev/) files. To see this in action, see our [data ETLs](https://github.com/dClimate/etl-scripts).
-
-# Usage
+# Installation and Usage
 To install, since we do not publish this package to PyPI, add this library to your project directly from git.
 ```sh
 pip install 'git+https://github.com/dClimate/py-hamt'
 ```
 
-Below are some examples, but for more information see the [API documentation](https://dclimate.github.io/py-hamt/py_hamt.html). Looking at the test files, namely `test_hamt.py` is also quite helpful. You can also see this library used in notebooks for data analysis here [dClimate Jupyter Notebooks](https://github.com/dClimate/jupyter-notebooks)
+Below are some examples, but for more information see the [API documentation](https://dclimate.github.io/py-hamt/py_hamt.html). Each major item has example code. You can also see this library used in [Jupyter notebooks for data analysis](https://github.com/dClimate/jupyter-notebooks).
 
-## Basic Writing/Reading from an in memory store
+## Basic Writing/Reading
+A HAMT allows for generic key-value storage.
 ```python
-from py_hamt import HAMT, DictStore
+from py_hamt import HAMT, IPFSStore
 
-# Setup a HAMT with an in memory store
-hamt = HAMT(store=DictStore())
+# Setup a HAMT and connect it to your local ipfs node
+hamt = HAMT(store=IPFSStore())
 
 # Set and get one value
 hamt["foo"] = "bar"
@@ -48,6 +47,9 @@ print (list(hamt)) # [foo, foo2], order depends on the hash function used
 # Delete a value
 del hamt["foo"]
 assert len(hamt) == 1
+
+# Print CID of the HAMT
+print(hamt.root_node_id)
 ```
 
 ## Reading a CID from IPFS
@@ -55,7 +57,7 @@ assert len(hamt) == 1
 from py_hamt import HAMT, IPFSStore
 from multiformats import CID
 
-# Get the CID you wish to read whether from a blog post, a smart contract, or a friend
+# A CID for data you wish to read, from a blog post, a smart contract, or a friend
 dataset_cid = "baf..."
 
 # Use the multiformats library to decode the CID into an object
@@ -70,32 +72,9 @@ hamt = HAMT(store=IPFSStore(), root_node_id=root_cid) # You can optionally pass 
 ...
 ```
 
-## Partially encrypted zarrs
-```python
-from py_hamt import HAMT, IPFSStore, create_zarr_encryption_transformers
+For an example on how to read and write Zarr v3, check the API documentation and look at the ``IPFSZarr3` class.
 
-ds = ... # example ds with precip and temp data variables
-encryption_key = bytes(32) # change before using, only for demonstration purposes!
-header = "sample-header".encode()
-encrypt, decrypt = create_zarr_encryption_transformers(
-    encryption_key, header, exclude_vars=["temp"]
-)
-hamt = HAMT(
-    store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
-)
-ds.to_zarr(store=hamt, mode="w")
-
-print("Attempting to read and print metadata of partially encrypted zarr")
-enc_ds = xr.open_zarr(
-    store=HAMT(store=IPFSStore(), root_node_id=hamt.root_node_id, read_only=True)
-)
-print(enc_ds)
-assert enc_ds.temp.sum() == ds.temp.sum()
-try:
-    enc_ds.precip.sum()
-except:
-    print("Couldn't read encrypted variable")
-```
+For how to create partially encrypted zarrs, check the API documentation's `create_zarr_encryption_transformers` section.
 
 # Development Guide
 ## Setting Up
@@ -141,4 +120,4 @@ uv run pdoc py_hamt
 ```
 
 ## Managing dependencies
-Use `uv add` and `uv remove`, e.g. `uv add numpy` or `uv add --dev pytest`. For more information please see the [uv documentation](https://docs.astral.sh/uv/guides/projects/).
+Use `uv add` and `uv remove`, e.g. `uv add numpy` or `uv add pytest --group dev`. For more information please see the [uv documentation](https://docs.astral.sh/uv/guides/projects/).

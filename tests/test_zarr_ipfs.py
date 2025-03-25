@@ -1,15 +1,15 @@
 import os
 import shutil
 import tempfile
+import time
 
-from multiformats import CID
 import numpy as np
 import pandas as pd
 import xarray as xr
 import pytest
-import time
+import zarr.core.buffer
 
-from py_hamt import HAMT, IPFSStore, create_zarr_encryption_transformers
+from py_hamt import HAMT, IPFSStore, IPFSZarr3, create_zarr_encryption_transformers
 
 
 @pytest.fixture(scope="module")
@@ -64,91 +64,164 @@ def random_zarr_dataset():
     shutil.rmtree(temp_dir)
 
 
-def test_upload_then_read(random_zarr_dataset: tuple[str, xr.Dataset]):
-    zarr_path, expected_ds = random_zarr_dataset
-    test_ds = xr.open_zarr(zarr_path)
-
-    print("Writing this xarray Dataset to IPFS")
+# This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
+@pytest.mark.asyncio
+async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
+    _, test_ds = random_zarr_dataset
+    print("=== Writing this xarray Dataset to a Zarr v3 on IPFS ===")
     print(test_ds)
 
-    ipfs_store_write = IPFSStore(debug=True)
-    hamt_write = HAMT(store=ipfs_store_write)
-    start_time = time.time()
-    test_ds.to_zarr(store=hamt_write, mode="w")
-    end_time = time.time()
-    total_time = end_time - start_time
-    print("=== Write Stats ===")
-    print(f"Total time in seconds: {total_time:.2f}")
-    print(f"Sent bytes: {ipfs_store_write.total_sent}")
-    print(f"Received bytes: {ipfs_store_write.total_received}")
+    ipfsstore = IPFSStore(debug=True)
+    hamt = HAMT(store=ipfsstore)
+    ipfszarr3 = IPFSZarr3(hamt)
+    assert ipfszarr3.supports_writes
+    start = time.perf_counter()
+    # Do an initial write along with an append
+    test_ds.to_zarr(store=ipfszarr3)  # type: ignore
+    test_ds.to_zarr(store=ipfszarr3, mode="a", append_dim="time")  # type: ignore
+    end = time.perf_counter()
+    elapsed = end - start
+    print("=== Write Stats")
+    print(f"Total time in seconds: {elapsed:.2f}")
+    print(f"Sent bytes: {ipfsstore.total_sent}")
+    print(f"Received bytes: {ipfsstore.total_received}")
+    print("=== Root CID")
+    cid = hamt.root_node_id
+    print(cid)
 
-    hamt_write_cid: CID = hamt_write.root_node_id  # type: ignore
-    print(f"Root CID: {hamt_write_cid}")
+    print("=== Reading data back in and checking if identical")
+    ipfsstore = IPFSStore(debug=True)
+    hamt = HAMT(store=ipfsstore, root_node_id=cid)
+    start = time.perf_counter()
+    ipfs_ds: xr.Dataset
+    ipfszarr3 = IPFSZarr3(hamt, read_only=True)
+    ipfs_ds = xr.open_zarr(store=ipfszarr3)
+    print(ipfs_ds)
 
-    ipfs_store_read = IPFSStore(debug=True)
-    hamt_read = HAMT(store=ipfs_store_read, root_node_id=hamt_write_cid, read_only=True)
-    start_time = time.time()
-    loaded_ds = xr.open_zarr(store=hamt_read)
-    end_time = time.time()
-    total_time = end_time - start_time
+    # Check both halves, since each are an identical copy
+    ds1 = ipfs_ds.isel(time=slice(0, len(ipfs_ds.time) // 2))
+    ds2 = ipfs_ds.isel(time=slice(len(ipfs_ds.time) // 2, len(ipfs_ds.time)))
+    xr.testing.assert_identical(ds1, ds2)
+    xr.testing.assert_identical(test_ds, ds1)
+    xr.testing.assert_identical(test_ds, ds2)
 
-    xr.testing.assert_identical(loaded_ds, expected_ds)
+    end = time.perf_counter()
+    elapsed = end - start
+    print("=== Read Stats")
+    print(f"Total time in seconds: {elapsed:.2f}")
+    print(f"Sent bytes: {ipfsstore.total_sent}")
+    print(f"Received bytes: {ipfsstore.total_received}")
 
-    assert "temp" in loaded_ds
-    assert "precip" in loaded_ds
-    assert loaded_ds.temp.attrs["units"] == "celsius"
+    # Tests for code coverage's sake
+    assert await ipfszarr3.exists("zarr.json")
+    # __eq__
+    assert ipfszarr3 == ipfszarr3
+    assert ipfszarr3 != hamt
+    assert not ipfszarr3.supports_writes
+    assert not ipfszarr3.supports_partial_writes
+    assert not ipfszarr3.supports_deletes
 
-    assert loaded_ds.temp.shape == expected_ds.temp.shape
+    hamt_keys = set(ipfszarr3.hamt.keys())
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list():
+        ipfszarr3_keys.add(k)
+    assert hamt_keys == ipfszarr3_keys
 
-    print("=== Read Stats ===")
-    print(f"Total time in seconds: {total_time:.2f}")
-    print(f"Sent bytes: {ipfs_store_read.total_sent}")
-    print(f"Received bytes: {ipfs_store_read.total_received}")
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list():
+        ipfszarr3_keys.add(k)
+    assert hamt_keys == ipfszarr3_keys
+
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list_prefix(""):
+        ipfszarr3_keys.add(k)
+    assert hamt_keys == ipfszarr3_keys
+
+    with pytest.raises(NotImplementedError):
+        await ipfszarr3.set_partial_values([])
+
+    with pytest.raises(NotImplementedError):
+        await ipfszarr3.get_partial_values(
+            zarr.core.buffer.default_buffer_prototype(), []
+        )
+
+    previous_zarr_json = await ipfszarr3.get(
+        "zarr.json", zarr.core.buffer.default_buffer_prototype()
+    )
+    assert previous_zarr_json is not None
+    # Setting a metadata file that should always exist should not change anything
+    await ipfszarr3.set_if_not_exists("zarr.json", np.array([b"a"], dtype=np.bytes_))  # type: ignore np.arrays, if dtype is bytes, is usable as a zarr buffer
+    zarr_json_now = await ipfszarr3.get(
+        "zarr.json", zarr.core.buffer.default_buffer_prototype()
+    )
+    assert zarr_json_now is not None
+    assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
+
+    # now remove that metadata file and then add it back
+    ipfszarr3 = IPFSZarr3(ipfszarr3.hamt, read_only=False)  # make a writable version
+    await ipfszarr3.delete("zarr.json")
+    ipfszarr3_keys: set[str] = set()
+    async for k in ipfszarr3.list():
+        ipfszarr3_keys.add(k)
+    assert hamt_keys != ipfszarr3_keys
+    assert "zarr.json" not in ipfszarr3_keys
+
+    await ipfszarr3.set_if_not_exists("zarr.json", previous_zarr_json)
+    zarr_json_now = await ipfszarr3.get(
+        "zarr.json", zarr.core.buffer.default_buffer_prototype()
+    )
+    assert zarr_json_now is not None
+    assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
 
 
 def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
-    zarr_path, expected_ds = random_zarr_dataset
-    test_ds = xr.open_zarr(zarr_path)
+    _, test_ds = random_zarr_dataset
 
     with pytest.raises(ValueError, match="Encryption key is not 32 bytes"):
         create_zarr_encryption_transformers(bytes(), bytes())
 
     encryption_key = bytes(32)
-    # Encrypt only precipitation, not temperature
+    # Encrypt only precipitation, not temperature or the coordinate variables
     encrypt, decrypt = create_zarr_encryption_transformers(
-        encryption_key, header="sample-header".encode(), exclude_vars=["temp"]
+        encryption_key,
+        header="sample-header".encode(),
+        exclude_vars=["lat", "lon", "time", "temp"],
     )
     hamt = HAMT(
         store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
     )
-    test_ds.to_zarr(store=hamt, mode="w")
+    ipfszarr3 = IPFSZarr3(hamt)
+    test_ds.to_zarr(store=ipfszarr3)  # type: ignore
 
-    hamt.make_read_only()
-    loaded_ds = xr.open_zarr(store=hamt)
-    xr.testing.assert_identical(loaded_ds, expected_ds)
+    ipfs_ds = xr.open_zarr(store=ipfszarr3)
+    xr.testing.assert_identical(ipfs_ds, test_ds)
 
     # Now trying to load without a decryptor, xarray should be able to read the metadata and still perform operations on the unencrypted variable
-    print("Attempting to read and print metadata of partially encrypted zarr")
+    print("=== Attempting to read and print metadata of partially encrypted zarr")
+
     ds = xr.open_zarr(
-        store=HAMT(store=IPFSStore(), root_node_id=hamt.root_node_id, read_only=True)
+        store=IPFSZarr3(
+            HAMT(store=IPFSStore(), root_node_id=hamt.root_node_id, read_only=True)
+        )
     )
     print(ds)
-    assert ds.temp.sum() == expected_ds.temp.sum()
+    assert ds.temp.sum() == test_ds.temp.sum()
     # We should be unable to read precipitation values which are still encrypted
     with pytest.raises(Exception):
         ds.precip.sum()
 
 
-# This test assumes the other IPFSStore zarr ipfs tests are working fine, so if other things are breaking check those first
+# This test assumes the other zarr ipfs tests are working fine, so if other things are breaking check those first
 def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
-    zarr_path, test_ds = random_zarr_dataset
+    _, test_ds = random_zarr_dataset
 
     def write_and_check(store: IPFSStore) -> bool:
         try:
             store.rpc_uri_stem = "http://127.0.0.1:5002"  # 5002 is the port configured in the run-checks.yaml actions file for nginx to serve the proxy on
             hamt = HAMT(store=store)
-            test_ds.to_zarr(store=hamt, mode="w")
-            loaded_ds = xr.open_zarr(store=hamt)
+            ipfszarr3 = IPFSZarr3(hamt)
+            test_ds.to_zarr(store=ipfszarr3, mode="w")  # type: ignore
+            loaded_ds = xr.open_zarr(store=ipfszarr3)
             xr.testing.assert_identical(test_ds, loaded_ds)
             return True
         except Exception as _:

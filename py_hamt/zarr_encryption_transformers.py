@@ -4,18 +4,6 @@ from pathlib import Path
 from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
 
-# Metadata files used in zarr v2
-_metadata_files = [
-    # top level metadata
-    ".zattrs",  # Also found within folders for variables
-    ".zgroup",
-    ".zmetadata",
-    # Found within folders for variables
-    ".zarray",
-    # important for coordinate variables, so that we can read bounds
-    "0",
-]
-
 type TransformerFN = Callable[[str, bytes], bytes]
 
 
@@ -31,7 +19,35 @@ def create_zarr_encryption_transformers(
 
     Note that the encryption key must always be 32 bytes long. A header is required by the underlying encryption algorithm. Every time a zarr chunk is encrypted, a random 24-byte nonce is generated. This is saved with the chunk for use when reading back.
 
-    Metadata within a zarr, such as ".zattrs" or ".zgroup" are always ignored, to allow for calculating an encrypted zarr's structure without necessarily having the encryption key. You may also set some variables to be entirely unencrypted with the exclude_vars argument. This allows for partially encrypted zarrs which can be loaded into xarray but the values of encrypted variables cannot be accessed (errors will be thrown).
+    zarr.json metadata files in a zarr v3 are always ignored, to allow for calculating an encrypted zarr's structure without having the encryption key.
+
+    With `exclude_vars` you may also set some variables to be unencrypted. This allows for partially encrypted zarrs which can be loaded into xarray but the values of encrypted variables cannot be accessed (errors will be thrown). You should generally include your coordinate variables along with your data variables in here.
+
+    # Example code
+    ```python
+    from py_hamt import HAMT, IPFSStore, IPFSZarr3
+
+    ds = ... # example xarray Dataset with precip and temp data variables
+    encryption_key = bytes(32) # change before using, only for demonstration purposes!
+    header = "sample-header".encode()
+    encrypt, decrypt = create_zarr_encryption_transformers(
+        encryption_key, header, exclude_vars=["temp"]
+    )
+    hamt = HAMT(
+        store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
+    )
+    ipfszarr3 = IPFSZarr3(hamt)
+    ds.to_zarr(store=ipfszarr3, mode="w")
+
+    print("Attempting to read and print metadata of partially encrypted zarr")
+    enc_ds = xr.open_zarr(store=ipfszarr3, read_only=True)
+    print(enc_ds)
+    assert enc_ds.temp.sum() == ds.temp.sum()
+    try:
+        enc_ds.precip.sum()
+    except:
+        print("Couldn't read encrypted variable")
+    ```
     """
 
     if len(encryption_key) != 32:
@@ -39,10 +55,16 @@ def create_zarr_encryption_transformers(
 
     def _should_transform(key: str) -> bool:
         p = Path(key)
-        if p.parent.name in exclude_vars:
+
+        # Find the first directory name in the path since zarr v3 chunks are stored in a nested directory structure
+        # e.g. for Path("precip/c/0/0/1") it would return "precip"
+        if p.parts[0] in exclude_vars:
             return False
-        if p.name in _metadata_files:
+
+        # Don't transform metadata files
+        if p.name == "zarr.json":
             return False
+
         return True
 
     def encrypt(key: str, val: bytes) -> bytes:
