@@ -642,7 +642,7 @@ requires-dist = [
     { name = "multiformats", extras = ["full"], specifier = ">=0.3.1.post4" },
     { name = "pycryptodome", specifier = ">=3.21.0" },
     { name = "requests", specifier = ">=2.32.3" },
-    { name = "zarr" },
+    { name = "zarr", specifier = ">=3.0.6" },
 ]
 
 [package.metadata.requires-dev]
@@ -657,7 +657,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.0.0" },
     { name = "ruff", specifier = ">=0.7.1" },
     { name = "snakeviz", specifier = ">=2.2.0" },
-    { name = "xarray", specifier = ">=2025.1.2" },
+    { name = "xarray", specifier = ">=2025.3.0" },
 ]
 
 [[package]]
@@ -1003,21 +1003,21 @@ wheels = [
 
 [[package]]
 name = "xarray"
-version = "2025.1.2"
+version = "2025.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "packaging" },
     { name = "pandas" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/89/c0/edb2f6cfafa5369106f927409f6211141c3296c14877cc634d8ee4c970a4/xarray-2025.1.2.tar.gz", hash = "sha256:e7675c79ac69d274dd3b3c5450ce57176928d2792947576251ed1c7df1783224", size = 3271214 }
+sdist = { url = "https://files.pythonhosted.org/packages/8a/8c/e56820a2c682834d8fb4a940956cd41b9f2532fee9692bfaf43b14f33c6e/xarray-2025.3.0.tar.gz", hash = "sha256:531cf6d64e6ab54c19239930a840654f1a79d2140e9f0d11d1e8d69dcc581d0f", size = 3292399 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/05/79/4e19100342fe13d69fd6e77b343e2269924fec681258e2ea21b55576aad2/xarray-2025.1.2-py3-none-any.whl", hash = "sha256:a7ad6a36c6e0becd67f8aff6a7808d20e4bdcd344debb5205f0a34b1a4a7f8d6", size = 1247773 },
+    { url = "https://files.pythonhosted.org/packages/91/19/5dbac77ca82f009f8267d0e7cca4fd3be2a435d83ed98f6f8b9c5cb1747e/xarray-2025.3.0-py3-none-any.whl", hash = "sha256:022b7eac5ebc26d70d34211de732ec1a15127a40455f9492acdde7fbe5bbf091", size = 1270849 },
 ]
 
 [[package]]
 name = "zarr"
-version = "3.0.5"
+version = "3.0.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "donfig" },
@@ -1026,7 +1026,7 @@ dependencies = [
     { name = "packaging" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0f/27/9969116e77d0ce3996c58630678fa20ff094a1599018ef24006c1df480c0/zarr-3.0.5.tar.gz", hash = "sha256:4ac0a09d66875d398ab53c95fd4bddca2f3d757a04454831fc2d54bfbafcb7e5", size = 240716 }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/bf/2820e8ad5f086ea5cd4c4d65eb5e0113f98145ddf5810cec1c75fb10fb98/zarr-3.0.6.tar.gz", hash = "sha256:6ef23c740e34917a2a1099471361537732942e49f0cabe95c9b7124cd0d6d84f", size = 240812 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/2c/1ce2f94d062a9457d980831f60062f274ac3286006c7ef007b9720fa562c/zarr-3.0.5-py3-none-any.whl", hash = "sha256:e56f8cf1f8105a118a9cdadb78f3b44363b9c67f326a569d79271a1f1cb338e1", size = 196354 },
+    { url = "https://files.pythonhosted.org/packages/fb/38/56a1c129577d20dc975a934ccc3f7f16276eab04ff0ffbe02ea348407a37/zarr-3.0.6-py3-none-any.whl", hash = "sha256:dba078726b6e4defb0ae6a852b7e7035ce163d89d485961681ece49191dcce82", size = 196357 },
 ]
