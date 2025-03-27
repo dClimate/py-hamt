@@ -160,6 +160,8 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
     # now remove that metadata file and then add it back
     ipfszarr3 = IPFSZarr3(ipfszarr3.hamt, read_only=False)  # make a writable version
     await ipfszarr3.delete("zarr.json")
+    # doing a duplicate delete should not result in an error
+    await ipfszarr3.delete("zarr.json")
     ipfszarr3_keys: set[str] = set()
     async for k in ipfszarr3.list():
         ipfszarr3_keys.add(k)
@@ -202,7 +204,7 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
     ds = xr.open_zarr(
         store=IPFSZarr3(
             HAMT(store=IPFSStore(), root_node_id=ipfszarr3.hamt.root_node_id),
-            read_only=True
+            read_only=True,
         )
     )
     print(ds)

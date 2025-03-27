@@ -115,7 +115,12 @@ class IPFSZarr3(zarr.abc.store.Store):
         return not self.hamt.read_only
 
     async def delete(self, key: str) -> None:
-        del self.hamt[key]
+        try:
+            del self.hamt[key]
+        # It's fine if the key was not in the HAMT
+        # Sometimes zarr v3 calls deletes on keys that don't exist (or have already been deleted) for some reason
+        except KeyError:
+            return
 
     @property
     def supports_listing(self) -> bool:
