@@ -1,6 +1,6 @@
 [project]
 name = "py-hamt"
-version = "2.4.0"
+version = "2.4.1"
 description = "HAMT implementation for an abstract backing store"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -10,7 +10,7 @@ dependencies = [
     "multiformats[full]>=0.3.1.post4",
     "pycryptodome>=3.21.0",
     "requests>=2.32.3",
-    "zarr",
+    "zarr>=3.0.6",
 ]
 
 [build-system]
@@ -28,6 +28,6 @@ dev = [
     "snakeviz>=2.2.0",
     "pandas>=2.2.3",
     "numpy>=2.1.3",
-    "xarray>=2025.1.2",
     "pytest-asyncio>=0.25.3",
+    "xarray>=2025.3.0",
 ]
