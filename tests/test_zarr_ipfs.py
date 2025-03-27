@@ -201,7 +201,8 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
 
     ds = xr.open_zarr(
         store=IPFSZarr3(
-            HAMT(store=IPFSStore(), root_node_id=hamt.root_node_id, read_only=True)
+            HAMT(store=IPFSStore(), root_node_id=ipfszarr3.hamt.root_node_id),
+            read_only=True
         )
     )
     print(ds)
