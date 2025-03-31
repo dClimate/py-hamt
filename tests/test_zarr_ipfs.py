@@ -187,13 +187,14 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
     encrypt, decrypt = create_zarr_encryption_transformers(
         encryption_key,
         header="sample-header".encode(),
-        exclude_vars=["lat", "lon", "time", "temp"],
+        exclude_vars=["temp"],
+        detect_exclude=test_ds,
     )
     hamt = HAMT(
         store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
     )
     ipfszarr3 = IPFSZarr3(hamt)
-    test_ds.to_zarr(store=ipfszarr3)  # type: ignore
+    test_ds.to_zarr(store=ipfszarr3, consolidated=True)  # type: ignore
 
     ipfs_ds = xr.open_zarr(store=ipfszarr3)
     xr.testing.assert_identical(ipfs_ds, test_ds)
@@ -201,9 +202,19 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
     # Now trying to load without a decryptor, xarray should be able to read the metadata and still perform operations on the unencrypted variable
     print("=== Attempting to read and print metadata of partially encrypted zarr")
 
+    bad_key = bytes([0xAA]) * 32
+    encrypt, decrypt = create_zarr_encryption_transformers(
+        bad_key,
+        "".encode(),
+    )
     ds = xr.open_zarr(
         store=IPFSZarr3(
-            HAMT(store=IPFSStore(), root_node_id=ipfszarr3.hamt.root_node_id),
+            HAMT(
+                store=IPFSStore(),
+                root_node_id=ipfszarr3.hamt.root_node_id,
+                transformer_encode=encrypt,
+                transformer_decode=decrypt,
+            ),
             read_only=True,
         )
     )

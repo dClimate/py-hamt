@@ -1,6 +1,9 @@
-from typing import Callable
+import json
+from typing import Callable, Literal
 from pathlib import Path
 
+import dag_cbor
+import xarray as xr
 from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
 
@@ -11,6 +14,7 @@ def create_zarr_encryption_transformers(
     encryption_key: bytes,
     header: bytes,
     exclude_vars: list[str] = [],
+    detect_exclude: xr.Dataset | Literal["auto-from-read"] | None = "auto-from-read",
 ) -> tuple[TransformerFN, TransformerFN]:
     """
     Uses XChaCha20_Poly1305 from the pycryptodome library to perform encryption, while ignoring zarr metadata files.
@@ -21,7 +25,9 @@ def create_zarr_encryption_transformers(
 
     zarr.json metadata files in a zarr v3 are always ignored, to allow for calculating an encrypted zarr's structure without having the encryption key.
 
-    With `exclude_vars` you may also set some variables to be unencrypted. This allows for partially encrypted zarrs which can be loaded into xarray but the values of encrypted variables cannot be accessed (errors will be thrown). You should generally include your coordinate variables along with your data variables in here.
+    With `exclude_vars` you may also set some variables to be unencrypted. This allows for partially encrypted zarrs which can be loaded into xarray, but the values of encrypted variables cannot be accessed (errors will be thrown). You should generally include your coordinate variables along with your data variables in here.
+
+    `detect_coordinates` allows you to put in either an xarray Dataset or a HAMT containing a zarr v3. These will be used to automatically find coordinate variables, and they will be added to the list of excluded variables automatically.
 
     # Example code
     ```python
@@ -49,19 +55,27 @@ def create_zarr_encryption_transformers(
         print("Couldn't read encrypted variable")
     ```
     """
-
     if len(encryption_key) != 32:
         raise ValueError("Encryption key is not 32 bytes")
+
+    exclude_var_set = set(exclude_vars)
+
+    if detect_exclude is None:
+        pass
+    elif isinstance(detect_exclude, xr.Dataset):
+        ds = detect_exclude
+        for coord in list(ds.coords):
+            exclude_var_set.add(coord)  # type: ignore
 
     def _should_transform(key: str) -> bool:
         p = Path(key)
 
         # Find the first directory name in the path since zarr v3 chunks are stored in a nested directory structure
         # e.g. for Path("precip/c/0/0/1") it would return "precip"
-        if p.parts[0] in exclude_vars:
+        if p.parts[0] in exclude_var_set:
             return False
 
-        # Don't transform metadata files
+        # Don't transform metadata files, even for encrypted variables
         if p.name == "zarr.json":
             return False
 
@@ -78,14 +92,49 @@ def create_zarr_encryption_transformers(
         # + concatenates two byte variables x,y so that it looks like xy
         return nonce + tag + ciphertext
 
+    seen_metadata: set[str] = set()
+
     def decrypt(key: str, val: bytes) -> bytes:
+        # Look through files, this relies on the fact that xarray itself will attempt to read the root zarr.json and other metadata files first before any data will ever be accessed
+        if (
+            detect_exclude == "auto-from-read"
+            and key[-9:] == "zarr.json"
+            and key not in seen_metadata
+        ):
+            seen_metadata.add(key)
+
+            # Assume the zarr.json is unencrypted, which it should be if made with zarr encryption transformers
+            metadata = json.loads(dag_cbor.decode(val))  # type: ignore
+
+            # If the global zarr.json, check if it has the list of coordinates in the consolidated metadata
+            if (
+                "consolidated_metadata" in metadata
+                and metadata["consolidated_metadata"] is not None
+            ):
+                variables = metadata["consolidated_metadata"]["metadata"]
+                for var in variables:
+                    for dimension in variables[var]["dimension_names"]:
+                        exclude_var_set.add(dimension)
+            # Otherwise just scan a variable's individual metadata, but first make sure it's not the root zarr.json
+            elif "dimension_names" in metadata:
+                for dimension in metadata["dimension_names"]:
+                    exclude_var_set.add(dimension)
+
         if not _should_transform(key):
             return val
 
         nonce, tag, ciphertext = val[:24], val[24:40], val[40:]
         cipher = ChaCha20_Poly1305.new(key=encryption_key, nonce=nonce)
         cipher.update(header)
-        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-        return plaintext
+        try:
+            plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+            return plaintext
+        except Exception as e:
+            # If if we are auto detecting coordinates, and there's an error with decrypting, then assume the issue is that this is a partially encrypted zarr, so we need to mark this variable as being one of the unencrypted ones and return like normal
+            if detect_exclude == "auto-from-read":
+                exclude_var_set.add(Path(key).parts[0])
+                return val
+            else:
+                raise e
 
     return (encrypt, decrypt)
