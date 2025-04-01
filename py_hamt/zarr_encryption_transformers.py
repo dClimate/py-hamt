@@ -30,7 +30,7 @@ def create_zarr_encryption_transformers(
 
     `detect_exclude` allows you to put in a xarray Dataset. This will be used to automatically add coordinate variables to the exclusion list. When you reading back a dataset and you do not know the unencrypted variables ahead of time, you can set this to the default "auto-from-read", which will attempt to use any metadata or any decryption errors to detect unencrypted variables.
 
-    To do no automatic detection, set `detect_exclude` to None.
+    To do no automatic detection, set `detect_exclude` to False.
 
     # Example code
     ```python
