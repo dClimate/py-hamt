@@ -1,6 +1,5 @@
 import json
 from typing import Callable, Literal
-from pathlib import Path
 
 import dag_cbor
 import xarray as xr
@@ -72,23 +71,22 @@ def create_zarr_encryption_transformers(
 
     exclude_var_set = set(exclude_vars)
 
-    if detect_exclude is None:
-        pass
-    elif isinstance(detect_exclude, xr.Dataset):
+    if isinstance(detect_exclude, xr.Dataset):
         ds = detect_exclude
         for coord in list(ds.coords):
             exclude_var_set.add(coord)  # type: ignore
 
     def _should_transform(key: str) -> bool:
-        p = Path(key)
-
         # Find the first directory name in the path since zarr v3 chunks are stored in a nested directory structure
-        # e.g. for Path("precip/c/0/0/1") it would return "precip"
-        if p.parts[0] in exclude_var_set:
-            return False
+        # e.g. for "precip/c/0/0/1" this would find "precip"
+        first_slash = key.find("/")
+        if first_slash != -1:
+            var_name = key[0:first_slash]
+            if var_name in exclude_var_set:
+                return False
 
         # Don't transform metadata files, even for encrypted variables
-        if p.name == "zarr.json":
+        if key[-9:] == "zarr.json":
             return False
 
         return True
@@ -108,6 +106,7 @@ def create_zarr_encryption_transformers(
 
     def decrypt(key: str, val: bytes) -> bytes:
         # Look through files, this relies on the fact that xarray itself will attempt to read the root zarr.json and other metadata files first before any data will ever be accessed
+        # Important that this goes before _should_transform since that will return before we get a chance to look at metadata, and it needs information that we can glean here
         if (
             detect_exclude == "auto-from-read"
             and key[-9:] == "zarr.json"
@@ -135,16 +134,19 @@ def create_zarr_encryption_transformers(
         if not _should_transform(key):
             return val
 
-        nonce, tag, ciphertext = val[:24], val[24:40], val[40:]
-        cipher = ChaCha20_Poly1305.new(key=encryption_key, nonce=nonce)
-        cipher.update(header)
         try:
+            nonce, tag, ciphertext = val[:24], val[24:40], val[40:]
+            cipher = ChaCha20_Poly1305.new(key=encryption_key, nonce=nonce)
+            cipher.update(header)
             plaintext = cipher.decrypt_and_verify(ciphertext, tag)
             return plaintext
         except Exception as e:
             # If if we are auto detecting coordinates, and there's an error with decrypting, then assume the issue is that this is a partially encrypted zarr, so we need to mark this variable as being one of the unencrypted ones and return like normal
             if detect_exclude == "auto-from-read":
-                exclude_var_set.add(Path(key).parts[0])
+                first_slash = key.find("/")
+                if first_slash != -1:
+                    var_name = key[0:first_slash]
+                    exclude_var_set.add(var_name)
                 return val
             else:
                 raise e
