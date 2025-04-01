@@ -14,30 +14,34 @@ def create_zarr_encryption_transformers(
     encryption_key: bytes,
     header: bytes,
     exclude_vars: list[str] = [],
-    detect_exclude: xr.Dataset | Literal["auto-from-read"] | None = "auto-from-read",
+    detect_exclude: xr.Dataset
+    | Literal["auto-from-read"]
+    | Literal[False] = "auto-from-read",
 ) -> tuple[TransformerFN, TransformerFN]:
     """
     Uses XChaCha20_Poly1305 from the pycryptodome library to perform encryption, while ignoring zarr metadata files.
 
     https://pycryptodome.readthedocs.io/en/latest/src/cipher/chacha20_poly1305.html
 
-    Note that the encryption key must always be 32 bytes long. A header is required by the underlying encryption algorithm. Every time a zarr chunk is encrypted, a random 24-byte nonce is generated. This is saved with the chunk for use when reading back.
+    Note that the encryption key must be exactly 32 bytes long. A header is required by the underlying encryption algorithm. Every time a zarr chunk is encrypted, a random 24-byte nonce is generated. This is saved with the chunk for use when reading back.
 
-    zarr.json metadata files in a zarr v3 are always ignored, to allow for calculating an encrypted zarr's structure without having the encryption key.
+    zarr.json metadata files in a zarr v3 are always ignored and passed through unencrypted.
 
-    With `exclude_vars` you may also set some variables to be unencrypted. This allows for partially encrypted zarrs which can be loaded into xarray, but the values of encrypted variables cannot be accessed (errors will be thrown). You should generally include your coordinate variables along with your data variables in here.
+    With `exclude_vars` you may also set some variables to be unencrypted. This allows for partially encrypted zarrs. This should generally include your coordinate variables, along with any data variables you want to keep open.
 
-    `detect_coordinates` allows you to put in either an xarray Dataset or a HAMT containing a zarr v3. These will be used to automatically find coordinate variables, and they will be added to the list of excluded variables automatically.
+    `detect_exclude` allows you to put in a xarray Dataset. This will be used to automatically add coordinate variables to the exclusion list. When you reading back a dataset and you do not know the unencrypted variables ahead of time, you can set this to the default "auto-from-read", which will attempt to use any metadata or any decryption errors to detect unencrypted variables.
+
+    To do no automatic detection, set `detect_exclude` to None.
 
     # Example code
     ```python
-    from py_hamt import HAMT, IPFSStore, IPFSZarr3
+    from py_hamt import HAMT, IPFSStore, IPFSZarr3, create_zarr_encryption_transformers
 
     ds = ... # example xarray Dataset with precip and temp data variables
     encryption_key = bytes(32) # change before using, only for demonstration purposes!
     header = "sample-header".encode()
     encrypt, decrypt = create_zarr_encryption_transformers(
-        encryption_key, header, exclude_vars=["temp"]
+        encryption_key, header, exclude_vars=["temp"], detect_exclude=ds
     )
     hamt = HAMT(
         store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
@@ -46,7 +50,15 @@ def create_zarr_encryption_transformers(
     ds.to_zarr(store=ipfszarr3, mode="w")
 
     print("Attempting to read and print metadata of partially encrypted zarr")
-    enc_ds = xr.open_zarr(store=ipfszarr3, read_only=True)
+    wrong_key = bytes([0xAA]) * 32
+    wrong_header = "".encode()
+    bad_encrypt, auto_detecting_decrypt = create_zarr_encryption_transformers(
+        wrong_key,
+        wrong_header,
+    )
+    hamt = HAMT(store=IPFSStore(), transformer_encode=bad_encrypt, transformer_decode=auto_detecting_decrypt, root_node_id=ipfszarr3.hamt.root_node_id)
+    ipfszarr3 = IPFSZarr3(hamt, read_only=True)
+    enc_ds = xr.open_zarr(store=ipfszarr3)
     print(enc_ds)
     assert enc_ds.temp.sum() == ds.temp.sum()
     try:
