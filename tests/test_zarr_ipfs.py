@@ -187,7 +187,8 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
     encrypt, decrypt = create_zarr_encryption_transformers(
         encryption_key,
         header="sample-header".encode(),
-        exclude_vars=["lat", "lon", "time", "temp"],
+        exclude_vars=["temp"],
+        detect_exclude=test_ds,
     )
     hamt = HAMT(
         store=IPFSStore(), transformer_encode=encrypt, transformer_decode=decrypt
@@ -195,15 +196,27 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
     ipfszarr3 = IPFSZarr3(hamt)
     test_ds.to_zarr(store=ipfszarr3)  # type: ignore
 
+    ipfszarr3 = IPFSZarr3(ipfszarr3.hamt, read_only=True)
     ipfs_ds = xr.open_zarr(store=ipfszarr3)
     xr.testing.assert_identical(ipfs_ds, test_ds)
 
     # Now trying to load without a decryptor, xarray should be able to read the metadata and still perform operations on the unencrypted variable
     print("=== Attempting to read and print metadata of partially encrypted zarr")
 
+    bad_key = bytes([0xAA]) * 32
+    bad_header = "".encode()
+    bad_encrypt, auto_detecting_decrypt = create_zarr_encryption_transformers(
+        bad_key,
+        bad_header,
+    )
     ds = xr.open_zarr(
         store=IPFSZarr3(
-            HAMT(store=IPFSStore(), root_node_id=ipfszarr3.hamt.root_node_id),
+            HAMT(
+                store=IPFSStore(),
+                root_node_id=ipfszarr3.hamt.root_node_id,
+                transformer_encode=bad_encrypt,
+                transformer_decode=auto_detecting_decrypt,
+            ),
             read_only=True,
         )
     )
@@ -212,6 +225,25 @@ def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
     # We should be unable to read precipitation values which are still encrypted
     with pytest.raises(Exception):
         ds.precip.sum()
+
+    # For code coverage's sake
+    # Don't auto detect, and thus encounter an error when trying to read back an unencrypted variable with the wrong encryption key and header
+    bad_encrypt, bad_decrypt = create_zarr_encryption_transformers(
+        bad_key, bad_header, detect_exclude=False
+    )
+    with pytest.raises(Exception):
+        ds = xr.open_zarr(
+            store=IPFSZarr3(
+                HAMT(
+                    store=IPFSStore(),
+                    root_node_id=ipfszarr3.hamt.root_node_id,
+                    transformer_encode=bad_encrypt,
+                    transformer_decode=bad_decrypt,
+                ),
+                read_only=True,
+            )
+        )
+        assert ds.temp.sum() == test_ds.temp.sum()
 
 
 # This test assumes the other zarr ipfs tests are working fine, so if other things are breaking check those first
