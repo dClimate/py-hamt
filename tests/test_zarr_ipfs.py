@@ -14,17 +14,13 @@ from py_hamt import HAMT, IPFSStore, IPFSZarr3, create_zarr_encryption_transform
 
 @pytest.fixture(scope="module")
 def random_zarr_dataset():
-    """Creates a random xarray Dataset and saves it to a temporary zarr store.
+    """Creates a random xarray Dataset.
 
     Returns:
         tuple: (dataset_path, expected_data)
             - dataset_path: Path to the zarr store
             - expected_data: The original xarray Dataset for comparison
     """
-    # Create temporary directory for zarr store
-    temp_dir = tempfile.mkdtemp()
-    zarr_path = os.path.join(temp_dir, "test.zarr")
-
     # Coordinates of the random data
     times = pd.date_range("2024-01-01", periods=100)
     lats = np.linspace(-90, 90, 18)
@@ -56,18 +52,13 @@ def random_zarr_dataset():
         attrs={"description": "Test dataset with random weather data"},
     )
 
-    ds.to_zarr(zarr_path, mode="w")
-
-    yield zarr_path, ds
-
-    # Cleanup
-    shutil.rmtree(temp_dir)
+    yield ds
 
 
 # This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
 @pytest.mark.asyncio
 async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
-    _, test_ds = random_zarr_dataset
+    test_ds = random_zarr_dataset
     print("=== Writing this xarray Dataset to a Zarr v3 on IPFS ===")
     print(test_ds)
 
@@ -177,7 +168,7 @@ async def test_write_read(random_zarr_dataset: tuple[str, xr.Dataset]):
 
 
 def test_encryption(random_zarr_dataset: tuple[str, xr.Dataset]):
-    _, test_ds = random_zarr_dataset
+    test_ds = random_zarr_dataset
 
     with pytest.raises(ValueError, match="Encryption key is not 32 bytes"):
         create_zarr_encryption_transformers(bytes(), bytes())
