@@ -60,6 +60,12 @@ def random_zarr_dataset():
     yield ds
 
 
+def find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("", 0))  # Bind to a free port provided by the host.
+        return int(s.getsockname()[1])  # Return the port number assigned.
+
+
 @pytest.fixture
 def create_ipfs():
     # Create temporary directory, set it as the IPFS Path
@@ -312,59 +318,47 @@ def test_encryption(create_ipfs, random_zarr_dataset: xr.Dataset):
         assert ds.temp.sum() == test_ds.temp.sum()
 
 
-def find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))  # Bind to a free port provided by the host.
-        return int(s.getsockname()[1])  # Return the port number assigned.
-
-
 # This test assumes the other zarr ipfs tests are working fine, so if other things are breaking check those first
-# def test_authenticated_gateway(create_authed_ipfs, random_zarr_dataset: tuple[str, xr.Dataset]):
-#     rpc_uri_stem, gateway_uri_stem = create_authed_ipfs
-#     _, test_ds = random_zarr_dataset
+def test_authenticated_gateway(
+    create_authed_ipfs, random_zarr_dataset: tuple[str, xr.Dataset]
+):
+    rpc_uri_stem, gateway_uri_stem = create_authed_ipfs
+    _, test_ds = random_zarr_dataset
 
-#     def write_and_check(store: IPFSStore) -> bool:
-#         store.rpc_uri_stem = rpc_uri_stem
-#         store.gateway_uri_stem = gateway_uri_stem
+    def write_and_check(store: IPFSStore) -> bool:
+        store.rpc_uri_stem = rpc_uri_stem
+        store.gateway_uri_stem = gateway_uri_stem
 
-#         check_result = False
-#         try:
-#             hamt = HAMT(store=store)
-#             ipfszarr3 = IPFSZarr3(hamt)
-#             test_ds.to_zarr(store=ipfszarr3, mode="w")  # type: ignore
-#             loaded_ds = xr.open_zarr(store=ipfszarr3)
-#             xr.testing.assert_identical(test_ds, loaded_ds)
-#             check_result = True
-#         except Exception as _:
-#             check_result = False
-#         finally:
-#             pass
-#             # Shut down the daemon
+        try:
+            hamt = HAMT(store=store)
+            ipfszarr3 = IPFSZarr3(hamt)
+            test_ds.to_zarr(store=ipfszarr3, mode="w")  # type: ignore
+            loaded_ds = xr.open_zarr(store=ipfszarr3)
+            xr.testing.assert_identical(test_ds, loaded_ds)
+            return True
+        except Exception as _:
+            return False
 
-#             # Cleanup by deleting the temporary directory for ipfs
+    # Test with API Key
+    api_key_store = IPFSStore(api_key="test")
+    assert write_and_check(api_key_store)
 
-#         return check_result
+    # Test that wrong API Key fails
+    bad_api_key_store = IPFSStore(api_key="badKey")
+    assert not write_and_check(bad_api_key_store)
 
-#     # Test with API Key
-#     api_key_store = IPFSStore(api_key="test")
-#     assert write_and_check(api_key_store)
+    # Test just bearer token
+    bearer_ipfs_store = IPFSStore(bearer_token="test")
+    assert write_and_check(bearer_ipfs_store)
 
-#     # Test that wrong API Key fails
-#     bad_api_key_store = IPFSStore(api_key="badKey")
-#     assert not write_and_check(bad_api_key_store)
+    # Test with wrong bearer
+    bad_bearer_store = IPFSStore(bearer_token="wrongBearer")
+    assert not write_and_check(bad_bearer_store)
 
-#     # Test just bearer token
-#     bearer_ipfs_store = IPFSStore(bearer_token="test")
-#     assert write_and_check(bearer_ipfs_store)
+    # Test with just basic auth
+    basic_auth_store = IPFSStore(basic_auth=("test", "test"))
+    assert write_and_check(basic_auth_store)
 
-#     # Test with wrong bearer
-#     bad_bearer_store = IPFSStore(bearer_token="wrongBearer")
-#     assert not write_and_check(bad_bearer_store)
-
-#     # Test with just basic auth
-#     basic_auth_store = IPFSStore(basic_auth=("test", "test"))
-#     assert write_and_check(basic_auth_store)
-
-#     # Test with wrong basic auth
-#     bad_basic_auth_store = IPFSStore(basic_auth=("wrong", "wrong"))
-#     assert not write_and_check(bad_basic_auth_store)
+    # Test with wrong basic auth
+    bad_basic_auth_store = IPFSStore(basic_auth=("wrong", "wrong"))
+    assert not write_and_check(bad_basic_auth_store)
