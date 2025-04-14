@@ -319,17 +319,12 @@ def test_encryption(create_ipfs, random_zarr_dataset: xr.Dataset):
 
 
 # This test assumes the other zarr ipfs tests are working fine, so if other things are breaking check those first
-def test_authenticated_gateway(
-    create_authed_ipfs, random_zarr_dataset: tuple[str, xr.Dataset]
-):
-    rpc_uri_stem, gateway_uri_stem = create_authed_ipfs
+def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
     _, test_ds = random_zarr_dataset
 
     def write_and_check(store: IPFSStore) -> bool:
-        store.rpc_uri_stem = rpc_uri_stem
-        store.gateway_uri_stem = gateway_uri_stem
-
         try:
+            store.rpc_uri_stem = "http://127.0.0.1:5002"  # 5002 is the port configured in the run-checks.yaml actions file for nginx to serve the proxy on
             hamt = HAMT(store=store)
             ipfszarr3 = IPFSZarr3(hamt)
             test_ds.to_zarr(store=ipfszarr3, mode="w")  # type: ignore
