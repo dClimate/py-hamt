@@ -319,8 +319,8 @@ def test_encryption(create_ipfs, random_zarr_dataset: xr.Dataset):
 
 
 # This test assumes the other zarr ipfs tests are working fine, so if other things are breaking check those first
-def test_authenticated_gateway(random_zarr_dataset: tuple[str, xr.Dataset]):
-    _, test_ds = random_zarr_dataset
+def test_authenticated_gateway(random_zarr_dataset: xr.Dataset):
+    test_ds = random_zarr_dataset
 
     def write_and_check(store: IPFSStore) -> bool:
         try:
