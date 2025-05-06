@@ -7,41 +7,13 @@ from dag_cbor import IPLDKind
 from multiformats import CID
 from hypothesis import given
 from hypothesis import strategies as st
-from hypothesis.strategies import SearchStrategy
 import pytest
 
 from py_hamt import HAMT, DictStore
 from py_hamt.hamt import Node
 from py_hamt.store import Store
 
-
-def cid_strategy() -> SearchStrategy:
-    """Generate random CIDs for testing."""
-
-    # Strategy for generating random hash digests
-    digests = st.binary(min_size=32, max_size=32).map(
-        lambda d: bytes.fromhex("1220") + d  # 0x12 = sha2-256, 0x20 = 32 bytes
-    )
-
-    # Generate CIDv1 (more flexible)
-    cidv1 = st.tuples(st.just("base32"), st.just(1), st.just("dag-cbor"), digests)
-
-    # Combine the strategies and create CIDs
-    return cidv1.map(lambda args: CID(*args))
-
-
-def ipld_strategy() -> SearchStrategy:
-    return st.one_of(
-        [
-            st.none(),
-            st.booleans(),
-            st.integers(min_value=-9223372036854775808, max_value=9223372036854775807),
-            st.floats(allow_infinity=False, allow_nan=False),
-            st.text(),
-            st.binary(),
-            cid_strategy(),
-        ]
-    )
+from .testing_utils import ipld_strategy
 
 
 key_value_lists = st.lists(
