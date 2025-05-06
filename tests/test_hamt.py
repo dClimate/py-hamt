@@ -13,18 +13,7 @@ from py_hamt import HAMT, DictStore
 from py_hamt.hamt import Node
 from py_hamt.store import Store
 
-from .testing_utils import ipld_strategy
-
-
-key_value_lists = st.lists(
-    st.tuples(st.text(), ipld_strategy()),
-    min_size=0,
-    max_size=10000,
-    unique_by=lambda x: x[
-        0
-    ],  # ensure unique keys, otherwise we can't do the length and size checks
-)
-
+from .testing_utils import key_value_list
 
 # Just enough to make it that reading back a hamt without the proper transformer will scramble things
 _x = "x".encode()
@@ -38,14 +27,10 @@ def transformer_decode_minimal(key: str, val: bytes) -> bytes:
     return val[1:]
 
 
-@given(key_value_lists)
+@given(key_value_list)
 def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     store = DictStore()
-    hamt = HAMT(
-        store=store,
-        transformer_encode=transformer_encode_minimal,
-        transformer_decode=transformer_decode_minimal,
-    )
+    hamt = HAMT(store=store)
     assert isinstance(hamt, MutableMapping)
 
     # The HAMT should be able to withstand its bucket size changing in between operations

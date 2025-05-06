@@ -42,6 +42,16 @@ def ipld_strategy() -> SearchStrategy:
     )
 
 
+key_value_list = st.lists(
+    st.tuples(st.text(), ipld_strategy()),
+    min_size=0,
+    max_size=10000,
+    unique_by=lambda x: x[
+        0
+    ],  # ensure unique keys, otherwise we can't do the length and size checks when using these KVs for the HAMT
+)
+
+
 def find_free_port() -> int:
     with socket.socket() as s:
         s.bind(("", 0))  # Bind to a free port provided by the host.
