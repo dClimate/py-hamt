@@ -9,6 +9,8 @@ from multiformats.multihash import Multihash
 
 import aiohttp
 
+type CodecInput = Literal["raw", "dag-cbor"]
+
 
 class Store(ABC):
     """Abstract class that represents a storage mechanism the HAMT can use for keeping data.
@@ -17,7 +19,7 @@ class Store(ABC):
     """
 
     @abstractmethod
-    async def save(self, data: bytes, codec: Literal["raw", "dag-cbor"]) -> IPLDKind:
+    async def save(self, data: bytes, codec: CodecInput) -> IPLDKind:
         """Take any set of bytes, save it to the storage mechanism, and reutrn an ID in the type of IPLDKind which can be used to retrieve those bytes later. This also includes extra information in `codec` on whether to mark this data as special linked data."""
         # TODO add bit about its important that dag-cbor is only called for an internal data structure node, and ONLY that type
 
@@ -39,7 +41,7 @@ class DictStore(Store):
         self.store = dict()
         self.hash_alg = multihash.get("blake3")
 
-    async def save(self, data: bytes, codec: Literal["raw", "dag-cbor"]) -> bytes:
+    async def save(self, data: bytes, codec: CodecInput) -> bytes:
         hash = self.hash_alg.digest(data, size=32)
         self.store[hash] = data
         return hash
@@ -94,7 +96,7 @@ class IPFSStore(Store):
         # self.total_received: None | int = 0 if debug else None
         # """Total bytes in responses from IPFS for blocks. Used for debugging purposes."""
 
-    async def save(self, data: bytes, codec: Literal["raw", "dag-cbor"]) -> CID:
+    async def save(self, data: bytes, codec: CodecInput) -> CID:
         if self.rpc_session is None:
             self.rpc_session = aiohttp.ClientSession(
                 base_url=IPFSStore.KUBO_DEFAULT_LOCAL_RPC_BASE_URL
@@ -114,10 +116,8 @@ class IPFSStore(Store):
 
             return cid
 
-    # Ignore the type error since CID is in the IPLDKind type
-    async def load(  # type: ignore
-        self,
-        id: CID,
+    async def load(  # type: ignore CID is definitely in the IPLDKind type
+        self, id: CID
     ) -> bytes:
         if self.gateway_session is None:
             self.gateway_session = aiohttp.ClientSession(
