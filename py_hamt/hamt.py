@@ -1,7 +1,11 @@
+from abc import ABC, abstractmethod
 from collections.abc import MutableMapping
 from sys import getsizeof
 from threading import Lock
-from typing import Callable
+from typing import Callable, Iterator, AsyncIterator
+import uuid
+from random import shuffle
+import asyncio
 
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
@@ -39,35 +43,6 @@ def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
     return result
 
 
-# Used for readability, since a HAMT also stores IPLDKind objects
-# Store IDs are also IPLDKind, which makes the code harder to read if only using IPLDKind rather than this type alias
-type Link = IPLDKind
-type StoreID = IPLDKind
-
-
-class Node:
-    def __init__(self):
-        self.data: list[IPLDKind] = [dict() for _ in range(0, 256)]
-
-    def serialize(self) -> bytes:
-        return dag_cbor.encode(self.data)
-
-    @classmethod
-    def deserialize(cls, data: bytes) -> "Node":
-        try:
-            decoded_data = dag_cbor.decode(data)
-        except:  # noqa: E722
-            raise Exception(
-                "Invalid dag-cbor encoded data from the store was attempted to be decoded"
-            )
-        if (isinstance(decoded_data, list) and len(decoded_data) == 256):
-            node = cls()
-            node.data = decoded_data
-            return node
-        else:
-            raise ValueError("Data does not contain a valid Node")
-
-
 b3 = multihash.get("blake3")
 
 
@@ -85,6 +60,213 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
     return raw_bytes
 
 
+# Used for readability, since a HAMT also stores IPLDKind objects
+# Store IDs are also IPLDKind, which makes the code harder to read if only using IPLDKind rather than this type alias
+type Link = IPLDKind
+type StoreID = IPLDKind
+
+
+class Node:
+    def __init__(self):
+        self.data: list[IPLDKind] = [dict() for _ in range(0, 256)]
+        # empty dicts represent empty buckets, lists with one element are links, with the internal element being a link
+
+    def iter_buckets(self) -> Iterator[int]:
+        """Return the list indices where there are buckets, empty or not."""
+        for i in range(len(self.data)):
+            if isinstance(self.data[i], dict):
+                yield i
+
+    def iter_links(self) -> Iterator[int]:
+        """Return the list indices where there are links."""
+        for i in range(len(self.data)):
+            if isinstance(self.data[i], list):
+                yield i
+
+    def get_link(self, index: int) -> IPLDKind:
+        link_wrapper: list[IPLDKind] = self.data[index]  # type: ignore
+        return link_wrapper[0]
+
+    def set_link(self, index: int, link: IPLDKind):
+        wrapped = [link]
+        self.data[index] = wrapped
+
+    def serialize(self) -> bytes:
+        return dag_cbor.encode(self.data)
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> "Node":
+        try:
+            decoded_data = dag_cbor.decode(data)
+        except:  # noqa: E722
+            raise Exception(
+                "Invalid dag-cbor encoded data from the store was attempted to be decoded"
+            )
+        if isinstance(decoded_data, list) and len(decoded_data) == 256:
+            node = cls()
+            node.data = decoded_data
+            return node
+        else:
+            raise ValueError("Data does not contain a valid Node")
+
+
+# For HAMT internal use for increaing performance with nodes
+class VirtualStore(ABC):
+    @abstractmethod
+    async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
+        pass
+
+    @abstractmethod
+    async def load(self, id: IPLDKind) -> Node:
+        pass
+
+
+class ReadCacheStore(VirtualStore):
+    def __init__(self, hamt: "HAMT"):
+        self.cache: dict[IPLDKind, Node] = dict()
+        self.hamt = hamt
+
+    def cache_eviction_lru(self):
+        while getsizeof(self.cache) > self.hamt.read_cache_limit:
+            if len(self.cache) == 0:
+                return
+            stalest_node_id = next(iter(self.cache.keys()))
+            del self.cache[stalest_node_id]
+
+    async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
+        raise Exception(
+            "Save called in virtual store ReadCacheStore, only supposed to be used for reading"
+        )
+
+    async def load(self, id: IPLDKind) -> Node:
+        # Cache Hit
+        if id in self.cache:
+            # Reinsert to put this key as the most recently used and last in the dict insertion order
+            node = self.cache[id]
+            del self.cache[id]
+            self.cache[id] = node
+
+            return node
+
+        # Cache Miss
+        node = Node.deserialize(await self.hamt.store.load(id))
+        self.cache[id] = node
+        self.cache_eviction_lru()
+        return node
+
+
+class InMemoryTreeStore(VirtualStore):
+    def __init__(self, hamt: "HAMT"):
+        self.hamt = hamt
+
+        # The Store ID returned by the InMemoryTree to mark objects as being in memory looks like list[inmemory_marker, virtual store uuid int ID for that node, original Store ID]
+        self.inmemory_marker = uuid.uuid4().int
+        # This buffer goes from the node's virtual store uuid to a Node object, which we can return references to for mutating within the HAMT
+        self.buffer: dict[IPLDKind, Node] = dict()
+
+    def is_buffer_id(self, id: IPLDKind) -> bool:
+        return isinstance(id, list) and len(id) == 3 and id[0] == self.inmemory_marker
+
+    def children_in_memory(self, node: Node) -> Iterator[IPLDKind]:
+        for index in range(len(node.data)):
+            item = node.data[index]
+            if self.is_buffer_id(item):
+                yield item
+
+    def has_children_in_memory(self, node: Node) -> bool:
+        for _ in self.children_in_memory(node):
+            return True
+        return False
+
+    def needs_flushing(self) -> bool:
+        return getsizeof(self.buffer) > self.hamt.inmemory_tree_limit
+
+    async def flush_buffer(self, flush_everything: bool = False):
+        if (not self.needs_flushing()) and (not flush_everything):
+            return
+
+        # Start with the root node's children, which should always be in the in memory buffer if there's anything there
+        # there is an implicit assumption that the entire continuous line of branches up to an ancestor in the memory buffer, which will happen because of the DFS style traversal in all HAMT operations
+        # node stack is a list of tuples that look like (parent_id, self_id, node)
+        node_stack: list[tuple[IPLDKind, IPLDKind, Node]] = []
+        root_node: Node = self.buffer[self.hamt.root_node_id]
+        for child_buffer_id in self.children_in_memory(root_node):
+            node = self.buffer[child_buffer_id]
+            node_stack.append((self.hamt.root_node_id, child_buffer_id, node))
+
+        shuffle(node_stack)  # so that we don't always recurse down the rightmost branch
+
+        while len(node_stack) > 0 and (self.needs_flushing() or flush_everything):
+            top_parent_buffer_id, top_buffer_id, top_node = node_stack[-1]
+            new_nodes_on_stack = []
+            if self.has_children_in_memory(top_node):
+                for child_buffer_id in self.children_in_memory(top_node):
+                    node = self.buffer[child_buffer_id]
+                    new_nodes_on_stack.append((top_buffer_id, child_buffer_id, node))
+
+                shuffle(
+                    new_nodes_on_stack
+                )  # avoid always recursing down the rightmost branch first
+                node_stack.extend(new_nodes_on_stack)
+            else:
+                # We can flush this one completely, we'll just have to reserialize its parents up to the root node
+                old_id = top_buffer_id
+                new_id = await self.hamt.store.save(
+                    top_node.serialize(), codec="dag-cbor"
+                )
+                parent_node = self.buffer[top_parent_buffer_id]
+                for i in range(len(parent_node.data)):
+                    item = parent_node.data[i]
+                    if self.is_buffer_id(item) and item == old_id:
+                        parent_node.set_link(i, new_id)
+                        break
+
+                del self.buffer[top_buffer_id]  # type: ignore
+                node_stack.pop()
+
+        # Only flush the root node if our size limits are still too big, or we've been instructed to remove everything. Always keeping the root node is important for performance
+        if self.needs_flushing() or flush_everything:
+            del self.buffer[self.root_node_id]
+            self.root_node_id = await self.hamt.store.save(
+                root_node.serialize(), codec="dag-cbor"
+            )
+
+        if flush_everything:
+            assert len(self.buffer) == 0
+        if self.needs_flushing():
+            raise Exception(
+                "Could not flush in memory tree buffer enough to reach limit, consider raising limit to accomodate for python empty object overheads"
+            )
+
+    async def add_to_buffer(self, original_id: IPLDKind, node: Node) -> list:
+        # This is IPLDKind type, but not dag_cbor serializable due to int limits so this will throw errors early if the tree is written with the buffer_ids still in there
+        node_uuid = uuid.uuid4().int
+        buffer_id = [self.inmemory_marker, node_uuid, original_id]
+        # Returns the virtual store ID that was generated for this node
+        self.buffer[buffer_id] = node
+
+        return buffer_id
+
+    async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
+        if self.is_buffer_id(original_id):
+            return original_id
+
+        # This node was not in the buffer, don't save it to the backing store but rather add to it to the in memory buffer
+        buffer_id = await self.add_to_buffer(original_id, node)
+        return buffer_id
+
+    async def load(self, id: IPLDKind) -> Node:
+        # Hit for something already in the in memory tree
+        if self.is_buffer_id(id):
+            node: Node = self.buffer[id]  # type: ignore
+            return node
+
+        # Miss, something that isn't in the in memory tree, add it
+        node = Node.deserialize(await self.hamt.store.load(id))
+        await self.add_to_buffer(id, node)
+        return node
+
+
 class HAMT(MutableMapping):
     """
     This HAMT presents a key value interface, like a python dictionary. The only limits are that keys can only be strings, and values can only be types amenable with [IPLDKind](https://dag-cbor.readthedocs.io/en/stable/api/dag_cbor.ipld.html#dag_cbor.ipld.IPLDKind). IPLDKind is a fairly flexible data model, but do note that integers are must be within the bounds of a signed 64-bit integer.
@@ -96,11 +278,6 @@ class HAMT(MutableMapping):
     Since modifying a HAMT changes all parts of the tree, due to reserializing and saving to the backing store, modificiations are not thread safe. Thus, we offer a read-only mode which allows for parallel accesses, or a thread safe write enabled mode. You can see what type it is from the `read_only` variable. HAMTs default to write enabled mode on creation. Calling mutating operations in read only mode will raise Exceptions.
 
     In write enabled mode, all operations block and wait, so multiple threads can write to the HAMT but the operations will in reality happen one after the other.
-
-    # transformer_encode, transformer_decode
-    `transformer_encode` and `transformer_decode` are functions that are called right before sending raw data to the store, after being encoded with dag_cbor. They get access to the key that the value originally corresponded to.
-
-    HAMT also sometimes sends its internal data structure objects to the store, those will not pass through these functions.
 
     # dunder method documentation
     These are not generated by pdoc automatically so we are including their documentation here.
@@ -122,9 +299,11 @@ class HAMT(MutableMapping):
 
     store: Store
     """@private"""
+
     # Every call of this will look like self.hash_fn() and so the first argument will always take a self argument
     hash_fn: Callable[[bytes], bytes]
     """@private"""
+
     # Only important for writing, when reading this will use buckets even if they are overly big
     max_bucket_size: int
     """@private"""
@@ -132,6 +311,8 @@ class HAMT(MutableMapping):
     # Don't use the type alias here since this is exposed in the documentation
     root_node_id: IPLDKind
     """DO NOT modify this directly.
+
+    TODO write about how you do need to read it at times, and it should only be read when the buffer has been flushed to the backing store
 
     This is the ID that the store returns for the root node of the HAMT. This is exposed since it is sometimes useful to reconstruct other HAMTs later if using a persistent store.
 
@@ -144,127 +325,104 @@ class HAMT(MutableMapping):
     For use in multithreading
     """
 
-    read_only: bool
-    """
-    DO NOT modify this directly. This is here for you to read and check.
+    async def write_raw(self, data: IPLDKind) -> IPLDKind:
+        return await self.store.save(dag_cbor.encode(data), codec="raw")
 
-    You can modify the read status of a HAMT through the `make_read_only` or `enable_write` functions, so that the HAMT will block on making a change until all mutating operations are done.
-    """
+    async def read_raw(self, id: IPLDKind) -> IPLDKind:
+        return dag_cbor.decode(await self.store.load(id))
 
-    transformer_encode: None | Callable[[str, bytes], bytes]
-    """This function is called to transform the raw bytes of a value after it is encoded with dag_cbor but before it gets sent to the Store."""
-    transformer_decode: None | Callable[[str, bytes], bytes]
-    """This function is called to transform the raw bytes of a value after it is retrieved from the store but before decoding with dag_cbor to python IPLDKind type objects."""
+    async def read_node(self, id: IPLDKind) -> Node:
+        # TODO handle having a cache as well, with cache limits
+        if self.inmemory_buffer is not None and id in self.inmemory_buffer:
+            return self.inmemory_buffer[id]
 
-    cache: dict[StoreID, Node]
-    """@private"""
-    max_cache_size_bytes: int
-    """The maximum size of the internal cache of nodes. We expect that some Stores will be high latency, so it is useful to cache parts of the datastructure.
-
-    Set to 0 if you want no cache at all."""
-
-    # We rely on python 3.7+'s dicts which keep insertion order of elements to do a basic LRU
-    def cache_eviction_lru(self):
-        while getsizeof(self.cache) > self.max_cache_size_bytes:
-            if len(self.cache) == 0:
-                return
-            stalest_node_id = next(iter(self.cache.keys()))
-            del self.cache[stalest_node_id]
-
-    def write_node(self, node: Node) -> IPLDKind:
-        """@private"""
-        node_id = self.store.save_dag_cbor(node.serialize())
-        self.cache[node_id] = node
-        self.cache_eviction_lru()
-        return node_id
-
-    def read_node(self, node_id: IPLDKind) -> Node:
-        """@private"""
-        node: Node
-        # cache hit
-        if node_id in self.cache:
-            node = self.cache[node_id]
-            # Reinsert to put this key as the most recently used and last in the dict insertion order
-            del self.cache[node_id]
-            self.cache[node_id] = node
-            # cache miss
-        else:
-            node = Node.deserialize(self.store.load(node_id))
-            self.cache[node_id] = node
-            self.cache_eviction_lru()
-
+        node = Node.deserialize(await self.store.load(id))
+        await self.add_to_buffer(id, node)
         return node
+
+    async def write_node(self, old_id: IPLDKind, node: Node) -> IPLDKind:
+        if self.inmemory_buffer is not None and old_id in self.inmemory_buffer:
+            # Nodes hold a mutable pointer to their data, so we shouldn't even need to set the inmemory buffer to this new node
+            return old_id
+
+        new_id = await self.store.save(node.serialize(), codec="dag-cbor")
+        await self.add_to_buffer(new_id, node)
+        return new_id
+
+    inmemory_buffer: dict[IPLDKind, Node] | None
 
     def __init__(
         self,
         store: Store,
         hash_fn: Callable[[bytes], bytes] = blake3_hashfn,
-        read_only: bool = False,
         root_node_id: IPLDKind = None,
-        max_cache_size_bytes=10_000_000,  # default to 10 megabytes
-        transformer_encode: None | Callable[[str, bytes], bytes] = None,
-        transformer_decode: None | Callable[[str, bytes], bytes] = None,
+        read_only: bool = False,
+        max_bucket_size: int = 67,
+        inmemory_tree_limit: int = 10_000_000,  # 10 MB default
+        read_cache_limit: int = 10_000_000,  # 10 MB default
     ):
         self.store = store
         self.hash_fn = hash_fn
-
-        self.cache = {}
-        self.max_cache_size_bytes = max_cache_size_bytes
-
-        self.max_bucket_size = 4
-        self.read_only = read_only
         self.lock = Lock()
+        self.read_only = read_only
 
-        self.transformer_encode = transformer_encode
-        self.transformer_decode = transformer_decode
+        if max_bucket_size < 1:
+            raise ValueError("Bucket size maximum must be a positive integer")
+        self.max_bucket_size = max_bucket_size
+
+        # TODO add documentation about buffer limit and cache limit minimums being 10 KB, to avoid strange boundary cases in the algorithms due to python object overhead meaning that an in memory buffer should just never be used
+        # Add documentation about how its values should not be positive, otherwise the HAMT will not work
+        # Specify a minimum size of a couple hundred bytes, since just an empty dict will consume some memory
+
+        if read_cache_limit < 10_000:
+            raise ValueError("Cache limit too small, less than 10 KB")
+        if inmemory_tree_limit < 10_000:
+            raise ValueError("In memory tree limit too small, less than 10 KB")
+
+        self.inmemory_tree_limit = inmemory_tree_limit
+        self.read_cache_limit = read_cache_limit
+
+        # Create an empty in memory tree or read cache store
+        self.virtual_store: VirtualStore
+        if read_only:
+            self.virtual_store = ReadCacheStore(self)
+        else:
+            self.virtual_store = InMemoryTreeStore(self)
 
         if root_node_id is None:
-            root_node = Node()
-            self.root_node_id = self.write_node(root_node)
+            self.root_node_id = asyncio.run(self.write_node(None, Node()))
         else:
             self.root_node_id = root_node_id
-            # Make sure the cache has our root node
-            self.read_node(self.root_node_id)
-
-    # dunder for the python deepcopy module
-    def __deepcopy__(self, memo) -> "HAMT":
-        if not self.read_only:
-            self.lock.acquire(blocking=True)
-
-        copy_hamt = HAMT(
-            store=self.store,
-            hash_fn=self.hash_fn,
-            read_only=self.read_only,
-            root_node_id=self.root_node_id,
-            transformer_encode=self.transformer_encode,
-            transformer_decode=self.transformer_decode,
-        )
-
-        if not self.read_only:
-            self.lock.release()
-
-        return copy_hamt
 
     def make_read_only(self):
-        """Disables all mutation of this HAMT. When enabled, the HAMT will throw errors if set or delete are called. When a HAMT is only in read only mode, it allows for safe multithreaded reads, increasing performance."""
         self.lock.acquire(blocking=True)
         self.read_only = True
+        asyncio.run(self.flush_buffer(flush_everything=True))
+        self.inmemory_buffer = None
+        self.cache = dict()
         self.lock.release()
 
     def enable_write(self):
         self.lock.acquire(blocking=True)
         self.read_only = False
+        self.inmemory_buffer = dict()
+        self.cache = None
         self.lock.release()
 
-    def _reserialize_and_link(self, node_stack: list[tuple[Link, Node]]):
+    async def _reserialize_and_link(self, node_stack: list[tuple[Link, Node]]):
+        # TODO this, or the set_pointer and delitem functions must manage best when to flush the in memory tree, since that requires that traveling down the branch to an arbitrary node within the buffer is contiguous
         """
-        For internal use
         This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
         Takes a stack of nodes, we represent a stack with a list where the first element is the root element and the last element is the top of the stack
         Each element in the list is a tuple where the first element is the ID from the store and the second element is the Node in python
         If a node ends up being empty, then it is deleted entirely, unless it is the root node
         Modifies in place
         """
+        # if we have just the root node, then don't operate at all and serialize it all the way
+        if len(node_stack) == 1:
+            self.cache[self.root_node_id] = node_stack[0][1]
+            return
+
         # Iterate in the reverse direction, imitating going deeper into a stack
         for stack_index in range(len(node_stack) - 1, -1, -1):
             old_store_id, node = node_stack[stack_index]
@@ -293,19 +451,21 @@ class HAMT(MutableMapping):
                     prev_node._replace_link(old_store_id, new_store_id)
 
     def __setitem__(self, key_to_insert: str, val_to_insert: IPLDKind):
+        asyncio.run(self.setitem(key_to_insert, val_to_insert))
+
+    async def setitem(self, key_to_insert: str, val_to_insert: IPLDKind):
+        val_ptr = await self.write_raw(val_to_insert)
+        await self.set_pointer(key_to_insert, val_ptr)
+
+    async def set_pointer(self, key_to_insert: str, val_ptr: IPLDKind):
         if self.read_only:
             raise Exception("Cannot call set on a read only HAMT")
 
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
-        val = dag_cbor.encode(val_to_insert)
-        if self.transformer_encode is not None:
-            val = self.transformer_encode(key_to_insert, val)
-        val_ptr = self.store.save_raw(val)
-
-        node_stack: list[tuple[Link, Node]] = []
-        root_node = self.read_node(self.root_node_id)
+        node_stack: list[tuple[IPLDKind, Node]] = []
+        root_node = await self.read_node(self.root_node_id)
         node_stack.append((self.root_node_id, root_node))
 
         # FIFO queue to keep track of all the KVs we need to insert
@@ -313,83 +473,51 @@ class HAMT(MutableMapping):
         kvs_queue: list[tuple[str, IPLDKind]] = []
         kvs_queue.append((key_to_insert, val_ptr))
 
-        created_change = False
-        # Keep iterating until we have no more KVs to insert
-        while len(kvs_queue) != 0:
+        while len(kvs_queue) > 0:
             _, top_node = node_stack[-1]
-            curr_key, curr_val = kvs_queue[0]
+            curr_key, curr_val_ptr = kvs_queue[0]
 
             raw_hash = self.hash_fn(curr_key.encode())
-            map_key = str(extract_bits(raw_hash, len(node_stack) - 1, 8))
+            map_key = extract_bits(raw_hash, len(node_stack) - 1, 8)
 
-            buckets = top_node.get_buckets()
-            links = top_node.get_links()
-
-            if map_key in links and map_key in buckets:
-                self.lock.release()
-                raise Exception(
-                    "Key in both buckets and links of the node, invariant violated"
-                )
-            elif map_key in links:
-                next_node_id = links[map_key]
-                next_node = self.read_node(next_node_id)
+            item = top_node.data[map_key]
+            if isinstance(item, list):
+                next_node_id = item[0]
+                next_node = await self.read_node(next_node_id)
                 node_stack.append((next_node_id, next_node))
-            elif map_key in buckets:
-                bucket = buckets[map_key]
-                created_change = True
+            if isinstance(item, dict):
+                bucket: dict[str, IPLDKind] = item
 
-                # If this bucket already has this same key, just rewrite the value
-                # Since we can't use continues to go back to the top of the while loop, use this boolean flag instead
-                should_continue_at_while = False
-                for kv in bucket:
-                    if curr_key in kv:
-                        kv[curr_key] = curr_val
-                        kvs_queue.pop(0)
-                        should_continue_at_while = True
-                        break
-                if should_continue_at_while:
+                # If this bucket already has this same key, or has space, just rewrite the value and work on the others in the queue
+                if curr_key in bucket or len(bucket) < self.max_bucket_size:
+                    bucket[curr_key] = curr_val_ptr
+                    kvs_queue.pop(0)
                     continue
 
-                bucket_has_space = len(bucket) < self.max_bucket_size
-                if bucket_has_space:
-                    bucket.append({curr_key: curr_val})
-                    kvs_queue.pop(0)
-                # If bucket is full and we need to add, then all these KVs need to be taken out of this bucket and reinserted throughout the tree
-                else:
-                    # Empty the bucket of KVs into the queue
-                    for kv in bucket:
-                        for k, v in kv.items():
-                            kvs_queue.append((k, v))
+                # The current key is not in the bucket and the bucket is too full, so empty KVs from the bucket and restart insertion
+                for k, v_ptr in bucket:
+                    kvs_queue.append((k, v_ptr))
 
-                    # Delete empty bucket, there should only be a link now
-                    del buckets[map_key]
+                # Create a new link to a new node so that we can reflow these KVs into nodes
+                new_node = Node()
+                new_node_id = await self.write_node(None, new_node)
 
-                    # Create a new link to a new node so that we can reflow these KVs into new buckets
-                    new_node = Node()
-                    new_node_id = self.write_node(new_node)
-
-                    links[map_key] = new_node_id
-
-                    # We need to rerun from the top with the new queue, but this time this node will have a link to put KVs deeper down in the tree
-                    node_stack.append((new_node_id, new_node))
-            else:
-                # If there is no link and no bucket, then we can create a new bucket, insert, and be done with this key
-                bucket: list[dict[str, IPLDKind]] = []
-                bucket.append({curr_key: curr_val})
-                kvs_queue.pop(0)
-                buckets[map_key] = bucket
-                created_change = True
+                link = [new_node_id]
+                top_node.data[map_key] = link
 
         # Finally, reserialize and fix all links, deleting empty nodes as needed
-        if created_change:
-            self._reserialize_and_link(node_stack)
-            node_stack_top_id = node_stack[0][0]
-            self.root_node_id = node_stack_top_id
+        await self._reserialize_and_link(node_stack)
+        node_stack_top_id = node_stack[0][0]
+        self.root_node_id = node_stack_top_id
 
         if not self.read_only:
             self.lock.release()
 
     def __delitem__(self, key: str):
+        asyncio.run(self.delitem(key))
+
+    async def delitem(self, key: str):
+        """Also deletes the pointer at the same time."""
         if self.read_only:
             raise Exception("Cannot call delete on a read only HAMT")
 
@@ -398,54 +526,31 @@ class HAMT(MutableMapping):
 
         raw_hash = self.hash_fn(key.encode())
 
-        node_stack: list[tuple[Link, Node]] = []
-        root_node = self.read_node(self.root_node_id)
+        node_stack: list[tuple[IPLDKind, Node]] = []
+        root_node = await self.read_node(self.root_node_id)
         node_stack.append((self.root_node_id, root_node))
 
         created_change = False
         while True:
-            top_id, top_node = node_stack[-1]
-            map_key = str(extract_bits(raw_hash, len(node_stack) - 1, 8))
+            _, top_node = node_stack[-1]
+            map_key = extract_bits(raw_hash, len(node_stack) - 1, 8)
 
-            buckets = top_node.get_buckets()
-            links = top_node.get_links()
+            item = top_node.data[map_key]
 
-            if map_key in buckets and map_key in links:
-                self.lock.release()
-                raise Exception(
-                    "Key in both buckets and links of the node, invariant violated"
-                )
-            elif map_key in buckets:
-                bucket = buckets[map_key]
-
-                # Delete from within this bucket
-                for bucket_index in range(len(bucket)):
-                    kv = bucket[bucket_index]
-                    if key in kv:
-                        created_change = True
-                        bucket.pop(bucket_index)
-
-                        # If this bucket becomes empty then delete this dict entry for the bucket
-                        if len(bucket) == 0:
-                            del buckets[map_key]
-
-                        # This must be done to avoid IndexErrors after continuing to iterate since the length of the bucket has now changed
-                        break
-
+            if isinstance(item, dict):
+                bucket = item
+                if key in bucket:
+                    del bucket[key]
+                    created_change = True
                 break
-            elif map_key in links:
-                link = links[map_key]
-                next_node = self.read_node(link)
+            if isinstance(item, list):
+                link = item[0]
+                next_node = await self.read_node(link)
                 node_stack.append((link, next_node))
-                continue
-
-            else:
-                # This key is not even in the HAMT so just exit
-                break
 
         # Finally, reserialize and fix all links, deleting empty nodes as needed
         if created_change:
-            self._reserialize_and_link(node_stack)
+            await self._reserialize_and_link(node_stack)
             node_stack_top_id = node_stack[0][0]
             self.root_node_id = node_stack_top_id
 
@@ -456,37 +561,41 @@ class HAMT(MutableMapping):
             raise KeyError
 
     def __getitem__(self, key: str) -> IPLDKind:
+        return asyncio.run(self.getitem(key))
+
+    async def getitem(self, key: str) -> IPLDKind:
+        pointer: IPLDKind = await self.get_pointer(key)
+        return await self.read_raw(pointer)
+
+    async def get_pointer(self, key: str) -> IPLDKind:
         if not self.read_only:
             self.lock.acquire(blocking=True)
 
         raw_hash = self.hash_fn(key.encode())
 
-        node_id_stack: list[Link] = []
-        node_id_stack.append(self.root_node_id)
+        current_id = self.root_node_id
+        current_depth = 0
 
-        # Don't check if result is none but use a boolean to indicate finding something, this is because None is a possible value the HAMT can store
+        # Don't check if result is none but use a boolean to indicate finding something, this is because None is a possible value of IPLDKind
         result_ptr: IPLDKind = None
         found_a_result: bool = False
         while True:
-            top_id = node_id_stack[-1]
-            top_node = self.read_node(top_id)
-            map_key = str(extract_bits(raw_hash, len(node_id_stack) - 1, 8))
+            top_id = current_id
+            top_node = await self.read_node(top_id)
+            map_key = extract_bits(raw_hash, current_depth, 8)
 
-            # Check if this node is in one of the buckets
-            buckets = top_node.get_buckets()
-            if map_key in buckets:
-                bucket = buckets[map_key]
-                for kv in bucket:
-                    if key in kv:
-                        result_ptr = kv[key]
-                        found_a_result = True
-                        break
-
-            # If it isn't in one of the buckets, check if there's a link to another serialized node id
-            links = top_node.get_links()
-            if map_key in links:
-                link_id = links[map_key]
-                node_id_stack.append(link_id)
+            # Check if this key is in one of the buckets
+            item = top_node.data[map_key]
+            if isinstance(item, dict):
+                bucket = item
+                if key in bucket:
+                    result_ptr = bucket[key]
+                    found_a_result = True
+                    break
+            if isinstance(item, list):
+                link = item[0]
+                current_id = link
+                current_depth += 1
                 continue
             # Nowhere left to go, stop walking down the tree
             else:
@@ -498,17 +607,30 @@ class HAMT(MutableMapping):
         if not found_a_result:
             raise KeyError
 
-        result_bytes = self.store.load(result_ptr)
-        if self.transformer_decode is not None:
-            result_bytes = self.transformer_decode(key, result_bytes)
-        return dag_cbor.decode(result_bytes)
+        return result_ptr
 
-    def __len__(self) -> int:
-        key_count = 0
-        for _ in self:
-            key_count += 1
+    async def _iter_nodes(self) -> AsyncIterator[tuple[IPLDKind, Node]]:
+        if not self.read_only:
+            self.lock.acquire(blocking=True)
 
-        return key_count
+        node_id_stack = []
+        node_id_stack.append(self.root_node_id)
+
+        while True:
+            if len(node_id_stack) == 0:
+                break
+
+            top_id = node_id_stack.pop()
+            node = await self.read_node(top_id)
+            yield (top_id, node)
+
+            # Traverse down list of links
+            for link_index in node.iter_links():
+                link = node.get_link(link_index)
+                node_id_stack.append(link)
+
+        if not self.read_only:
+            self.lock.release()
 
     def __iter__(self):
         if not self.read_only:
@@ -517,51 +639,45 @@ class HAMT(MutableMapping):
         node_id_stack = []
         node_id_stack.append(self.root_node_id)
 
-        if not self.read_only:
-            self.lock.release()
-
         while True:
             if len(node_id_stack) == 0:
                 break
 
             top_id = node_id_stack.pop()
-            node = self.read_node(top_id)
+            node = asyncio.run(self.read_node(top_id))
 
-            # Collect all keys from all buckets
-            buckets = node.get_buckets()
-            for bucket in buckets.values():
-                for kv in bucket:
-                    for k in kv:
-                        yield k
-
-            # Traverse down list of links
-            links = node.get_links()
-            for link in links.values():
-                node_id_stack.append(link)
-
-    def ids(self):
-        """Generator of all IDs the backing store uses"""
-        if not self.read_only:
-            self.lock.acquire(blocking=True)
-
-        node_id_stack: list[Link] = []
-        node_id_stack.append(self.root_node_id)
+            for item_index in range(len(node.data)):
+                item = node.data[item_index]
+                if isinstance(item, dict):
+                    bucket = item
+                    for key in bucket:
+                        yield key
+                elif isinstance(item, list):
+                    link = item[0]
+                    node_id_stack.append(link)
 
         if not self.read_only:
             self.lock.release()
 
-        while len(node_id_stack) > 0:
-            top_id = node_id_stack.pop()
-            yield top_id
-            top_node = self.read_node(top_id)
+    async def aiter_keys(self) -> AsyncIterator[str]:
+        async for _, node in self._iter_nodes():
+            for item_index in range(len(node.data)):
+                item = node.data[item_index]
+                if isinstance(item, dict):
+                    bucket = item
+                    for key in bucket:
+                        yield key
 
-            buckets = top_node.get_buckets()
-            for bucket in buckets.values():
-                for kv in bucket:
-                    for v in kv.values():
-                        yield v
+    def __len__(self) -> int:
+        count = 0
+        for _ in self:
+            count += 1
 
-            # Traverse down list of ids that are the store's links'
-            links = top_node.get_links()
-            for link in links.values():
-                node_id_stack.append(link)
+        return count
+
+    async def async_len(self):
+        count = 0
+        async for _ in self.aiter_keys():
+            count += 1
+
+        return count
