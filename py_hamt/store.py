@@ -1,3 +1,4 @@
+import io
 from typing import Literal
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
@@ -98,7 +99,7 @@ class IPFSStore(Store):
             )
 
         async with self.rpc_session.request(
-            method="POST", url=self.rpc_url, data={"file": data}
+            method="POST", url=self.rpc_url, data={"file": io.BytesIO(data)}
         ) as response:
             response.raise_for_status()
             json_bytes = await response.read()
