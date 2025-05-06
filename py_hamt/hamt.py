@@ -47,40 +47,26 @@ type StoreID = IPLDKind
 
 class Node:
     # Use a dict for easy serializability with dag_cbor
-    data: dict[str, IPLDKind]
+    data: list[IPLDKind]
 
     def __init__(self):
-        data = {}
-
         # Each "string" key for both buckets and CIDs is the bits as a string, e.g. str(0b1101) = '13'
-        buckets: dict[str, list[dict[str, IPLDKind]]] = {}
-        data["B"] = buckets
+        buckets: dict[str, dict[str, IPLDKind]] = dict()
         links: dict[str, Link] = {}
-        data["L"] = links
-        self.data = data
+        self.data = [buckets, links]  # type: ignore
 
     # By having these two methods, the HAMT class has to know less about Node's internal structure and we get better type checking since we don't need to put #type:ignore everywhere
-    def get_buckets(self) -> dict[str, list[dict[str, IPLDKind]]]:
-        buckets: dict[str, list[dict[str, IPLDKind]]] = self.data["B"]  # type: ignore
+    def get_buckets(self) -> dict[str, dict[str, IPLDKind]]:
+        # Buckets looks like
+        # {"0": {k1: v1, k2: v2, ...}, "1": ...}
+        buckets: dict[str, dict[str, IPLDKind]] = self.data[0]  # type: ignore
         return buckets
 
     def get_links(self) -> dict[str, Link]:
-        links: dict[str, Link] = self.data["L"]  # type: ignore
+        # Links looks like
+        # {"0": Link, "1": Link, ...}
+        links: dict[str, Link] = self.data[1]  # type: ignore
         return links
-
-    def _replace_link(self, old_link: Link, new_link: Link):
-        links = self.get_links()
-        for str_key in list(links.keys()):
-            link = links[str_key]
-            if link == old_link:
-                links[str_key] = new_link
-
-    def _remove_link(self, old_link: Link):
-        links = self.get_links()
-        for str_key in list(links.keys()):
-            link = links[str_key]
-            if link == old_link:
-                del links[str_key]
 
     def serialize(self) -> bytes:
         return dag_cbor.encode(self.data)
@@ -88,23 +74,22 @@ class Node:
     @classmethod
     def deserialize(cls, data: bytes) -> "Node":
         try:
-            decoded = dag_cbor.decode(data)
+            decoded_data = dag_cbor.decode(data)
         except:  # noqa: E722
             raise Exception(
                 "Invalid dag-cbor encoded data from the store was attempted to be decoded"
             )
         if (
-            isinstance(decoded, dict)
-            and "B" in decoded
-            and isinstance(decoded["B"], dict)
-            and "L" in decoded
-            and isinstance(decoded["L"], dict)
+            isinstance(decoded_data, list)
+            and len(decoded_data) == 2
+            and isinstance(decoded_data[0], dict)
+            and isinstance(decoded_data[1], dict)
         ):
             node = cls()
-            node.data = decoded
+            node.data = decoded_data
             return node
         else:
-            raise ValueError("Data not a valid Node serialization")
+            raise ValueError("Data does not contain a valid Node")
 
 
 b3 = multihash.get("blake3")
