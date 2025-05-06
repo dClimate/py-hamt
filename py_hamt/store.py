@@ -16,8 +16,10 @@ class Store(ABC):
     The return type of save and input to load is really type IPLDKind, but the documentation generates something a bit strange since IPLDKind is a type union.
     """
 
+    @abstractmethod
     async def save(self, data: bytes, codec: Literal["raw", "dag-cbor"]) -> IPLDKind:
         """Take any set of bytes, save it to the storage mechanism, and reutrn an ID in the type of IPLDKind which can be used to retrieve those bytes later. This also includes extra information in `codec` on whether to mark this data as special linked data."""
+        # TODO add bit about its important that dag-cbor is only called for an internal data structure node, and ONLY that type
 
     @abstractmethod
     async def load(self, id: IPLDKind) -> bytes:
@@ -116,7 +118,6 @@ class IPFSStore(Store):
     async def load(  # type: ignore
         self,
         id: CID,
-        session: aiohttp.ClientSession | None = None,
     ) -> bytes:
         if self.gateway_session is None:
             self.gateway_session = aiohttp.ClientSession(
