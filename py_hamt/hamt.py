@@ -46,27 +46,8 @@ type StoreID = IPLDKind
 
 
 class Node:
-    # Use a dict for easy serializability with dag_cbor
-    data: list[IPLDKind]
-
     def __init__(self):
-        # Each "string" key for both buckets and CIDs is the bits as a string, e.g. str(0b1101) = '13'
-        buckets: dict[str, dict[str, IPLDKind]] = dict()
-        links: dict[str, Link] = {}
-        self.data = [buckets, links]  # type: ignore
-
-    # By having these two methods, the HAMT class has to know less about Node's internal structure and we get better type checking since we don't need to put #type:ignore everywhere
-    def get_buckets(self) -> dict[str, dict[str, IPLDKind]]:
-        # Buckets looks like
-        # {"0": {k1: v1, k2: v2, ...}, "1": ...}
-        buckets: dict[str, dict[str, IPLDKind]] = self.data[0]  # type: ignore
-        return buckets
-
-    def get_links(self) -> dict[str, Link]:
-        # Links looks like
-        # {"0": Link, "1": Link, ...}
-        links: dict[str, Link] = self.data[1]  # type: ignore
-        return links
+        self.data: list[IPLDKind] = [dict() for _ in range(0, 256)]
 
     def serialize(self) -> bytes:
         return dag_cbor.encode(self.data)
@@ -79,12 +60,7 @@ class Node:
             raise Exception(
                 "Invalid dag-cbor encoded data from the store was attempted to be decoded"
             )
-        if (
-            isinstance(decoded_data, list)
-            and len(decoded_data) == 2
-            and isinstance(decoded_data[0], dict)
-            and isinstance(decoded_data[1], dict)
-        ):
+        if (isinstance(decoded_data, list) and len(decoded_data) == 256):
             node = cls()
             node.data = decoded_data
             return node
