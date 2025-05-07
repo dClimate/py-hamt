@@ -370,10 +370,11 @@ class HAMT:
             self.node_store = InMemoryTreeStore(self)
 
     @classmethod
-    async def build(cls, *args, **kwargs):
+    async def build(cls, *args, **kwargs) -> "HAMT":
         hamt = cls(*args, **kwargs)
         if hamt.root_node_id is None:
             hamt.root_node_id = await hamt.node_store.save(None, Node())
+        return hamt
 
     # This is typically a massive blocking operation, you dont want to be running this concurrently with a bunch of other operations, so it's ok to have it not be async
     async def make_read_only(self):
