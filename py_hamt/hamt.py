@@ -469,7 +469,7 @@ class HAMT(MutableMapping):
             self.lock.acquire(blocking=True)
 
         node_stack: list[tuple[IPLDKind, Node]] = []
-        root_node = await self.read_node(self.root_node_id)
+        root_node = await self.virtual_store.load(self.root_node_id)
         node_stack.append((self.root_node_id, root_node))
 
         # FIFO queue to keep track of all the KVs we need to insert
@@ -487,7 +487,7 @@ class HAMT(MutableMapping):
             item = top_node.data[map_key]
             if isinstance(item, list):
                 next_node_id = item[0]
-                next_node = await self.read_node(next_node_id)
+                next_node = await self.virtual_store.load(next_node_id)
                 node_stack.append((next_node_id, next_node))
             if isinstance(item, dict):
                 bucket: dict[str, IPLDKind] = item
@@ -504,7 +504,7 @@ class HAMT(MutableMapping):
 
                 # Create a new link to a new node so that we can reflow these KVs into nodes
                 new_node = Node()
-                new_node_id = await self.write_node(None, new_node)
+                new_node_id = await self.virtual_store.save(None, new_node)
 
                 link = [new_node_id]
                 top_node.data[map_key] = link
@@ -531,7 +531,7 @@ class HAMT(MutableMapping):
         raw_hash = self.hash_fn(key.encode())
 
         node_stack: list[tuple[IPLDKind, Node]] = []
-        root_node = await self.read_node(self.root_node_id)
+        root_node = await self.virtual_store.load(self.root_node_id)
         node_stack.append((self.root_node_id, root_node))
 
         created_change = False
@@ -549,7 +549,7 @@ class HAMT(MutableMapping):
                 break
             if isinstance(item, list):
                 link = item[0]
-                next_node = await self.read_node(link)
+                next_node = await self.virtual_store.load(link)
                 node_stack.append((link, next_node))
 
         # Finally, reserialize and fix all links, deleting empty nodes as needed
@@ -585,7 +585,7 @@ class HAMT(MutableMapping):
         found_a_result: bool = False
         while True:
             top_id = current_id
-            top_node = await self.read_node(top_id)
+            top_node = await self.virtual_store.load(top_id)
             map_key = extract_bits(raw_hash, current_depth, 8)
 
             # Check if this key is in one of the buckets
@@ -625,7 +625,7 @@ class HAMT(MutableMapping):
                 break
 
             top_id = node_id_stack.pop()
-            node = await self.read_node(top_id)
+            node = await self.virtual_store.load(top_id)
             yield (top_id, node)
 
             # Traverse down list of links
@@ -648,7 +648,7 @@ class HAMT(MutableMapping):
                 break
 
             top_id = node_id_stack.pop()
-            node = asyncio.run(self.read_node(top_id))
+            node = asyncio.run(self.virtual_store.load(top_id))
 
             for item_index in range(len(node.data)):
                 item = node.data[item_index]
