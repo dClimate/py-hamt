@@ -91,6 +91,13 @@ class Node:
         wrapped = [link]
         self.data[index] = wrapped
 
+    def replace_link(self, old_link: IPLDKind, new_link: IPLDKind):
+        for link_index in self.iter_links():
+            link = self.get_link(link_index)
+            if link == old_link:
+                self.data[link_index] = new_link
+                return
+
     def serialize(self) -> bytes:
         return dag_cbor.encode(self.data)
 
@@ -160,6 +167,7 @@ class InMemoryTreeStore(VirtualStore):
         self.hamt = hamt
 
         # The Store ID returned by the InMemoryTree to mark objects as being in memory looks like list[inmemory_marker, virtual store uuid int ID for that node, original Store ID]
+        # TODO write about how a virtual store uuid int is used for every specific node since content addressed systems would normally return the same Store ID for every single empty Node
         self.inmemory_marker = uuid.uuid4().int
         # This buffer goes from the node's virtual store uuid to a Node object, which we can return references to for mutating within the HAMT
         self.buffer: dict[IPLDKind, Node] = dict()
@@ -331,26 +339,6 @@ class HAMT(MutableMapping):
     async def read_raw(self, id: IPLDKind) -> IPLDKind:
         return dag_cbor.decode(await self.store.load(id))
 
-    async def read_node(self, id: IPLDKind) -> Node:
-        # TODO handle having a cache as well, with cache limits
-        if self.inmemory_buffer is not None and id in self.inmemory_buffer:
-            return self.inmemory_buffer[id]
-
-        node = Node.deserialize(await self.store.load(id))
-        await self.add_to_buffer(id, node)
-        return node
-
-    async def write_node(self, old_id: IPLDKind, node: Node) -> IPLDKind:
-        if self.inmemory_buffer is not None and old_id in self.inmemory_buffer:
-            # Nodes hold a mutable pointer to their data, so we shouldn't even need to set the inmemory buffer to this new node
-            return old_id
-
-        new_id = await self.store.save(node.serialize(), codec="dag-cbor")
-        await self.add_to_buffer(new_id, node)
-        return new_id
-
-    inmemory_buffer: dict[IPLDKind, Node] | None
-
     def __init__(
         self,
         store: Store,
@@ -382,6 +370,13 @@ class HAMT(MutableMapping):
         self.inmemory_tree_limit = inmemory_tree_limit
         self.read_cache_limit = read_cache_limit
 
+        self.root_node_id = root_node_id
+        # Create an empty node to use as the root node
+        if root_node_id is None:
+            self.root_node_id = asyncio.run(
+                self.store.save(Node().serialize(), "dag-cbor")
+            )
+
         # Create an empty in memory tree or read cache store
         self.virtual_store: VirtualStore
         if read_only:
@@ -389,24 +384,24 @@ class HAMT(MutableMapping):
         else:
             self.virtual_store = InMemoryTreeStore(self)
 
-        if root_node_id is None:
-            self.root_node_id = asyncio.run(self.write_node(None, Node()))
-        else:
-            self.root_node_id = root_node_id
-
+    # This is typically a massive blocking operation, you dont want to be running this concurrently with a bunch of other operations, so it's ok to have it not be async
     def make_read_only(self):
         self.lock.acquire(blocking=True)
         self.read_only = True
-        asyncio.run(self.flush_buffer(flush_everything=True))
-        self.inmemory_buffer = None
-        self.cache = dict()
+
+        # Swap in memory tree for a read cache
+        inmemory_tree: InMemoryTreeStore = self.virtual_store  # type: ignore
+        asyncio.run(inmemory_tree.flush_buffer(flush_everything=True))
+
+        read_cache = ReadCacheStore(self)
+        self.virtual_store = read_cache
+
         self.lock.release()
 
     def enable_write(self):
         self.lock.acquire(blocking=True)
         self.read_only = False
-        self.inmemory_buffer = dict()
-        self.cache = None
+        self.virtual_store = InMemoryTreeStore(self)
         self.lock.release()
 
     async def _reserialize_and_link(self, node_stack: list[tuple[Link, Node]]):
@@ -418,37 +413,46 @@ class HAMT(MutableMapping):
         If a node ends up being empty, then it is deleted entirely, unless it is the root node
         Modifies in place
         """
-        # if we have just the root node, then don't operate at all and serialize it all the way
-        if len(node_stack) == 1:
-            self.cache[self.root_node_id] = node_stack[0][1]
-            return
-
         # Iterate in the reverse direction, imitating going deeper into a stack
+        # this range goes from n-1 to 0
         for stack_index in range(len(node_stack) - 1, -1, -1):
-            old_store_id, node = node_stack[stack_index]
+            old_id, node = node_stack[stack_index]
 
-            # If this node is empty, and its not the root node, then we can delete it entirely from the list
-            buckets = node.get_buckets()
-            links = node.get_links()
-            is_empty = buckets == {} and links == {}
+            # If this node is empty, and it's not the root node, then we can delete it entirely from the list
+            is_empty = True
+            for i in range(len(node.data)):
+                item = node.data[i]
+                # If we have a nonempty bucket, or a link at all, then this is a nonempty node
+                if (isinstance(item, dict) and len(item) > 0) or isinstance(item, list):
+                    is_empty = False
+                    break
             is_not_root = stack_index > 0
 
             if is_empty and is_not_root:
                 # Unlink from the rest of the tree
                 _, prev_node = node_stack[stack_index - 1]
-                prev_node._remove_link(old_store_id)
+                # When removing links, don't worry about two nodes having the same link since all nodes are guaranteed to be different by the design of the tree and the exclusion of empty nodes
+                for i in range(len(prev_node.data)):
+                    item = prev_node.data
+                    if isinstance(item, dict):
+                        continue
+                    link = item[0]
+                    # Delete the link by making it an empty bucket
+                    if link == old_id:
+                        prev_node.data[i] = dict()
 
                 # Remove from our stack
                 node_stack.pop(stack_index)
-            else:
-                # Reserialize
-                new_store_id = self.write_node(node)
-                node_stack[stack_index] = (new_store_id, node)
+                continue
 
-                # If this is not the last i.e. root node, we need to change the linking of the node prior in the list
-                if stack_index > 0:
-                    _, prev_node = node_stack[stack_index - 1]
-                    prev_node._replace_link(old_store_id, new_store_id)
+            # If not an empty node, just reserialize like normal
+            new_store_id = await self.virtual_store.save(old_id, node)
+            node_stack[stack_index] = (new_store_id, node)
+
+            # If this is not the last i.e. root node, we need to change the linking of the node prior in the list
+            if is_not_root:
+                _, prev_node = node_stack[stack_index - 1]
+                prev_node.replace_link(old_id, new_store_id)
 
     def __setitem__(self, key_to_insert: str, val_to_insert: IPLDKind):
         asyncio.run(self.setitem(key_to_insert, val_to_insert))
