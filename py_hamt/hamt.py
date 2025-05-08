@@ -69,11 +69,11 @@ class Node:
         self.data: list[IPLDKind] = [dict() for _ in range(0, 256)]
         # empty dicts represent empty buckets, lists with one element are links, with the internal element being a link
 
-    def iter_bucket_indices(self) -> Iterator[int]:
-        """Return the list indices where there are buckets, empty or not."""
+    def iter_buckets(self) -> Iterator[dict]:
         for i in range(len(self.data)):
-            if isinstance(self.data[i], dict):
-                yield i
+            item = self.data[i]
+            if isinstance(item, dict):
+                yield item
 
     def iter_link_indices(self) -> Iterator[int]:
         """Return the list indices where there are links."""
@@ -81,24 +81,32 @@ class Node:
             if isinstance(self.data[i], list):
                 yield i
 
-    def get_link(self, index: int) -> IPLDKind:
-        link_wrapper: list[IPLDKind] = self.data[index]  # type: ignore
-        return link_wrapper[0]
-
     def iter_links(self) -> Iterator[IPLDKind]:
         for i in self.iter_link_indices():
             yield self.get_link(i)
+
+    def get_link(self, index: int) -> IPLDKind:
+        link_wrapper: list[IPLDKind] = self.data[index]  # type: ignore
+        return link_wrapper[0]
 
     def set_link(self, index: int, link: IPLDKind):
         wrapped = [link]
         self.data[index] = wrapped
 
+    # This assumes that there is only one unique link matching the old link, which is valid since we prune empty Nodes when reserializing and relinking
     def replace_link(self, old_link: IPLDKind, new_link: IPLDKind):
         for link_index in self.iter_link_indices():
             link = self.get_link(link_index)
             if link == old_link:
                 self.set_link(link_index, new_link)
                 return
+
+    def is_empty(self) -> bool:
+        for i in range(len(self.data)):
+            item = self.data[i]
+            if (isinstance(item, dict) and len(item) > 0) or isinstance(item, list):
+                return False
+        return True
 
     def serialize(self) -> bytes:
         return dag_cbor.encode(self.data)
