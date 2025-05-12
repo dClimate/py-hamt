@@ -131,11 +131,11 @@ class Node:
 class NodeStore(ABC):
     @abstractmethod
     async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
-        pass
+        """Save nodes to the store"""
 
     @abstractmethod
     async def load(self, id: IPLDKind) -> Node:
-        pass
+        """Load nodes from the store"""
 
 
 class ReadCacheStore(NodeStore):
@@ -198,14 +198,14 @@ class InMemoryTreeStore(NodeStore):
 
     # TODO, reimplement without treating the root node specially, but do assume that the root node is always in the in memory buffer since it will always be called first in any operations doing tree traversal
     async def flush_buffer(self, flush_everything: bool = False):
-        if (
-            (not self.needs_flushing())
-            and (not flush_everything)
-            or len(self.buffer) == 0
-        ):
+        if not self.needs_flushing() and not flush_everything:
             return
 
-        # Start by removing completely empty nodes, which will end up being unreferencing by anything else, but which will still be inside the buffer since this in memory tree assigns unique IDs to every node unlike a normal content-addressed system
+        if len(self.buffer) == 0:
+            return
+
+
+        # Start by removing completely empty nodes, which will be unreferenced by other nodes but will still be inside the buffer since this in memory tree assigns unique IDs to every node, unlike a normal content-addressed system which would have consolidated all the empty nodes
         empty_node_buffer_ids: list[
             int
         ] = []  # we can't modify a dictionary while iterating so do the deletion in a separate step
@@ -216,8 +216,10 @@ class InMemoryTreeStore(NodeStore):
             node = self.buffer[buffer_id]
             if node.is_empty():
                 empty_node_buffer_ids.append(buffer_id)
+
         for buffer_id in empty_node_buffer_ids:
             del self.buffer[buffer_id]
+
 
         # Start with the root node's children, which should always be in the in memory buffer if there's anything there
         # there is an implicit assumption that the entire continuous line of branches up to an ancestor in the memory buffer, which will happen because of the DFS style traversal in all HAMT operations
@@ -347,6 +349,7 @@ class HAMT:
         self.node_store: NodeStore
         if read_only:
             self.node_store = ReadCacheStore(self)
+        else:
             self.node_store = InMemoryTreeStore(self)
 
     @classmethod
@@ -368,8 +371,13 @@ class HAMT:
 
     async def enable_write(self):
         async with self.lock:
+            # Get the root node right before we clear out the cache store
+            root_node = await self.node_store.load(self.root_node_id)
+
             self.read_only = False
             self.node_store = InMemoryTreeStore(self)
+            # Make sure the root node is in memory, we can't modify the originating root node otherwise when loading things in
+            self.root_node_id = await self.node_store.save(self.root_node_id, root_node)
 
     async def _reserialize_and_link(self, node_stack: list[tuple[Link, Node]]):
         """

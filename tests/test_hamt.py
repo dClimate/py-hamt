@@ -1,4 +1,4 @@
-from copy import deepcopy
+import asyncio
 import random
 from collections.abc import MutableMapping
 
@@ -17,74 +17,79 @@ from testing_utils import key_value_list
 @pytest.mark.asyncio
 @given(key_value_list)
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
+# async def test_fuzz():
     store = DictStore()
     hamt = await HAMT.build(store=store)
 
-    # The HAMT should be able to withstand its bucket size changing in between operations
+    # Sequential setting and getting, while randomly changing the bucket size which the HAMT should be able to withstand
     for key, value in kvs:
         hamt.max_bucket_size = random.randint(1, 10)
         await hamt.set(key, value)
         assert (await hamt.get(key)) == value
-    assert (await hamt.len()) == len(kvs)
-    assert len([key async for key in hamt.keys()]) == (await hamt.len())
+
+    assert len([key async for key in hamt.keys()]) == (await hamt.len()) == len(kvs)
+    await asyncio.gather(*[hamt.delete(k) for k, _ in kvs]) # delete everything
+    assert len([key async for key in hamt.keys()]) == (await hamt.len()) == 0
+
+    # Set entirely concurrently thus with unpredictable order
+    await asyncio.gather(*[hamt.set(k, v) for k, v in kvs])
+
+    # Switching this one and off should not cause any problems
+    await hamt.make_read_only()
+    await hamt.enable_write()
+    await hamt.make_read_only()
+
+    # Verify completely concurrently
+    async def verify(k, v):
+        assert (await hamt.get(k)) == v
+
+    await asyncio.gather(*[verify(k, v) for k, v in kvs])
+
+    await hamt.enable_write()
+    # Delete and empty it out again
+    await asyncio.gather(*[hamt.delete(k) for k, _ in kvs])
+    assert len([key async for key in hamt.keys()]) == (await hamt.len()) == 0
+
+    # Re insert all items but now with a bucket size that forces linking, which actually runs the link following code branches, otherwise we would miss 100% code coverage
+    hamt.max_bucket_size = 1
+    await asyncio.gather(*[hamt.set(k, v) for k, v in kvs])
+    assert len([key async for key in hamt.keys()]) == (await hamt.len()) == len(kvs)
+
+    # HAMT should be throwing errors on keys that do not exist
+    ks = [k for k, _ in kvs]
+    key_that_cannot_exist = "".join(ks).join(
+        "string to account for empty string key case"
+    )
+    with pytest.raises(KeyError):
+        await hamt.get(key_that_cannot_exist)
+    with pytest.raises(KeyError):
+        await hamt.delete(key_that_cannot_exist)
+
+    hamt_keys = [key async for key in hamt.keys()]
+    hamt_key_set = set(hamt_keys)
+    keys_set = set()
     for key, _ in kvs:
-        await hamt.delete(key)
-    assert (await hamt.len()) == 0
-    # assert len(list(hamt)) == len(hamt)
-    # # Re insert all items but now with a bucket size that forces linking, which actually runs the link following code branches, otherwise we would miss 100% code coverage
-    # hamt.max_bucket_size = 1
-    # for key, value in kvs:
-    #     hamt[key] = value
-    #     assert hamt[key] == value
-    # assert len(hamt) == len(kvs)
-    # assert len(list(hamt)) == len(hamt)
+        keys_set.add(key)
 
-    # ks = [k for k, _ in kvs]
-    # key_that_cannot_exist = "".join(ks).join(
-    #     "string to account for empty string key case"
-    # )
-    # with pytest.raises(KeyError):
-    #     hamt[key_that_cannot_exist]
-    # with pytest.raises(KeyError):
-    #     del hamt[key_that_cannot_exist]
+    assert hamt_key_set == keys_set
 
-    # for key, value in kvs:
-    #     assert hamt[key] == value
+    # Make sure all pointers actually exist in the store, this should not raise any exceptions
+    for k,_ in kvs:
+        # Callers must handle acquiring a lock themselves, so do these entirely sequentially
+        pointer: bytes = await hamt._get_pointer(k) # type: ignore we know that DictStore only returns bytes for its Link type
+        await store.load(pointer)
 
-    # assert len(hamt) == len(kvs)
-    # assert len(list(hamt)) == len(kvs)
+    await hamt.make_read_only()
+    with pytest.raises(Exception, match="Cannot call set on a read only HAMT"):
+        await hamt.set("foo", "bar")
+    with pytest.raises(Exception, match="Cannot call delete on a read only HAMT"):
+        await hamt.delete("foo")
 
-    # hamt_keys = list(hamt)
-    # hamt_key_set = set(hamt_keys)
-    # keys_set = set()
-    # for key, _ in kvs:
-    #     keys_set.add(key)
 
-    # assert hamt_key_set == keys_set
-
-    # # Make sure all ids actually exist in the store, this should not raies any exceptions
-    # store_ids: list[bytes] = list(hamt.ids())  # type: ignore
-    # for id in store_ids:
-    #     store.load(id)
-
-    # hamt.make_read_only()
-    # with pytest.raises(Exception, match="Cannot call set on a read only HAMT"):
-    #     hamt["foo"] = b"bar"
-    # with pytest.raises(Exception, match="Cannot call delete on a read only HAMT"):
-    #     del hamt["foo"]
-    # hamt.enable_write()
-
-    # copy_hamt = deepcopy(hamt)
-
-    # # Modify our current hamt and since the copy is a deep copy, they should be different
-    # for key, _ in kvs:
-    #     del hamt[key]
-    # assert len(hamt) == 0
-    # assert len(copy_hamt) == len(kvs)
-
-    # # Test that when a hamt has its root manually initialized by a user, that the key count is accurate
-    # hamt_re_initialized = HAMT(store=store, root_node_id=copy_hamt.root_node_id)
-    # assert len(hamt_re_initialized) == len(kvs)
+    # Test that when a hamt has its root manually initialized by a user, that the key count is accurate
+    # We can only get the root node id here since hamt is in read mode and thus the in memory tree has been entirely flushed
+    new_hamt = await HAMT.build(store=store, root_node_id=hamt.root_node_id)
+    assert len([key async for key in new_hamt.keys()]) == (await new_hamt.len()) == len(kvs)
 
 
 # Mostly for complete code coverage's sake
@@ -137,24 +142,23 @@ def test_key_rewrite():
 
 
 def test_cache_clear():
-    hamt = HAMT(store=DictStore(), max_cache_size_bytes=1000)
+    hamt = HAMT(store=DictStore(), read_cache_limit=1000)
     for key_int in range(50):
         hamt[str(key_int)] = key_int
 
 
 # Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
-def test_link_following():
-    store = DictStore()
-    hamt = HAMT(store=store)
+async def test_link_following():
+    hamt = HAMT(store=DictStore())
     hamt.max_bucket_size = 1
-    # The first byte of the blake3 hash of each of these is 0b10110011
+    # The first byte of the blake3 hash of each of these is the same, 10110011
     kvs = [(str(5), b""), (str(15), b""), (str(123), b"")]
     for k, v in kvs:
-        hamt[k] = v
-    assert len(hamt) == 3
+        await hamt.set(k, v)
+    assert (await hamt.len()) == 3
     for k, _ in kvs:
-        del hamt[k]
-    assert len(hamt) == 0
+        await hamt.delete(k)
+    assert (await hamt.len()) == 0
 
 
 # Run this with varying cache sizes to see the impact on performance of the cache when using IPFSStore()
