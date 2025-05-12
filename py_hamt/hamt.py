@@ -196,9 +196,8 @@ class InMemoryTreeStore(NodeStore):
     def needs_flushing(self) -> bool:
         return getsizeof(self.buffer) > self.hamt.inmemory_tree_limit
 
-    # TODO, reimplement without treating the root node specially, but do assume that the root node is always in the in memory buffer since it will always be called first in any operations doing tree traversal
     async def flush_buffer(self, flush_everything: bool = False):
-        if not self.needs_flushing() and not flush_everything:
+        if not (self.needs_flushing() or flush_everything):
             return
 
         if len(self.buffer) == 0:
@@ -258,19 +257,22 @@ class InMemoryTreeStore(NodeStore):
                 del self.buffer[top_buffer_id]
                 node_stack.pop()
 
-        # Only flush the root node if our size limits are still too big, or we've been instructed to remove everything. Always keeping the root node is important for performance
-        if self.needs_flushing() or flush_everything:
+        # Flush out the root node along before we do everything else as well
+        if (self.needs_flushing() or flush_everything) and self.is_buffer_id(self.hamt.root_node_id):
+            root_node: Node = self.buffer[self.hamt.root_node_id]  # type: ignore
             del self.buffer[self.hamt.root_node_id]  # type: ignore
             self.hamt.root_node_id = await self.hamt.store.save(
                 root_node.serialize(), codec="dag-cbor"
             )
 
+        # If the in memory tree is used for only read purposes, then we will have a bunch of nodes that seem "unlinked" to anything else, since Links used within the Nodes will reference the real underlying store
+        # For this case, just clear everything, nothing inside is linked to anything else anyhow
+        if self.needs_flushing() or flush_everything:
+            self.buffer = dict()
+            assert not self.is_buffer_id(self.hamt.root_node_id)
+
         if flush_everything:
             assert len(self.buffer) == 0
-        if self.needs_flushing():
-            raise Exception(
-                "Could not flush in memory tree buffer enough to reach limit, consider raising limit to accomodate for python empty object overheads"
-            )
 
     async def add_to_buffer(self, node: Node) -> IPLDKind:
         # This is IPLDKind type, but not dag_cbor serializable due to int limits so this will throw errors early if the tree is written with the buffer_ids still in there
@@ -376,7 +378,7 @@ class HAMT:
 
             self.read_only = False
             self.node_store = InMemoryTreeStore(self)
-            # Make sure the root node is in memory, we can't modify the originating root node otherwise when loading things in
+            # Guarantee the root node is in the inmemory tree, we can't modify the originating root node otherwise when loading things in if the user is quickly switching between enabling write and making it read only without using any other operations
             self.root_node_id = await self.node_store.save(self.root_node_id, root_node)
 
     async def _reserialize_and_link(self, node_stack: list[tuple[Link, Node]]):
@@ -477,7 +479,6 @@ class HAMT:
 
             # Finally, reserialize and fix all links, deleting empty nodes as needed
             await self._reserialize_and_link(node_stack)
-            self.root_node_id = node_stack[0][0]
             # This needs to be called after the root node is set from the node stack, since this may change the root node if the memory buffer is too small to hold the root node
             if isinstance(self.node_store, InMemoryTreeStore):
                 await self.node_store.flush_buffer()

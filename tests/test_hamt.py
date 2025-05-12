@@ -53,7 +53,9 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     # Re insert all items but now with a bucket size that forces linking, which actually runs the link following code branches, otherwise we would miss 100% code coverage
     hamt.max_bucket_size = 1
     await asyncio.gather(*[hamt.set(k, v) for k, v in kvs])
+    await hamt.make_read_only() # cover code branch in keys() that does not need to acquire lock for read only mode
     assert len([key async for key in hamt.keys()]) == (await hamt.len()) == len(kvs)
+    await hamt.enable_write()
 
     # HAMT should be throwing errors on keys that do not exist
     ks = [k for k, _ in kvs]
