@@ -461,6 +461,7 @@ class HAMT:
 
             # Finally, reserialize and fix all links, deleting empty nodes as needed
             await self._reserialize_and_link(node_stack)
+            self.root_node_id = node_stack[0][0]
             # This needs to be called after the root node is set from the node stack, since this may change the root node if the memory buffer is too small to hold the root node
             if isinstance(self.node_store, InMemoryTreeStore):
                 await self.node_store.flush_buffer()
