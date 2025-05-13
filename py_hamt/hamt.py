@@ -13,16 +13,14 @@ from .store import Store
 
 
 def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
-    """Extract `nbits` bits from `hash_bytes`, beginning at position `depth * nbits`,
-    and convert them into an unsigned integer value.
+    """
+    Extract `nbits` bits from `hash_bytes`, beginning at position `depth * nbits`, and convert them into an unsigned integer value.
 
-    Args:
-        hash_bytes (bytes): binary hash to extract bit sequence from
-        depth (int): depth of the node containing the hash
-        nbits (int): bit width of hash
+    hash_bytes: binary hash to extract bit sequence from
+    depth: depth of the node containing the hash
+    nbits: bit width of hash
 
-    Returns:
-        int: An unsigned integer version of the bit sequence
+    returns an unsigned integer version of the bit sequence
     """
     # This is needed since int.bit_length on a integer representation of a bytes object ignores leading 0s
     hash_bit_length = len(hash_bytes) * 8
@@ -46,9 +44,9 @@ b3 = multihash.get("blake3")
 
 def blake3_hashfn(input_bytes: bytes) -> bytes:
     """
-    This is provided as a default recommended hash function by py-hamt. It uses the blake3 hash function and uses 32 bytes as the hash size.
+    This is the default hash function used for . It uses the blake3 hash function and uses 32 bytes as the hash size.
 
-    To bring your own hash function, just create a function that takes in bytes and returns the hash bytes, and use that in the HAMT init method.
+    To provide your own hash function, create a function that takes in arbitrarily long bytes and returns the hash bytes.
 
     It's important to note that the resulting hash must must always be a multiple of 8 bits since python bytes object can only represent in segments of bytes, and thus 8 bits.
     """
@@ -57,33 +55,28 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
     raw_bytes = b3.unwrap(digest)
     return raw_bytes
 
-
-# Used for readability, since a HAMT also stores IPLDKind objects
-# Store IDs are also IPLDKind, which makes the code harder to read if only using IPLDKind rather than this type alias
-type Link = IPLDKind
-type StoreID = IPLDKind
-
-
 class Node:
+    """
+    The Node class encapsulates
+    """
     def __init__(self):
         self.data: list[IPLDKind] = [dict() for _ in range(0, 256)]
         # empty dicts represent empty buckets, lists with one element are links, with the internal element being a link
 
     def iter_buckets(self) -> Iterator[dict]:
-        for i in range(len(self.data)):
-            item = self.data[i]
+        for item in self.data:
             if isinstance(item, dict):
                 yield item
 
     def iter_link_indices(self) -> Iterator[int]:
-        """Return the list indices where there are links."""
         for i in range(len(self.data)):
             if isinstance(self.data[i], list):
                 yield i
 
     def iter_links(self) -> Iterator[IPLDKind]:
-        for i in self.iter_link_indices():
-            yield self.get_link(i)
+        for item in self.data:
+            if isinstance(item, list):
+                yield item[0]
 
     def get_link(self, index: int) -> IPLDKind:
         link_wrapper: list[IPLDKind] = self.data[index]  # type: ignore
@@ -119,12 +112,11 @@ class Node:
             raise Exception(
                 "Invalid dag-cbor encoded data from the store was attempted to be decoded"
             )
-        if isinstance(decoded_data, list) and len(decoded_data) == 256:
-            node = cls()
-            node.data = decoded_data
-            return node
-        else:
-            raise ValueError("Data does not contain a valid Node")
+
+        # Don't do any further checks for speed purposes
+        node = cls()
+        node.data = decoded_data # type: ignore
+        return node
 
 
 # For HAMT internal use for increaing performance with nodes
@@ -324,11 +316,13 @@ class HAMT:
         max_bucket_size: int = 4,
         inmemory_tree_limit: int = 10_000_000,  # 10 MB default
         read_cache_limit: int = 10_000_000,  # 10 MB default
+        values_are_bytes: bool = False
     ):
         self.store = store
         self.hash_fn = hash_fn
         self.lock = asyncio.Lock()
         self.read_only = read_only
+        self.values_are_bytes = values_are_bytes
 
         if max_bucket_size < 1:
             raise ValueError("Bucket size maximum must be a positive integer")
@@ -381,7 +375,7 @@ class HAMT:
             # Guarantee the root node is in the inmemory tree, we can't modify the originating root node otherwise when loading things in if the user is quickly switching between enabling write and making it read only without using any other operations
             self.root_node_id = await self.node_store.save(self.root_node_id, root_node)
 
-    async def _reserialize_and_link(self, node_stack: list[tuple[Link, Node]]):
+    async def _reserialize_and_link(self, node_stack: list[tuple[IPLDKind, Node]]):
         """
         This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
         Takes a stack of nodes, we represent a stack with a list where the first element is the root element and the last element is the top of the stack
@@ -420,13 +414,13 @@ class HAMT:
                 prev_node.replace_link(old_id, new_store_id)
 
     # automatically skip encoding if the value provided is of the bytes variety
-    async def set(self, key: str, val: IPLDKind, skip_encode=False):
+    async def set(self, key: str, val: IPLDKind):
         """TODO add something about how skip encoding can make large bytes setting much more efficient"""
         if self.read_only:
             raise Exception("Cannot call set on a read only HAMT")
 
         data: bytes
-        if skip_encode:
+        if self.values_are_bytes:
             data = val  # type: ignore let users get an exception if they pass in a non bytes when they want to skip encoding
         else:
             data = dag_cbor.encode(val)
@@ -524,8 +518,8 @@ class HAMT:
                 # If we didn't make a change, then this key must not exist within the HAMT
                 raise KeyError
 
-    # include option to skip decode if the user knows that the value inside is also going to be a bytes object
-    async def get(self, key: str, skip_decode=False) -> IPLDKind:
+    # TODO document option to skip decode if the user knows that the value inside is also going to be a bytes object
+    async def get(self, key: str) -> IPLDKind:
         # If read only, no need to acquire a lock
         pointer: IPLDKind
         if self.read_only:
@@ -535,7 +529,7 @@ class HAMT:
                 pointer = await self._get_pointer(key)
 
         data = await self.store.load(pointer)
-        if skip_decode:
+        if self.values_are_bytes:
             return data
         else:
             return dag_cbor.decode(data)
