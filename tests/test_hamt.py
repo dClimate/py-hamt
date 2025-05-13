@@ -17,6 +17,8 @@ from testing_utils import key_value_list
 @pytest.mark.asyncio
 @given(key_value_list)
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
+# async def test_fuzz():
+#     kvs=[('', None), ('0', None)]
     store = DictStore()
     hamt = await HAMT.build(store=store)
 
@@ -84,10 +86,22 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     with pytest.raises(Exception, match="Cannot call delete on a read only HAMT"):
         await hamt.delete("foo")
 
+    async def verify_kvs_and_len(h: HAMT):
+        for k,v in kvs:
+            assert (await h.get(k)) == v
+        assert len([key async for key in h.keys()]) == (await h.len()) == len(kvs)
+
     # Test that when a hamt has its root manually initialized by a user, that the key count is accurate
     # We can only get the root node id here since hamt is in read mode and thus the in memory tree has been entirely flushed
-    new_hamt = await HAMT.build(store=store, root_node_id=hamt.root_node_id)
-    assert len([key async for key in new_hamt.keys()]) == (await new_hamt.len()) == len(kvs)
+    new_hamt = await HAMT.build(store=store, root_node_id=hamt.root_node_id, read_only=True)
+    await verify_kvs_and_len(new_hamt)
+
+    # Test a hamt with too small of a read cache
+    hamt_no_read_cache = await HAMT.build(store=store, root_node_id=hamt.root_node_id, read_only=True, read_cache_limit=0)
+    await verify_kvs_and_len(hamt_no_read_cache)
+
+    hamt_no_memory_tree = await HAMT.build(store=store, root_node_id=hamt.root_node_id, inmemory_tree_limit = 0)
+    await verify_kvs_and_len(hamt_no_memory_tree)
 
 key_bytes_list = st.lists(
     st.tuples(st.text(), st.binary()),
@@ -112,7 +126,13 @@ async def test_values_are_bytes(kvs: list[tuple[str, bytes]]):
     await asyncio.gather(*[hamt.delete(k) for k, _ in kvs]) # delete everything
     assert len([key async for key in hamt.keys()]) == (await hamt.len()) == 0
 
-# # Mostly for complete code coverage's sake
+@pytest.mark.asyncio
+async def test_invalid_node():
+    memory_store = DictStore()
+    with pytest.raises(Exception, match="Invalid dag-cbor encoded data from the store was attempted to be decoded"):
+        Node.deserialize(bytes())
+
+
 # def test_remaining_exceptions():
 #     memory_store = DictStore()
 #     with pytest.raises(Exception, match="ID not found in store"):
