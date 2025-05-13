@@ -12,6 +12,9 @@ import aiohttp
 type CodecInput = Literal["raw", "dag-cbor"]
 
 
+# TODO add Store documentation note about not supporting Stores that use null as a valid ID, since the HAMT uses this as a way to indicate null for its root node in its constructor
+
+
 class Store(ABC):
     """Abstract class that represents a storage mechanism the HAMT can use for keeping data.
 
@@ -50,8 +53,8 @@ class DictStore(Store):
     async def load(self, id: bytes) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
         if id in self.store:
             return self.store[id]
-        else:
-            raise Exception("ID not found in store")
+
+        raise KeyError
 
 
 class IPFSStore(Store):
@@ -102,8 +105,9 @@ class IPFSStore(Store):
                 base_url=IPFSStore.KUBO_DEFAULT_LOCAL_RPC_BASE_URL
             )
 
-        async with self.rpc_session.request(
-            method="POST", url=self.rpc_url, data={"file": io.BytesIO(data)}
+        async with self.rpc_session.post(
+            url=self.rpc_url,
+            data={"file": io.BytesIO(data)},
         ) as response:
             response.raise_for_status()
             json_bytes = await response.read()
@@ -124,8 +128,16 @@ class IPFSStore(Store):
                 base_url=IPFSStore.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
             )
 
-        async with self.gateway_session.request(
-            method="GET", url=f"/ipfs/{str(id)}"
-        ) as response:
+        async with self.gateway_session.get(url=f"/ipfs/{str(id)}") as response:
             response.raise_for_status()
             return await response.read()
+
+    async def close_sessions(self):
+        # TODO write about no-oping when sessions are closed but they either don't exist or were already closed
+        if self.rpc_session is not None:
+            await self.rpc_session.close()
+            self.rpc_session = None
+
+        if self.gateway_session is not None:
+            await self.gateway_session.close()
+            self.gateway_session = None
