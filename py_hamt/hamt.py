@@ -3,6 +3,7 @@ from typing import Callable, Iterator, AsyncIterator
 import uuid
 from random import shuffle
 import asyncio
+from copy import deepcopy
 
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
@@ -95,6 +96,11 @@ class Node:
             if link == old_link:
                 self.set_link(link_index, new_link)
                 return
+
+    def __deepcopy__(self, memo) -> "Node":
+        new_node = Node()
+        new_node.data = deepcopy(self.data)
+        return new_node
 
     def is_empty(self) -> bool:
         for i in range(len(self.data)):
@@ -193,12 +199,21 @@ class InMemoryTreeStore(NodeStore):
             if self.is_buffer_id(link):
                 yield link  # type: ignore we know for sure this is an int if it's a buffer id
 
+    _replaced_id_marker = bytes(64)
+
     # Callers must acquire a lock/stop operations to ensure an accurate calculation!
     def size(self) -> int:
+        # This is more difficult than normal links are intentionally unencodable in dag-cbor as the UUIDv4 128-bit integer IDs do not fit
+        # So before serializing, make a copy of the node, replace all of those integer links with zeroed out 64 byte marker which should be close to most IDs returned by backing stores
         total = 0
         for k in self.buffer:
             node = self.buffer[k]
-            total += len(node.serialize())
+            copied = deepcopy(node)
+            for link_index in copied.iter_link_indices():
+                if self.is_buffer_id(copied.get_link(link_index)):
+                    copied.set_link(link_index, InMemoryTreeStore._replaced_id_marker)
+            total += len(copied.serialize())
+
         return total
 
     # The HAMT must properly acquire a lock for this to run successfully! This is not async or thread safe
@@ -344,6 +359,20 @@ class HAMT:
             # The read cache has no writes that need to be sent upstream so we can remove it without vacating
             self.read_only = False
             self.node_store = InMemoryTreeStore(self)
+
+    # TODO specify in documentation that this is async concurrency safe
+    async def cache_size(self) -> int:
+        if self.read_only:
+            return self.node_store.size()
+        async with self.lock:
+            return self.node_store.size()
+
+    # TODO documentation
+    async def cache_vacate(self):
+        if self.read_only:
+            await self.node_store.vacate()
+        async with self.lock:
+            await self.node_store.vacate()
 
     async def _reserialize_and_link(self, node_stack: list[tuple[IPLDKind, Node]]):
         """

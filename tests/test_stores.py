@@ -9,12 +9,14 @@ from py_hamt import IPFSStore
 from py_hamt.store import DictStore
 from testing_utils import ipld_strategy, create_ipfs  # noqa
 
+
 # Just to cover this one case that isn't covered within test_hamt
 @pytest.mark.asyncio
 async def test_memory_store_exception():
     s = DictStore()
     with pytest.raises(KeyError):
         await s.load(bytes())
+
 
 @pytest.mark.asyncio
 @given(data=ipld_strategy())
@@ -46,7 +48,6 @@ async def test_ipfsstore_default_urls(data: IPLDKind):
     finally:
         await ipfsstore.close_sessions()
         await ipfsstore.close_sessions()
-
 
 
 @pytest.mark.asyncio

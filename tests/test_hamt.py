@@ -104,13 +104,12 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     ):
         await new_hamt.node_store.save(bytes(), Node())
 
-    hamt_no_memory_tree = await HAMT.build(
-        store=store, root_node_id=hamt.root_node_id, inmemory_tree_limit=0
-    )
-    await verify_kvs_and_len(hamt_no_memory_tree)
-
-    # TODO
     # None of the keys should be in a new hamt using the same store but with a fresh root node
+    empty_hamt = await HAMT.build(store=store)
+    for k, _ in kvs:
+        with pytest.raises(KeyError):
+            await empty_hamt.get(k)
+        assert len([key async for key in empty_hamt.keys()]) == (await empty_hamt.len()) == 0
 
     # invalid bucket size
     with pytest.raises(
@@ -119,30 +118,31 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
         await HAMT.build(store=store, max_bucket_size=-1)
 
 
-# The code branches for flushing children of children of the root node rarely run in test_fuzz, this forces them to run and rigorously
-# Use st.binary for the values, otherwise hypothesis will take too long to run
-@pytest.mark.asyncio
-@settings(suppress_health_check=[HealthCheck.data_too_large])
-@given(
-    st.lists(
-        st.binary(),  # just do bytes for faster test case generation in hypothesis
-        min_size=100,  # test with a large number of elements to force children
-        max_size=100000,
-    )
-)
-async def test_tree_flushing_children(vs: list[bytes]):
-    store = DictStore()
-    hamt = await HAMT.build(
-        store=store,
-        inmemory_tree_limit=100000,
-        max_bucket_size=1,
-        values_are_bytes=True,
-    )
-    await asyncio.gather(*[hamt.set(str(k_int), vs[k_int]) for k_int in range(len(vs))])
-    for k_int in range(len(vs)):
-        k = str(k_int)
-        v = vs[k_int]
+    # Cache size management code branches coverage, do it all in async concurrency
+
+    small_cache_size_bytes = 1000
+    # Read cache
+    read_hamt = await HAMT.build(store=store, root_node_id=hamt.root_node_id)
+    async def get_and_vacate(k,v):
         assert (await hamt.get(k)) == v
+        if (await hamt.cache_size()) > small_cache_size_bytes:
+            await hamt.cache_vacate()
+            assert (await hamt.cache_size()) == 0
+
+    await asyncio.gather(*[get_and_vacate(k,v) for k,v in kvs])
+
+    # In memory tree while writing
+    # set small max bucket size to force more linking and more nodes
+    small_memory_tree = await HAMT.build(store=store, max_bucket_size=1)
+    async def set_and_vacate(k,v):
+        await small_memory_tree.set(k, v)
+        assert (await small_memory_tree.get(k)) == v
+        if (await small_memory_tree.cache_size()) > small_cache_size_bytes:
+            await small_memory_tree.cache_vacate()
+            assert (await small_memory_tree.cache_size()) == 0
+        assert (await small_memory_tree.get(k)) == v
+
+    await asyncio.gather(*[set_and_vacate(k,v) for k,v in kvs])
 
 
 @pytest.mark.asyncio
