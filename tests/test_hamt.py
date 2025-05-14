@@ -1,11 +1,9 @@
 import asyncio
 import random
-from collections.abc import MutableMapping
 
-import dag_cbor
 from dag_cbor import IPLDKind
 from multiformats import CID
-from hypothesis import given
+from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
 import pytest
 
@@ -14,11 +12,12 @@ from py_hamt.hamt import Node
 
 from testing_utils import key_value_list
 
+
 @pytest.mark.asyncio
 @given(key_value_list)
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
-# async def test_fuzz():
-#     kvs=[('', None), ('0', None)]
+    # async def test_fuzz():
+    #     kvs=[('', None), ('0', None)]
     store = DictStore()
     hamt = await HAMT.build(store=store)
 
@@ -29,7 +28,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
         assert (await hamt.get(key)) == value
 
     assert len([key async for key in hamt.keys()]) == (await hamt.len()) == len(kvs)
-    await asyncio.gather(*[hamt.delete(k) for k, _ in kvs]) # delete everything
+    await asyncio.gather(*[hamt.delete(k) for k, _ in kvs])  # delete everything
     assert len([key async for key in hamt.keys()]) == (await hamt.len()) == 0
 
     # Set entirely concurrently thus with unpredictable order
@@ -52,7 +51,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     # Re insert all items but now with a bucket size that forces linking, which actually runs the link following code branches, otherwise we would miss 100% code coverage
     hamt.max_bucket_size = 1
     await asyncio.gather(*[hamt.set(k, v) for k, v in kvs])
-    await hamt.make_read_only() # cover code branch in keys() that does not need to acquire lock for read only mode
+    await hamt.make_read_only()  # cover code branch in keys() that does not need to acquire lock for read only mode
     assert len([key async for key in hamt.keys()]) == (await hamt.len()) == len(kvs)
     await hamt.enable_write()
 
@@ -75,9 +74,9 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     assert hamt_key_set == keys_set
 
     # Make sure all pointers actually exist in the store, this should not raise any exceptions
-    for k,_ in kvs:
+    for k, _ in kvs:
         # Callers must handle acquiring a lock themselves, so do these entirely sequentially
-        pointer: bytes = await hamt._get_pointer(k) # type: ignore we know that DictStore only returns bytes for its Link type
+        pointer: bytes = await hamt._get_pointer(k)  # type: ignore we know that DictStore only returns bytes for its Link type
         await store.load(pointer)
 
     await hamt.make_read_only()
@@ -87,118 +86,130 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
         await hamt.delete("foo")
 
     async def verify_kvs_and_len(h: HAMT):
-        for k,v in kvs:
+        for k, v in kvs:
             assert (await h.get(k)) == v
         assert len([key async for key in h.keys()]) == (await h.len()) == len(kvs)
 
     # Test that when a hamt has its root manually initialized by a user, that the key count is accurate
     # We can only get the root node id here since hamt is in read mode and thus the in memory tree has been entirely flushed
-    new_hamt = await HAMT.build(store=store, root_node_id=hamt.root_node_id, read_only=True)
+    new_hamt = await HAMT.build(
+        store=store, root_node_id=hamt.root_node_id, read_only=True
+    )
     await verify_kvs_and_len(new_hamt)
 
-    # Test a hamt with too small of a read cache
-    hamt_no_read_cache = await HAMT.build(store=store, root_node_id=hamt.root_node_id, read_only=True, read_cache_limit=0)
-    await verify_kvs_and_len(hamt_no_read_cache)
+    # Most for code coverage's sake
+    with pytest.raises(
+        Exception,
+        match="Save called in virtual store ReadCacheStore, only supposed to be used for reading",
+    ):
+        await new_hamt.node_store.save(bytes(), Node())
 
-    hamt_no_memory_tree = await HAMT.build(store=store, root_node_id=hamt.root_node_id, inmemory_tree_limit = 0)
+    hamt_no_memory_tree = await HAMT.build(
+        store=store, root_node_id=hamt.root_node_id, inmemory_tree_limit=0
+    )
     await verify_kvs_and_len(hamt_no_memory_tree)
 
-key_bytes_list = st.lists(
-    st.tuples(st.text(), st.binary()),
-    min_size=0,
-    max_size=10000,
-    unique_by=lambda x: x[
-        0
-    ],  # ensure unique keys, otherwise we can't do the length and size checks when using these KVs for the HAMT
+    # TODO
+    # None of the keys should be in a new hamt using the same store but with a fresh root node
+
+    # invalid bucket size
+    with pytest.raises(
+        ValueError, match="Bucket size maximum must be a positive integer"
+    ):
+        await HAMT.build(store=store, max_bucket_size=-1)
+
+
+# The code branches for flushing children of children of the root node rarely run in test_fuzz, this forces them to run and rigorously
+# Use st.binary for the values, otherwise hypothesis will take too long to run
+@pytest.mark.asyncio
+@settings(suppress_health_check=[HealthCheck.data_too_large])
+@given(
+    st.lists(
+        st.binary(),  # just do bytes for faster test case generation in hypothesis
+        min_size=100,  # test with a large number of elements to force children
+        max_size=100000,
+    )
 )
+async def test_tree_flushing_children(vs: list[bytes]):
+    store = DictStore()
+    hamt = await HAMT.build(
+        store=store,
+        inmemory_tree_limit=100000,
+        max_bucket_size=1,
+        values_are_bytes=True,
+    )
+    await asyncio.gather(*[hamt.set(str(k_int), vs[k_int]) for k_int in range(len(vs))])
+    for k_int in range(len(vs)):
+        k = str(k_int)
+        v = vs[k_int]
+        assert (await hamt.get(k)) == v
+
 
 @pytest.mark.asyncio
-@given(kvs=key_bytes_list)
+# This is a list of keys to arbitrary bytes
+@given(
+    kvs=st.lists(
+        st.tuples(st.text(), st.binary()),
+        min_size=0,
+        max_size=10000,
+        unique_by=lambda x: x[
+            0
+        ],  # ensure unique keys, otherwise we can't do the length and size checks when using these KVs for the HAMT
+    )
+)
 async def test_values_are_bytes(kvs: list[tuple[str, bytes]]):
     store = DictStore()
     hamt = await HAMT.build(store=store, values_are_bytes=True)
 
     await asyncio.gather(*[hamt.set(k, v) for k, v in kvs])
-    for k,v in kvs:
+    for k, v in kvs:
         value = await hamt.get(k)
         assert value == v
     assert len([key async for key in hamt.keys()]) == (await hamt.len()) == len(kvs)
-    await asyncio.gather(*[hamt.delete(k) for k, _ in kvs]) # delete everything
+    await asyncio.gather(*[hamt.delete(k) for k, _ in kvs])  # delete everything
     assert len([key async for key in hamt.keys()]) == (await hamt.len()) == 0
+
 
 @pytest.mark.asyncio
 async def test_invalid_node():
-    memory_store = DictStore()
-    with pytest.raises(Exception, match="Invalid dag-cbor encoded data from the store was attempted to be decoded"):
+    with pytest.raises(
+        Exception,
+        match="Invalid dag-cbor encoded data from the store was attempted to be decoded",
+    ):
         Node.deserialize(bytes())
 
 
-# def test_remaining_exceptions():
-#     memory_store = DictStore()
-#     with pytest.raises(Exception, match="ID not found in store"):
-#         memory_store.load(b"foo")
+@pytest.mark.asyncio
+async def test_key_rewrite():
+    hamt = await HAMT.build(store=DictStore())
+    await hamt.set("foo", b"bar")
+    assert b"bar" == await hamt.get("foo")
+    assert (await hamt.len()) == 1
 
-#     with pytest.raises(ValueError, match="Data not a valid Node serialization"):
-#         bad_serialization = dag_cbor.encode([])
-#         Node.deserialize(bad_serialization)
+    await hamt.set("foo", bytes("something else", "utf-8"))
+    assert (await hamt.len()) == 1
+    assert b"something else" == (await hamt.get("foo"))
 
-#     hamt = HAMT(
-#         store=memory_store,
-#     )
-#     root_node = Node.deserialize(memory_store.load(hamt.root_node_id))  # type: ignore
-#     buckets = root_node.get_buckets()
-#     links = root_node.get_links()
-#     # 4 is the map key for the string "foo"
-#     buckets["4"] = []
-#     links["4"] = b"bar"
-#     bad_node_id = memory_store.save(root_node.serialize())
-#     bad_hamt = HAMT(store=memory_store, root_node_id=bad_node_id)
-
-#     with pytest.raises(
-#         Exception,
-#         match="Key in both buckets and links of the node, invariant violated",
-#     ):
-#         bad_hamt["foo"] = b"bar2"
-
-#     with pytest.raises(
-#         Exception,
-#         match="Key in both buckets and links of the node, invariant violated",
-#     ):
-#         del bad_hamt["foo"]
+    await hamt.set("foo", CID("base32", 1, "dag-cbor", ("blake3", bytes(32))))
+    assert (await hamt.len()) == 1
 
 
-# def test_key_rewrite():
-#     hamt = HAMT(store=DictStore())
-#     hamt["foo"] = b"bar"
-#     assert b"bar" == hamt["foo"]
-#     assert len(hamt) == 1
-
-#     hamt["foo"] = bytes("something else", "utf-8")
-#     assert len(hamt) == 1
-#     assert b"something else" == hamt["foo"]
-
-#     hamt["foo"] = CID("base32", 1, "dag-cbor", ("blake3", bytes(32)))
-#     assert len(hamt) == 1
-
-
-# async def test_cache_clear():
-#     hamt = await HAMT.build(store=DictStore(), read_cache_limit=10000)
-#     await asyncio.gather(*[hamt.set(str(key_int), key_int) for key_int in range(50)])
+# Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
+@pytest.mark.asyncio
+async def test_link_following():
+    hamt = await HAMT.build(store=DictStore())
+    hamt.max_bucket_size = 1
+    # The first byte of the blake3 hash of each of these is the same, 10110011
+    kvs = [(str(5), b""), (str(15), b""), (str(123), b"")]
+    for k, v in kvs:
+        await hamt.set(k, v)
+    assert (await hamt.len()) == 3
+    for k, _ in kvs:
+        await hamt.delete(k)
+    assert (await hamt.len()) == 0
 
 
-# # Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
-# async def test_link_following():
-#     hamt = await HAMT.build(store=DictStore())
-#     hamt.max_bucket_size = 1
-#     # The first byte of the blake3 hash of each of these is the same, 10110011
-#     kvs = [(str(5), b""), (str(15), b""), (str(123), b"")]
-#     for k, v in kvs:
-#         await hamt.set(k, v)
-#     assert (await hamt.len()) == 3
-#     for k, _ in kvs:
-#         await hamt.delete(k)
-#     assert (await hamt.len()) == 0
-
+# The below 2 commented out tests are from HAMT version 2, if using keep in mind to update them with the new API (and adjust this comment accordingly)
 
 # Run this with varying cache sizes to see the impact on performance of the cache when using IPFSStore()
 # Commented out since this increases test time a lot

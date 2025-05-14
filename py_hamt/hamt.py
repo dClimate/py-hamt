@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
-from sys import getsizeof
-from typing import Callable, Iterator, AsyncIterator, Literal
+from typing import Callable, Iterator, AsyncIterator
 import uuid
 from random import shuffle
 import asyncio
@@ -55,10 +54,13 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
     raw_bytes = b3.unwrap(digest)
     return raw_bytes
 
+
 class Node:
     """
+    TODO
     The Node class encapsulates
     """
+
     def __init__(self):
         self.data: list[IPLDKind] = [dict() for _ in range(0, 256)]
         # empty dicts represent empty buckets, lists with one element are links, with the internal element being a link
@@ -115,7 +117,7 @@ class Node:
 
         # Don't do any further checks for speed purposes
         node = cls()
-        node.data = decoded_data # type: ignore
+        node.data = decoded_data  # type: ignore
         return node
 
 
@@ -129,18 +131,20 @@ class NodeStore(ABC):
     async def load(self, id: IPLDKind) -> Node:
         """Load nodes from the store"""
 
+    @abstractmethod
+    def size(self) -> int:
+        """Calculate the size of all internal Nodes in memory. Should not include the overhead in python of the dict or all the keys, which will be negligible compared to the Node sizes."""
+
+    # Async because the in memory tree has async calls
+    @abstractmethod
+    async def vacate(self):
+        """Remove everything from the cache."""
+
 
 class ReadCacheStore(NodeStore):
     def __init__(self, hamt: "HAMT"):
         self.hamt = hamt
         self.cache: dict[IPLDKind, Node] = dict()
-
-    def cache_eviction_lru(self):
-        while getsizeof(self.cache) > self.hamt.read_cache_limit:
-            if len(self.cache) == 0:
-                return
-            stalest_node_id = next(iter(self.cache.keys()))
-            del self.cache[stalest_node_id]
 
     async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
         raise Exception(
@@ -160,8 +164,17 @@ class ReadCacheStore(NodeStore):
         # Cache Miss
         node = Node.deserialize(await self.hamt.store.load(id))
         self.cache[id] = node
-        self.cache_eviction_lru()
         return node
+
+    def size(self):
+        total = 0
+        for k in self.cache:
+            node = self.cache[k]
+            total += len(node.serialize())
+        return total
+
+    async def vacate(self):
+        self.cache = dict()
 
 
 class InMemoryTreeStore(NodeStore):
@@ -185,86 +198,63 @@ class InMemoryTreeStore(NodeStore):
             return True
         return False
 
-    def needs_flushing(self) -> bool:
-        return getsizeof(self.buffer) > self.hamt.inmemory_tree_limit
+    # Callers must acquire a lock/stop operations to ensure an accurate calculation!
+    def size(self) -> int:
+        total = 0
+        for k in self.buffer:
+            node = self.buffer[k]
+            total += len(node.serialize())
+        return total
 
-    async def flush_buffer(self, flush_everything: bool = False):
-        if not (self.needs_flushing() or flush_everything):
-            return
-
-        if len(self.buffer) == 0:
-            return
-
-        # Start by removing completely empty nodes, which will be unreferenced by other nodes but will still be inside the buffer since this in memory tree assigns unique IDs to every node, unlike a normal content-addressed system which would have consolidated all the empty nodes
-        empty_node_buffer_ids: list[
-            int
-        ] = []  # we can't modify a dictionary while iterating so do the deletion in a separate step
-        for buffer_id in self.buffer:
-            # Just don't delete an empty root node
-            if buffer_id == self.hamt.root_node_id:
-                continue
-            node = self.buffer[buffer_id]
-            if node.is_empty():
-                empty_node_buffer_ids.append(buffer_id)
-
-        for buffer_id in empty_node_buffer_ids:
-            del self.buffer[buffer_id]
-
-        # The root node may not be in the buffer, e.g. this is freshly created
+    # The HAMT must properly acquire a lock for this to run successfully! This is not async or thread safe
+    # This algorithm has an implicit assumption that the entire continuous line of branches up to an ancestor is in the memory buffer, which will happen because of the DFS style traversal in all HAMT operations
+    async def vacate(self):
+        # node stack is a list of tuples that look like (parent_id, self_id, node)
+        node_stack: list[tuple[int | None, int, Node]] = []
+        # The root node may not be in the buffer, e.g. this is HAMT initialized with a specific root node id
         if self.is_buffer_id(self.hamt.root_node_id):
-            # Start with the root node's children, which should always be in the in memory buffer if there's anything there
-            # there is an implicit assumption that the entire continuous line of branches up to an ancestor in the memory buffer, which will happen because of the DFS style traversal in all HAMT operations
-            # node stack is a list of tuples that look like (parent_id, self_id, node)
-            node_stack: list[tuple[int, int, Node]] = []
             root_node: Node = self.buffer[self.hamt.root_node_id]  # type: ignore
-            for child_buffer_id in self.children_in_memory(root_node):
+            node_stack.append((None, self.hamt.root_node_id, root_node))  # type: ignore
+
+        while len(node_stack) > 0:
+            parent_buffer_id, top_buffer_id, top_node = node_stack[-1]
+            new_nodes_on_stack = []
+            for child_buffer_id in self.children_in_memory(top_node):
                 child_node = self.buffer[child_buffer_id]
-                node_stack.append((self.hamt.root_node_id, child_buffer_id, child_node))  # type: ignore
+                new_nodes_on_stack.append((top_buffer_id, child_buffer_id, child_node))
 
-            shuffle(node_stack)  # avoid always recursing down the rightmost branch
+            no_children_in_memory = len(new_nodes_on_stack) == 0
+            # We can flush this node out and relink as necessary
+            if no_children_in_memory:
+                # We can flush this one completely since it has no children in memory
+                is_root = parent_buffer_id is None
+                old_id = top_buffer_id
+                new_id = await self.hamt.store.save(
+                    top_node.serialize(), codec="dag-cbor"
+                )
+                del self.buffer[old_id]
+                node_stack.pop()
 
-            while len(node_stack) > 0 and (self.needs_flushing() or flush_everything):
-                parent_buffer_id, top_buffer_id, top_node = node_stack[-1]
-                new_nodes_on_stack = []
-                if self.has_children_in_memory(top_node):
-                    for child_buffer_id in self.children_in_memory(top_node):
-                        child_node = self.buffer[child_buffer_id]
-                        new_nodes_on_stack.append(
-                            (top_buffer_id, child_buffer_id, child_node)
-                        )
-
-                    shuffle(
-                        new_nodes_on_stack
-                    )  # avoid always recursing down the rightmost branch
-                    node_stack.extend(new_nodes_on_stack)
+                # If it's the root, we need to set the hamt's root node id once this is done sending to the backing store
+                if is_root:
+                    self.hamt.root_node_id = new_id
+                # Edit the parent if this is not the root
                 else:
-                    # We can flush this one completely since it has no children in memory, we'll just have to edit its parent after serializing it
-                    old_id = top_buffer_id
-                    new_id = await self.hamt.store.save(
-                        top_node.serialize(), codec="dag-cbor"
-                    )
                     parent_node = self.buffer[parent_buffer_id]
                     parent_node.replace_link(old_id, new_id)
+            # Continue recursing down the tree
+            else:
+                shuffle(
+                    new_nodes_on_stack
+                )  # avoids always recursing down the rightmost branch
 
-                    del self.buffer[top_buffer_id]
-                    node_stack.pop()
+                node_stack.extend(new_nodes_on_stack)
 
-        # Flush out the root node before we do everything else as well
-        if (self.needs_flushing() or flush_everything) and self.is_buffer_id(self.hamt.root_node_id):
-            root_node: Node = self.buffer[self.hamt.root_node_id]  # type: ignore
-            del self.buffer[self.hamt.root_node_id]  # type: ignore
-            self.hamt.root_node_id = await self.hamt.store.save(
-                root_node.serialize(), codec="dag-cbor"
-            )
-
-        # If the in memory tree is used for only read purposes, then we will have a bunch of nodes that seem "unlinked" to anything else, since Links used within the Nodes will reference the real underlying store
-        # For this case, just clear everything, nothing inside is linked to anything else anyhow
-        if self.needs_flushing() or flush_everything:
-            self.buffer = dict()
-            assert not self.is_buffer_id(self.hamt.root_node_id)
-
-        if flush_everything:
-            assert len(self.buffer) == 0
+        # There are only two types of nodes left in the buffer:
+        # 1. A bunch of nodes that seem "unlinked" to anything else, since Links used within the Nodes will reference the real underlying store
+        # 2. A bunch of empty nodes leftover if the key values they contain are deleted, these would normally be consolidated by a content addressed system but will be remaining here
+        # We can ignore those when clearing out everything else, nothing inside is linked to anything else anyhow
+        self.buffer = dict()
 
     async def add_to_buffer(self, node: Node) -> IPLDKind:
         # This is IPLDKind type, but not dag_cbor serializable due to int limits so this will throw errors early if the tree is written with the buffer_ids still in there
@@ -316,7 +306,7 @@ class HAMT:
         max_bucket_size: int = 4,
         inmemory_tree_limit: int = 10_000_000,  # 10 MB default
         read_cache_limit: int = 10_000_000,  # 10 MB default
-        values_are_bytes: bool = False
+        values_are_bytes: bool = False,
     ):
         self.store = store
         self.hash_fn = hash_fn
@@ -328,10 +318,7 @@ class HAMT:
             raise ValueError("Bucket size maximum must be a positive integer")
         self.max_bucket_size = max_bucket_size
 
-        # TODO add documentation about buffer limit and cache limit minimums and how if they are set to a really low limit they'll effectively constantly flush
-
-        self.inmemory_tree_limit = inmemory_tree_limit
-        self.read_cache_limit = read_cache_limit
+        # TODO add documentation about how to manage cache memories increasing
 
         self.root_node_id = root_node_id
 
@@ -351,15 +338,15 @@ class HAMT:
     # This is typically a massive blocking operation, you dont want to be running this concurrently with a bunch of other operations, so it's ok to have it not be async
     async def make_read_only(self):
         async with self.lock:
-            self.read_only = True
-
             inmemory_tree: InMemoryTreeStore = self.node_store  # type: ignore
-            await inmemory_tree.flush_buffer(flush_everything=True)
+            await inmemory_tree.vacate()
 
+            self.read_only = True
             self.node_store = ReadCacheStore(self)
 
     async def enable_write(self):
         async with self.lock:
+            # The read cache has no writes that need to be sent upstream so we can remove it without vacating
             self.read_only = False
             self.node_store = InMemoryTreeStore(self)
 
@@ -462,9 +449,6 @@ class HAMT:
             # Finally, reserialize and fix all links, deleting empty nodes as needed
             await self._reserialize_and_link(node_stack)
             self.root_node_id = node_stack[0][0]
-            # This needs to be called after the root node is set from the node stack, since this may change the root node if the memory buffer is too small to hold the root node
-            if isinstance(self.node_store, InMemoryTreeStore):
-                await self.node_store.flush_buffer()
 
     async def delete(self, key: str):
         # Also deletes the pointer at the same time so this doesn't have a _delete_pointer duo
@@ -500,9 +484,6 @@ class HAMT:
             if created_change:
                 await self._reserialize_and_link(node_stack)
                 self.root_node_id = node_stack[0][0]
-                # This needs to be called after the root node is set from the node stack, since this may change the root node if the memory buffer is too small to hold the root node
-                if isinstance(self.node_store, InMemoryTreeStore):
-                    await self.node_store.flush_buffer()
             else:
                 # If we didn't make a change, then this key must not exist within the HAMT
                 raise KeyError
@@ -555,9 +536,6 @@ class HAMT:
 
             # Nowhere left to go, stop walking down the tree
             break
-
-        if isinstance(self.node_store, InMemoryTreeStore):
-            await self.node_store.flush_buffer()
 
         if not found_a_result:
             raise KeyError
