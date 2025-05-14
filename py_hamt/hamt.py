@@ -193,11 +193,6 @@ class InMemoryTreeStore(NodeStore):
             if self.is_buffer_id(link):
                 yield link  # type: ignore we know for sure this is an int if it's a buffer id
 
-    def has_children_in_memory(self, node: Node) -> bool:
-        for _ in self.children_in_memory(node):
-            return True
-        return False
-
     # Callers must acquire a lock/stop operations to ensure an accurate calculation!
     def size(self) -> int:
         total = 0
