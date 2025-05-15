@@ -160,11 +160,7 @@ class ReadCacheStore(NodeStore):
     async def load(self, id: IPLDKind) -> Node:
         # Cache Hit
         if id in self.cache:
-            # Reinsert to put this key as the most recently used and last in the dict insertion order
             node = self.cache[id]
-            del self.cache[id]
-            self.cache[id] = node
-
             return node
 
         # Cache Miss
