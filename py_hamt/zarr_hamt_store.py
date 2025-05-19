@@ -10,7 +10,8 @@ class ZarrHAMTStore(zarr.abc.store.Store):
     """
     Write and read Zarr v3s with a HAMT.
 
-    TODO write about reinitializing if the hamt's read only mode changes to take advantage of performance, or if the separator has changed. Put some example code to show a sample usage of using xarray to put some into a HAMT
+    #### A note about using the same `ZarrHAMTStore` for writing and then reading again
+    If you write a Zarr to a HAMT, and then change it to read only mode, it's best to reinitialize a new ZarrHAMTStore with the proper read only setting. This is because this class, to err on the safe side, will not touch its super class's settings.
     """
 
     def __init__(self, hamt: HAMT, read_only: bool = False) -> None:
