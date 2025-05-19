@@ -276,6 +276,10 @@ class HAMT:
 
     Use this to store arbitrarily large key-value mappings in your CAS of choice.
 
+    For writing, this HAMT is async safe but NOT thread safe. Only write in an async event loop within the same thread.
+
+    When in read-only mode, the HAMT is both async and thread safe.
+
     #### A note about memory management, read/write and read-only modes
     The HAMT can be in either read/write mode or read-only mode. For either of these modes, the HAMT has some internal performance optimizations.
 
