@@ -143,7 +143,7 @@ async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):  # noqa
     assert previous_zarr_json is not None
     # Setting a metadata file that should always exist should not change anything
     await zhs.set_if_not_exists(
-        "zarr.json", np.array([b"a"], dtype=np.bytes_)
+        "zarr.json", np.array([b"a"], dtype=np.bytes_) # type: ignore
     )  # type: ignore np.arrays, if dtype is bytes, is usable as a zarr buffer
     zarr_json_now = await zhs.get(
         "zarr.json", zarr.core.buffer.default_buffer_prototype()
