@@ -16,7 +16,7 @@ from testing_utils import key_value_list
 @pytest.mark.asyncio
 @given(key_value_list)
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
-    cas= InMemoryCAS()
+    cas = InMemoryCAS()
     hamt = await HAMT.build(cas=cas)
 
     # Sequential setting and getting, while randomly changing the bucket size which the HAMT should be able to withstand
@@ -90,9 +90,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
 
     # Test that when a hamt has its root manually initialized by a user, that the key count is accurate
     # We can only get the root node id here since hamt is in read mode and thus the in memory tree has been entirely flushed
-    new_hamt = await HAMT.build(
-        cas=cas, root_node_id=hamt.root_node_id, read_only=True
-    )
+    new_hamt = await HAMT.build(cas=cas, root_node_id=hamt.root_node_id, read_only=True)
     await verify_kvs_and_len(new_hamt)
 
     # Most for code coverage's sake

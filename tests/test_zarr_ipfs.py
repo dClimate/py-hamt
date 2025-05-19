@@ -59,7 +59,7 @@ def random_zarr_dataset():
 # This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
 @pytest.mark.asyncio
 async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):  # noqa for fixture which is imported above but then "redefined"
-    rpc_base_url, gateway_base_url= create_ipfs
+    rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
     print("=== Writing this xarray Dataset to a Zarr v3 on IPFS ===")
     print(test_ds)
@@ -82,7 +82,9 @@ async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):  # noqa
     print(cid)
 
     print("=== Reading data back in and checking if identical")
-    hamt = await HAMT.build(cas=kubo_cas, root_node_id=cid, values_are_bytes=True, read_only=True)
+    hamt = await HAMT.build(
+        cas=kubo_cas, root_node_id=cid, values_are_bytes=True, read_only=True
+    )
     start = time.perf_counter()
     ipfs_ds: xr.Dataset
     zhs = ZarrHAMTStore(hamt, read_only=True)
@@ -133,9 +135,7 @@ async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):  # noqa
         await zhs.set_partial_values([])
 
     with pytest.raises(NotImplementedError):
-        await zhs.get_partial_values(
-            zarr.core.buffer.default_buffer_prototype(), []
-        )
+        await zhs.get_partial_values(zarr.core.buffer.default_buffer_prototype(), [])
 
     previous_zarr_json = await zhs.get(
         "zarr.json", zarr.core.buffer.default_buffer_prototype()
@@ -143,7 +143,8 @@ async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):  # noqa
     assert previous_zarr_json is not None
     # Setting a metadata file that should always exist should not change anything
     await zhs.set_if_not_exists(
-        "zarr.json", np.array([b"a"], dtype=np.bytes_) # type: ignore
+        "zarr.json",
+        np.array([b"a"], dtype=np.bytes_),  # type: ignore
     )  # type: ignore np.arrays, if dtype is bytes, is usable as a zarr buffer
     zarr_json_now = await zhs.get(
         "zarr.json", zarr.core.buffer.default_buffer_prototype()
@@ -153,9 +154,7 @@ async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):  # noqa
 
     # now remove that metadata file and then add it back
     await zhs.hamt.enable_write()
-    zhs = ZarrHAMTStore(
-        zhs.hamt, read_only=False
-    )  # make a writable version
+    zhs = ZarrHAMTStore(zhs.hamt, read_only=False)  # make a writable version
     await zhs.delete("zarr.json")
     # doing a duplicate delete should not result in an error
     await zhs.delete("zarr.json")

@@ -36,7 +36,11 @@ async def test_kubo_cas(create_ipfs, data: IPLDKind):  # noqa
     rpc_base_url, gateway_base_url = create_ipfs
 
     # Provide our own requests Session, for complete code coverage
-    kubo_cas = KuboCAS(rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url, requests_session=requests.Session())
+    kubo_cas = KuboCAS(
+        rpc_base_url=rpc_base_url,
+        gateway_base_url=gateway_base_url,
+        requests_session=requests.Session(),
+    )
 
     for codec in ["raw", "dag-cbor"]:
         cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)  # type: ignore
