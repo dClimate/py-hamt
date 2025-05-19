@@ -121,11 +121,11 @@ class Node:
 class NodeStore(ABC):
     @abstractmethod
     async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
-        pass
+        """"""
 
     @abstractmethod
     async def load(self, id: IPLDKind) -> Node:
-        pass
+        """"""
 
     @abstractmethod
     def size(self) -> int:
