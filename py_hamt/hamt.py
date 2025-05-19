@@ -314,17 +314,20 @@ class HAMT:
         read_cache_limit: int = 10_000_000,  # 10 MB default
         values_are_bytes: bool = False,
     ):
+        # TODO add documentation about how to manage cache memories increasing
+        # TODO add notice about calling build if needing to initialize a completely empty HAMT
+        # rename store to cas to point out the Content Addressed Store nature of it
         self.store = store
         self.hash_fn = hash_fn
         self.lock = asyncio.Lock()
         self.read_only = read_only
         self.values_are_bytes = values_are_bytes
+        # TODO Say that values are bytes are safe to change in between operations, so put a hypothetical example of toggling it when its in read only mode and back in write for a completely safe toggle.
+        self.total = 0
 
         if max_bucket_size < 1:
             raise ValueError("Bucket size maximum must be a positive integer")
         self.max_bucket_size = max_bucket_size
-
-        # TODO add documentation about how to manage cache memories increasing
 
         self.root_node_id = root_node_id
 
@@ -336,6 +339,7 @@ class HAMT:
 
     @classmethod
     async def build(cls, *args, **kwargs) -> "HAMT":
+        # TODO add notice about referring to the init but this is what needs to actually get called, if you are initializing a completely new empty HAMT
         hamt = cls(*args, **kwargs)
         if hamt.root_node_id is None:
             hamt.root_node_id = await hamt.node_store.save(None, Node())
@@ -414,6 +418,7 @@ class HAMT:
         if self.read_only:
             raise Exception("Cannot call set on a read only HAMT")
 
+        # print(f"setting {key}")
         data: bytes
         if self.values_are_bytes:
             data = val  # type: ignore let users get an exception if they pass in a non bytes when they want to skip encoding
@@ -421,7 +426,11 @@ class HAMT:
             data = dag_cbor.encode(val)
 
         pointer = await self.store.save(data, codec="raw")
+        start = time.perf_counter()
         await self._set_pointer(key, pointer)
+        end = time.perf_counter()
+        elapsed = end - start
+        self.total += elapsed
 
     async def _set_pointer(self, key: str, val_ptr: IPLDKind):
         async with self.lock:
@@ -511,12 +520,18 @@ class HAMT:
     # TODO document option to skip decode if the user knows that the value inside is also going to be a bytes object
     async def get(self, key: str) -> IPLDKind:
         # If read only, no need to acquire a lock
+        start = time.perf_counter()
         pointer: IPLDKind
         if self.read_only:
             pointer = await self._get_pointer(key)
         else:
             async with self.lock:
                 pointer = await self._get_pointer(key)
+        end = time.perf_counter()
+        elapsed = end - start
+        self.total += elapsed
+
+        # print(f"getting {key}")
 
         data = await self.store.load(pointer)
         if self.values_are_bytes:
@@ -575,7 +590,8 @@ class HAMT:
         """
         AsyncIterator returning all keys in the HAMT.
 
-        When the HAMT is write enabled, to maintain strong consistency this will obtain a lock and not a llow any other operations to proceed. For example, if you are inside of a for loop using this iterator, you cannot also get a value at the same time until iteration is completely done. If you try to get in fact, you will run into deadlock.
+        TODO clean up this paragraph's language
+        When the HAMT is write enabled, to maintain strong consistency this will obtain a lock and not a llow any other operations to proceed. For example, if you are inside of a for loop using this iterator, you cannot also get a value at the same time until iteration is completely done. If you try you will run into deadlock.
 
         In read only mode however, this can be run concurrently with get operations.
         """
