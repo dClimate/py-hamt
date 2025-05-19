@@ -121,13 +121,13 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
 
     small_cache_size_bytes = 1000
     # Read cache
-    read_hamt = await HAMT.build(cas=cas, root_node_id=hamt.root_node_id)
+    read_hamt = await HAMT.build(cas=cas, root_node_id=hamt.root_node_id, read_only=True)
 
     async def get_and_vacate(k, v):
-        assert (await hamt.get(k)) == v
-        if (await hamt.cache_size()) > small_cache_size_bytes:
-            await hamt.cache_vacate()
-            assert (await hamt.cache_size()) == 0
+        assert (await read_hamt.get(k)) == v
+        if (await read_hamt.cache_size()) > small_cache_size_bytes:
+            await read_hamt.cache_vacate()
+            assert (await read_hamt.cache_size()) == 0
 
     await asyncio.gather(*[get_and_vacate(k, v) for k, v in kvs])
 
