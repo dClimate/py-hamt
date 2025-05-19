@@ -1,12 +1,11 @@
 from .hamt import HAMT, blake3_hashfn
-from .store import Store, DictStore, IPFSStore
-from .ipfszarr3 import IPFSZarr3
+from .store import ContentAddressedStore, KuboCAS
+from .zarr_hamt_store import ZarrHAMTStore
 
 __all__ = [
-    "HAMT",
     "blake3_hashfn",
-    "Store",
-    "DictStore",
-    "IPFSStore",
-    "IPFSZarr3",
+    "HAMT",
+    "ContentAddressedStore",
+    "KuboCAS",
+    "ZarrHAMTStore",
 ]
