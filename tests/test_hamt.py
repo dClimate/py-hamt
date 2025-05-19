@@ -121,7 +121,9 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
 
     small_cache_size_bytes = 1000
     # Read cache
-    read_hamt = await HAMT.build(cas=cas, root_node_id=hamt.root_node_id, read_only=True)
+    read_hamt = await HAMT.build(
+        cas=cas, root_node_id=hamt.root_node_id, read_only=True
+    )
 
     async def get_and_vacate(k, v):
         assert (await read_hamt.get(k)) == v
