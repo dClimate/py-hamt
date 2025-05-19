@@ -3,12 +3,12 @@ import random
 
 from dag_cbor import IPLDKind
 from multiformats import CID
-from hypothesis import given, settings, HealthCheck
+from hypothesis import given
 from hypothesis import strategies as st
 import pytest
 
-from py_hamt import HAMT, DictStore
-from py_hamt.hamt import Node
+from py_hamt.hamt import HAMT, Node
+from py_hamt.store import InMemoryCAS
 
 from testing_utils import key_value_list
 
@@ -16,10 +16,8 @@ from testing_utils import key_value_list
 @pytest.mark.asyncio
 @given(key_value_list)
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
-    # async def test_fuzz():
-    #     kvs=[('', None), ('0', None)]
-    store = DictStore()
-    hamt = await HAMT.build(store=store)
+    cas= InMemoryCAS()
+    hamt = await HAMT.build(cas=cas)
 
     # Sequential setting and getting, while randomly changing the bucket size which the HAMT should be able to withstand
     for key, value in kvs:
@@ -77,7 +75,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     for k, _ in kvs:
         # Callers must handle acquiring a lock themselves, so do these entirely sequentially
         pointer: bytes = await hamt._get_pointer(k)  # type: ignore we know that DictStore only returns bytes for its Link type
-        await store.load(pointer)
+        await cas.load(pointer)
 
     await hamt.make_read_only()
     with pytest.raises(Exception, match="Cannot call set on a read only HAMT"):
@@ -93,48 +91,53 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     # Test that when a hamt has its root manually initialized by a user, that the key count is accurate
     # We can only get the root node id here since hamt is in read mode and thus the in memory tree has been entirely flushed
     new_hamt = await HAMT.build(
-        store=store, root_node_id=hamt.root_node_id, read_only=True
+        cas=cas, root_node_id=hamt.root_node_id, read_only=True
     )
     await verify_kvs_and_len(new_hamt)
 
     # Most for code coverage's sake
     with pytest.raises(
         Exception,
-        match="Save called in virtual store ReadCacheStore, only supposed to be used for reading",
+        match="Node was attempted to be written to the read cache",
     ):
         await new_hamt.node_store.save(bytes(), Node())
 
     # None of the keys should be in a new hamt using the same store but with a fresh root node
-    empty_hamt = await HAMT.build(store=store)
+    empty_hamt = await HAMT.build(cas=cas)
     for k, _ in kvs:
         with pytest.raises(KeyError):
             await empty_hamt.get(k)
-        assert len([key async for key in empty_hamt.keys()]) == (await empty_hamt.len()) == 0
+        assert (
+            len([key async for key in empty_hamt.keys()])
+            == (await empty_hamt.len())
+            == 0
+        )
 
     # invalid bucket size
     with pytest.raises(
         ValueError, match="Bucket size maximum must be a positive integer"
     ):
-        await HAMT.build(store=store, max_bucket_size=-1)
-
+        await HAMT.build(cas=cas, max_bucket_size=-1)
 
     # Cache size management code branches coverage, do it all in async concurrency
 
     small_cache_size_bytes = 1000
     # Read cache
-    read_hamt = await HAMT.build(store=store, root_node_id=hamt.root_node_id)
-    async def get_and_vacate(k,v):
+    read_hamt = await HAMT.build(cas=cas, root_node_id=hamt.root_node_id)
+
+    async def get_and_vacate(k, v):
         assert (await hamt.get(k)) == v
         if (await hamt.cache_size()) > small_cache_size_bytes:
             await hamt.cache_vacate()
             assert (await hamt.cache_size()) == 0
 
-    await asyncio.gather(*[get_and_vacate(k,v) for k,v in kvs])
+    await asyncio.gather(*[get_and_vacate(k, v) for k, v in kvs])
 
     # In memory tree while writing
     # set small max bucket size to force more linking and more nodes
-    small_memory_tree = await HAMT.build(store=store, max_bucket_size=1)
-    async def set_and_vacate(k,v):
+    small_memory_tree = await HAMT.build(cas=cas, max_bucket_size=1)
+
+    async def set_and_vacate(k, v):
         await small_memory_tree.set(k, v)
         assert (await small_memory_tree.get(k)) == v
         if (await small_memory_tree.cache_size()) > small_cache_size_bytes:
@@ -142,7 +145,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
             assert (await small_memory_tree.cache_size()) == 0
         assert (await small_memory_tree.get(k)) == v
 
-    await asyncio.gather(*[set_and_vacate(k,v) for k,v in kvs])
+    await asyncio.gather(*[set_and_vacate(k, v) for k, v in kvs])
 
 
 @pytest.mark.asyncio
@@ -158,8 +161,8 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     )
 )
 async def test_values_are_bytes(kvs: list[tuple[str, bytes]]):
-    store = DictStore()
-    hamt = await HAMT.build(store=store, values_are_bytes=True)
+    cas = InMemoryCAS()
+    hamt = await HAMT.build(cas=cas, values_are_bytes=True)
 
     await asyncio.gather(*[hamt.set(k, v) for k, v in kvs])
     for k, v in kvs:
@@ -181,7 +184,7 @@ async def test_invalid_node():
 
 @pytest.mark.asyncio
 async def test_key_rewrite():
-    hamt = await HAMT.build(store=DictStore())
+    hamt = await HAMT.build(cas=InMemoryCAS())
     await hamt.set("foo", b"bar")
     assert b"bar" == await hamt.get("foo")
     assert (await hamt.len()) == 1
@@ -197,7 +200,7 @@ async def test_key_rewrite():
 # Test that is guaranteed to induce overfull buckets that then requires our hamt to follow deeper into the tree to do insertions
 @pytest.mark.asyncio
 async def test_link_following():
-    hamt = await HAMT.build(store=DictStore())
+    hamt = await HAMT.build(cas=InMemoryCAS())
     hamt.max_bucket_size = 1
     # The first byte of the blake3 hash of each of these is the same, 10110011
     kvs = [(str(5), b""), (str(15), b""), (str(123), b"")]
