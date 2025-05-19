@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Callable, Iterator, AsyncIterator
 import uuid
-from random import shuffle
 import asyncio
 from copy import deepcopy
 
@@ -9,7 +8,7 @@ import dag_cbor
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
 
-from .store import Store
+from .store import ContentAddressedStore
 
 
 def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
@@ -44,11 +43,8 @@ b3 = multihash.get("blake3")
 
 def blake3_hashfn(input_bytes: bytes) -> bytes:
     """
-    This is the default hash function used for . It uses the blake3 hash function and uses 32 bytes as the hash size.
+    This is the default blake3 hash function used for the `HAMT`, with a 32 byte hash size.
 
-    To provide your own hash function, create a function that takes in arbitrarily long bytes and returns the hash bytes.
-
-    It's important to note that the resulting hash must must always be a multiple of 8 bits since python bytes object can only represent in segments of bytes, and thus 8 bits.
     """
     # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
     digest = b3.digest(input_bytes, size=32)
@@ -57,14 +53,10 @@ def blake3_hashfn(input_bytes: bytes) -> bytes:
 
 
 class Node:
-    """
-    TODO
-    The Node class encapsulates
-    """
-
     def __init__(self):
         self.data: list[IPLDKind] = [dict() for _ in range(0, 256)]
-        # empty dicts represent empty buckets, lists with one element are links, with the internal element being a link
+        # empty dicts represent empty buckets
+        # lists with one element are links, where list[0] is the real link
 
     def iter_buckets(self) -> Iterator[dict]:
         for item in self.data:
@@ -121,27 +113,25 @@ class Node:
                 "Invalid dag-cbor encoded data from the store was attempted to be decoded"
             )
 
-        # Don't do any further checks for speed purposes
         node = cls()
         node.data = decoded_data  # type: ignore
         return node
 
 
-# For HAMT internal use for increaing performance with nodes
 class NodeStore(ABC):
     @abstractmethod
     async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
-        """Save nodes to the store"""
+        pass
 
     @abstractmethod
     async def load(self, id: IPLDKind) -> Node:
-        """Load nodes from the store"""
+        pass
 
     @abstractmethod
     def size(self) -> int:
         """Calculate the size of all internal Nodes in memory. Should not include the overhead in python of the dict or all the keys, which will be negligible compared to the Node sizes."""
 
-    # Async because the in memory tree has async calls
+    # Async only because the in memory tree has to make async calls when flushing out
     @abstractmethod
     async def vacate(self):
         """Remove everything from the cache."""
@@ -153,9 +143,7 @@ class ReadCacheStore(NodeStore):
         self.cache: dict[IPLDKind, Node] = dict()
 
     async def save(self, original_id: IPLDKind, node: Node) -> IPLDKind:
-        raise Exception(
-            "Save called in virtual store ReadCacheStore, only supposed to be used for reading"
-        )
+        raise Exception("Node was attempted to be written to the read cache")
 
     async def load(self, id: IPLDKind) -> Node:
         # Cache Hit
@@ -164,7 +152,7 @@ class ReadCacheStore(NodeStore):
             return node
 
         # Cache Miss
-        node = Node.deserialize(await self.hamt.store.load(id))
+        node = Node.deserialize(await self.hamt.cas.load(id))
         self.cache[id] = node
         return node
 
@@ -180,11 +168,9 @@ class ReadCacheStore(NodeStore):
 
 
 class InMemoryTreeStore(NodeStore):
-    # Add note about how this initiates by adding the HAMT's root node to the in memory tree buffer
-    # TODO add notice about how flushing needs to be handled by the HAMT internally and called after every operation is finished
     def __init__(self, hamt: "HAMT"):
         self.hamt = hamt
-        # This buffer goes from the node's virtual store uuid to a tuple of (original store id, Node), we can return the original node
+        # The integer key is a uuidv4 128-bit integer, for (almost perfectly) guaranteeing uniqueness
         self.buffer: dict[int, Node] = dict()
 
     def is_buffer_id(self, id: IPLDKind) -> bool:
@@ -200,7 +186,7 @@ class InMemoryTreeStore(NodeStore):
     # Callers must acquire a lock/stop operations to ensure an accurate calculation!
     def size(self) -> int:
         # This is more difficult than normal links are intentionally unencodable in dag-cbor as the UUIDv4 128-bit integer IDs do not fit
-        # So before serializing, make a copy of the node, replace all of those integer links with zeroed out 64 byte marker which should be close to most IDs returned by backing stores
+        # So before serializing, make a copy of the node, replace all of those integer links with zeroed out 64 byte marker. 64 bytes is a conservative estimate for most IDs returned by CASes
         total = 0
         for k in self.buffer:
             node = self.buffer[k]
@@ -230,12 +216,11 @@ class InMemoryTreeStore(NodeStore):
                 new_nodes_on_stack.append((top_buffer_id, child_buffer_id, child_node))
 
             no_children_in_memory = len(new_nodes_on_stack) == 0
-            # We can flush this node out and relink as necessary
+            # Flush this node out and relink the rest of the tree
             if no_children_in_memory:
-                # We can flush this one completely since it has no children in memory
                 is_root = parent_buffer_id is None
                 old_id = top_buffer_id
-                new_id = await self.hamt.store.save(
+                new_id = await self.hamt.cas.save(
                     top_node.serialize(), codec="dag-cbor"
                 )
                 del self.buffer[old_id]
@@ -244,28 +229,23 @@ class InMemoryTreeStore(NodeStore):
                 # If it's the root, we need to set the hamt's root node id once this is done sending to the backing store
                 if is_root:
                     self.hamt.root_node_id = new_id
-                # Edit the parent if this is not the root
+                # Edit and properly relink the parent if this is not the root
                 else:
                     parent_node = self.buffer[parent_buffer_id]
                     parent_node.replace_link(old_id, new_id)
             # Continue recursing down the tree
             else:
-                shuffle(
-                    new_nodes_on_stack
-                )  # avoids always recursing down the rightmost branch
-
                 node_stack.extend(new_nodes_on_stack)
 
         # There are only two types of nodes left in the buffer:
-        # 1. A bunch of nodes that seem "unlinked" to anything else, since Links used within the Nodes will reference the real underlying store
-        # 2. A bunch of empty nodes leftover if the key values they contain are deleted, these would normally be consolidated by a content addressed system but will be remaining here
-        # We can ignore those when clearing out everything else, nothing inside is linked to anything else anyhow
+        # 1. A bunch of nodes that seem "unlinked" to anything else, since Links used within the Nodes will reference the real underlying CAS
+        # 2. A bunch of empty nodes leftover if the key values they contain are deleted, these would normally be consolidated by a content addressed system but will be leftover in the buffer
+        # So we can just clear out everything since these nodes are not used by the rest of the tree
         self.buffer = dict()
 
     async def add_to_buffer(self, node: Node) -> IPLDKind:
-        # This is IPLDKind type, but not dag_cbor serializable due to int limits so this will throw errors early if the tree is written with the buffer_ids still in there
+        # This buffer_id is IPLDKind type since technically it's an int, but it's not dag_cbor serializable since that library can only do up to 64-bit ints. Thus this will throw errors early if a node is written with buffer_ids still in there
         buffer_id = uuid.uuid4().int
-        # Returns the virtual store ID that was generated for this node
         self.buffer[buffer_id] = node
 
         return buffer_id
@@ -281,57 +261,103 @@ class InMemoryTreeStore(NodeStore):
     async def load(self, id: IPLDKind) -> Node:
         # Hit for something already in the in memory tree
         if self.is_buffer_id(id):
-            node: Node = self.buffer[id]  # type: ignore
+            node: Node = self.buffer[id]  # type: ignore we know all buffer ids are ints
             return node
 
-        # Miss, something that isn't in the in memory tree, add it
-        node = Node.deserialize(await self.hamt.store.load(id))
+        # Something that isn't in the in memory tree, add it
+        node = Node.deserialize(await self.hamt.cas.load(id))
         await self.add_to_buffer(node)
         return node
 
 
 class HAMT:
-    store: Store
+    """
+    An implementation of a Hash Array Mapped Trie for an arbitrary Content Addressed Storage (CAS) system, e.g. IPFS. This uses the IPLD data model.
 
-    # Every call of this will look like self.hash_fn() and so the first argument will always take a self argument
-    hash_fn: Callable[[bytes], bytes]
+    Use this to store arbitrarily large key-value mappings in your CAS of choice.
 
-    # Only important for writing, when reading this will use buckets even if they are overly big
-    max_bucket_size: int
+    #### A note about memory management, read/write and read-only modes
+    The HAMT can be in either read/write mode or read-only mode. For either of these modes, the HAMT has some internal performance optimizations.
 
-    root_node_id: IPLDKind
+    If in read/write, you should use `make_read_only()` to convert to read only mode to get a valid root node id.
 
-    lock: asyncio.Lock
+    These optimizations also trade off performance for memory use. Use `cache_size` to monitor the approximate memory usage. Be warned that for large key-value mapping sets this may take a bit to run. Use `cache_vacate` if you are over your memory limits for the HAMT.
+
+    #### IPFS HAMT Sample Code
+    ```python
+    kubo_cas = KuboCAS() # connects to a local kubo node with the default endpoints
+    hamt = await HAMT.build(cas=kubo_cas)
+    await hamt.set("foo", "bar")
+    assert (await hamt.get("foo")) == "bar"
+    await hamt.make_read_only()
+    cid = hamt.root_node_id # our root node CID
+    print(cid)
+    ```
+    """
 
     def __init__(
         self,
-        store: Store,
+        cas: ContentAddressedStore,
         hash_fn: Callable[[bytes], bytes] = blake3_hashfn,
         root_node_id: IPLDKind = None,
         read_only: bool = False,
         max_bucket_size: int = 4,
-        inmemory_tree_limit: int = 10_000_000,  # 10 MB default
-        read_cache_limit: int = 10_000_000,  # 10 MB default
         values_are_bytes: bool = False,
     ):
-        # TODO add documentation about how to manage cache memories increasing
-        # TODO add notice about calling build if needing to initialize a completely empty HAMT
-        # rename store to cas to point out the Content Addressed Store nature of it
-        self.store = store
-        self.hash_fn = hash_fn
+        """
+        Use `build` if you need to create a completely empty HAMT, as this requires some async operations with the CAS. For what each of the constructor input variables refer to, check the documentation with the matching names below.
+        """
+
+        self.cas: ContentAddressedStore = cas
+        """The backing storage system. py-hamt provides an implementation `KuboCAS` for IPFS."""
+
+        self.hash_fn: Callable[[bytes], bytes] = hash_fn
+        """
+        This is the hash function used to place a key-value within the HAMT.
+
+        To provide your own hash function, create a function that takes in arbitrarily long bytes and returns the hash bytes.
+
+        It's important to note that the resulting hash must must always be a multiple of 8 bits since python bytes object can only represent in segments of bytes, and thus 8 bits.
+
+        Theoretically your hash size must only be a minimum of 1 byte, and there can be less than or the same number of hash collisions as the bucket size. Any more and the HAMT will most likely throw errors.
+        """
+
         self.lock = asyncio.Lock()
-        self.read_only = read_only
-        self.values_are_bytes = values_are_bytes
-        # TODO Say that values are bytes are safe to change in between operations, so put a hypothetical example of toggling it when its in read only mode and back in write for a completely safe toggle.
-        self.total = 0
+        """@private"""
+
+        self.values_are_bytes: bool = values_are_bytes
+        """Set this to true if you are only going to be storing python bytes objects into the hamt. This will improve performance by skipping a serialization step from IPLDKind.
+
+        This is theoretically safe to change in between operations, but this has not been verified in testing, so only do this at your own risk.
+        """
 
         if max_bucket_size < 1:
             raise ValueError("Bucket size maximum must be a positive integer")
         self.max_bucket_size = max_bucket_size
+        """
+        This is only important for tuning performance when writing! For reading a HAMT that was written with a different max bucket size, this does not need to match and can be left unprovided.
+
+        This is an internal detail that has been exposed for performance tuning. The HAMT handles large key-value mapping sets even on a content addressed system by essentially sharding all the mappings across many smaller Nodes. The memory footprint of each of these Nodes footprint is a linear function of the maximum bucket size. Larger bucket sizes will result in larger Nodes, but more time taken to retrieve and decode these nodes from your backing CAS.
+
+        This must be a positive integer with a minimum of 1.
+        """
 
         self.root_node_id = root_node_id
+        """
+        This is type IPLDKind but the documentation generator pdoc mangles it a bit.
 
+        Read from this only when in read mode to get something valid!
+        """
+
+        self.read_only: bool = read_only
+        """Clients should NOT modify this.
+
+        This is here for checking whether the HAMT is in read only or read/write mode.
+
+        The distinction is made for performance and correctness reasons. In read only mode, the HAMT has an internal read cache that can speed up operations. In read/write mode, for reads the HAMT maintains strong consistency for reads by using async locks, and for writes the HAMT writes to an in memory buffer rather than performing (possibly) network calls to the underlying CAS.
+        """
         self.node_store: NodeStore
+        """@private"""
         if read_only:
             self.node_store = ReadCacheStore(self)
         else:
@@ -339,7 +365,11 @@ class HAMT:
 
     @classmethod
     async def build(cls, *args, **kwargs) -> "HAMT":
-        # TODO add notice about referring to the init but this is what needs to actually get called, if you are initializing a completely new empty HAMT
+        """
+        Use this if you are initializing a completely empty HAMT! That means passing in None for the root_node_id. Method arguments are the exact same as `__init__`. If the root_node_id is not None, this will have no difference than creating a HAMT instance with __init__.
+
+        This separate async method is required since initializing an empty HAMT means sending some internal objects to the underlying CAS, which requires async operations. python does not allow for an async __init__, so this method is separately provided.
+        """
         hamt = cls(*args, **kwargs)
         if hamt.root_node_id is None:
             hamt.root_node_id = await hamt.node_store.save(None, Node())
@@ -360,15 +390,29 @@ class HAMT:
             self.read_only = False
             self.node_store = InMemoryTreeStore(self)
 
-    # TODO specify in documentation that this is async concurrency safe
     async def cache_size(self) -> int:
+        """
+        Returns the memory used by some internal performance optimization tools in bytes.
+
+        This is async concurrency safe, so call it whenever. This does mean it will block and wait for other writes to finish however.
+
+        Be warned that this may take a while to run for large HAMTs.
+
+        For more on memory management, see the `HAMT` class documentation.
+        """
         if self.read_only:
             return self.node_store.size()
         async with self.lock:
             return self.node_store.size()
 
-    # TODO documentation
     async def cache_vacate(self):
+        """
+        Vacate and completely empty out the internal read/write cache.
+
+        Be warned that this may take a while if there have been a lot of write operations.
+
+        For more on memory management, see the `HAMT` class documentation.
+        """
         if self.read_only:
             await self.node_store.vacate()
         async with self.lock:
@@ -414,23 +458,18 @@ class HAMT:
 
     # automatically skip encoding if the value provided is of the bytes variety
     async def set(self, key: str, val: IPLDKind):
-        """TODO add something about how skip encoding can make large bytes setting much more efficient"""
+        """Write a key-value mapping."""
         if self.read_only:
             raise Exception("Cannot call set on a read only HAMT")
 
-        # print(f"setting {key}")
         data: bytes
         if self.values_are_bytes:
             data = val  # type: ignore let users get an exception if they pass in a non bytes when they want to skip encoding
         else:
             data = dag_cbor.encode(val)
 
-        pointer = await self.store.save(data, codec="raw")
-        start = time.perf_counter()
+        pointer = await self.cas.save(data, codec="raw")
         await self._set_pointer(key, pointer)
-        end = time.perf_counter()
-        elapsed = end - start
-        self.total += elapsed
 
     async def _set_pointer(self, key: str, val_ptr: IPLDKind):
         async with self.lock:
@@ -480,6 +519,8 @@ class HAMT:
             self.root_node_id = node_stack[0][0]
 
     async def delete(self, key: str):
+        """Delete a key-value mapping."""
+
         # Also deletes the pointer at the same time so this doesn't have a _delete_pointer duo
         if self.read_only:
             raise Exception("Cannot call delete on a read only HAMT")
@@ -517,23 +558,16 @@ class HAMT:
                 # If we didn't make a change, then this key must not exist within the HAMT
                 raise KeyError
 
-    # TODO document option to skip decode if the user knows that the value inside is also going to be a bytes object
     async def get(self, key: str) -> IPLDKind:
         # If read only, no need to acquire a lock
-        start = time.perf_counter()
         pointer: IPLDKind
         if self.read_only:
             pointer = await self._get_pointer(key)
         else:
             async with self.lock:
                 pointer = await self._get_pointer(key)
-        end = time.perf_counter()
-        elapsed = end - start
-        self.total += elapsed
 
-        # print(f"getting {key}")
-
-        data = await self.store.load(pointer)
+        data = await self.cas.load(pointer)
         if self.values_are_bytes:
             return data
         else:
@@ -590,10 +624,9 @@ class HAMT:
         """
         AsyncIterator returning all keys in the HAMT.
 
-        TODO clean up this paragraph's language
-        When the HAMT is write enabled, to maintain strong consistency this will obtain a lock and not a llow any other operations to proceed. For example, if you are inside of a for loop using this iterator, you cannot also get a value at the same time until iteration is completely done. If you try you will run into deadlock.
+        If the HAMT is write enabled, to maintain strong consistency this will obtain an async lock and not allow any other operations to proceed.
 
-        In read only mode however, this can be run concurrently with get operations.
+        When the HAMT is in read only mode however, this can be run concurrently with get operations.
         """
         if self.read_only:
             async for k in self._keys_no_locking():
