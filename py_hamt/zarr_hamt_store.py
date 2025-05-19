@@ -12,6 +12,26 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
     #### A note about using the same `ZarrHAMTStore` for writing and then reading again
     If you write a Zarr to a HAMT, and then change it to read only mode, it's best to reinitialize a new ZarrHAMTStore with the proper read only setting. This is because this class, to err on the safe side, will not touch its super class's settings.
+
+    #### Sample Code
+    ```python
+    # Write
+    ds: xarray.Dataset = # ...
+    cas: ContentAddressedStore = # ...
+    hamt: HAMT = # ... make sure values_are_bytes is True and read_only is False to enable writes
+    zhs = ZarrHAMTStore(hamt, False)
+    xarray.to_zarr(store=zhs)
+    await hamt.make_read_only()
+    root_node_id = hamt.root_node_id
+    print(root_node_id)
+
+    # Read
+    hamt_read = HAMT(cas=cas, root_node_id=root_node_id, read_only=True, values_are_bytes=True)
+    zhs_read = ZarrHAMTStore(hamt, True)
+    ds_read = xarray.open_zarr(store=zhs_read)
+    print(ds_read)
+    xarray.testing.assert_identical(ds, ds_read)
+    ```
     """
 
     def __init__(self, hamt: HAMT, read_only: bool = False) -> None:
