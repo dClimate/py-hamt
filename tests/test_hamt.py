@@ -3,7 +3,7 @@ import random
 
 from dag_cbor import IPLDKind
 from multiformats import CID
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 import pytest
 
@@ -15,6 +15,9 @@ from testing_utils import key_value_list
 
 @pytest.mark.asyncio
 @given(key_value_list)
+@settings(
+    deadline=500
+)  # increase for github CI which sometimes takees longer than the default 250 ms
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     cas = InMemoryCAS()
     hamt = await HAMT.build(cas=cas)
