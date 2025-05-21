@@ -1,3 +1,4 @@
+import asyncio
 from typing import Literal
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
@@ -111,7 +112,9 @@ class KuboCAS(ContentAddressedStore):
 
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
         """@private"""
-        response = self.requests_session.post(self.rpc_url, files={"file": data})
+        response = await asyncio.to_thread(
+            self.requests_session.post, self.rpc_url, files={"file": data}
+        )
         response.raise_for_status()
 
         cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
@@ -128,6 +131,6 @@ class KuboCAS(ContentAddressedStore):
     ) -> bytes:
         """@private"""
         url = self.gateway_base_url + str(id)
-        response = self.requests_session.get(url)
+        response = await asyncio.to_thread(self.requests_session.get, url)
         response.raise_for_status()
         return response.content
