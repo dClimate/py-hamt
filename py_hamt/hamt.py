@@ -280,12 +280,12 @@ class HAMT:
 
     When in read-only mode, the HAMT is both async and thread safe.
 
-    #### A note about memory management, read/write and read-only modes
-    The HAMT can be in either read/write mode or read-only mode. For either of these modes, the HAMT has some internal performance optimizations.
+    #### A note about memory management, read+write and read-only modes
+    The HAMT can be in either read+write mode or read-only mode. For either of these modes, the HAMT has some internal performance optimizations.
 
-    If in read/write, you should use `make_read_only()` to convert to read only mode to get a valid root node id.
+    Note that in read+write, the real root node id IS NOT VALID. You should call `make_read_only()` to convert to read only mode and then read `root_node_id`.
 
-    These optimizations also trade off performance for memory use. Use `cache_size` to monitor the approximate memory usage. Be warned that for large key-value mapping sets this may take a bit to run. Use `cache_vacate` if you are over your memory limits for the HAMT.
+    These optimizations also trade off performance for memory use. Use `cache_size` to monitor the approximate memory usage. Be warned that for large key-value mapping sets this may take a bit to run. Use `cache_vacate` if you are over your memory limits.
 
     #### IPFS HAMT Sample Code
     ```python
@@ -381,6 +381,11 @@ class HAMT:
 
     # This is typically a massive blocking operation, you dont want to be running this concurrently with a bunch of other operations, so it's ok to have it not be async
     async def make_read_only(self):
+        """
+        Makes the HAMT read only, which allows for more parallel read operations. The HAMT also needs to be in read only mode to get the real root node ID.
+
+        In read+write mode, the HAMT normally has to block separate get calls to enable strong consistency in case a set/delete operation falls in between.
+        """
         async with self.lock:
             inmemory_tree: InMemoryTreeStore = self.node_store  # type: ignore
             await inmemory_tree.vacate()
@@ -389,6 +394,9 @@ class HAMT:
             self.node_store = ReadCacheStore(self)
 
     async def enable_write(self):
+        """
+        Enable both reads and writes. This creates an internal structure for performance optimizations which will result in the root node ID no longer being valid, in order to read that at the end of your operations you must first use `make_read_only`.
+        """
         async with self.lock:
             # The read cache has no writes that need to be sent upstream so we can remove it without vacating
             self.read_only = False
