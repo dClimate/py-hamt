@@ -1,6 +1,6 @@
 import dag_cbor
 from dag_cbor import IPLDKind
-from hypothesis import given
+from hypothesis import given, settings
 import pytest
 import requests
 
@@ -20,6 +20,7 @@ async def test_memory_store_exception():
 
 @pytest.mark.asyncio
 @given(data=ipld_strategy())
+@settings(deadline=500)  # this sometimes takes longer than the default 250 ms
 async def test_kubo_default_urls(data: IPLDKind):
     kubo_cas = KuboCAS()
     cids = []
