@@ -41,6 +41,9 @@ async def test_kubo_default_urls(data: IPLDKind):
 
 @pytest.mark.asyncio
 @given(data=ipld_strategy())
+@settings(
+    deadline=500
+)  # this sometimes takes longer than the default 250 ms in GitHub CI
 async def test_kubo_cas(create_ipfs, data: IPLDKind):  # noqa
     rpc_base_url, gateway_base_url = create_ipfs
 
