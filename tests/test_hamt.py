@@ -76,7 +76,6 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
 
     # Make sure all pointers actually exist in the store, this should not raise any exceptions
     for k, _ in kvs:
-        # Callers must handle acquiring a lock themselves, so do these entirely sequentially
         pointer: bytes = await hamt.get_pointer(k)  # type: ignore we know that DictStore only returns bytes for its Link type
         await cas.load(pointer)
 
