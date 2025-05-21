@@ -419,8 +419,9 @@ class HAMT:
         """
         if self.read_only:
             await self.node_store.vacate()
-        async with self.lock:
-            await self.node_store.vacate()
+        else:
+            async with self.lock:
+                await self.node_store.vacate()
 
     async def _reserialize_and_link(self, node_stack: list[tuple[IPLDKind, Node]]):
         """
