@@ -17,7 +17,7 @@ from testing_utils import key_value_list
 @given(key_value_list)
 @settings(
     deadline=500
-)  # increase for github CI which sometimes takees longer than the default 250 ms
+)  # increase for github CI which sometimes takes longer than the default 250 ms
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     cas = InMemoryCAS()
     hamt = await HAMT.build(cas=cas)
