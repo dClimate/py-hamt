@@ -1,5 +1,6 @@
 from typing import Literal
 from abc import ABC, abstractmethod
+import asyncio
 from dag_cbor.ipld import IPLDKind
 from msgspec import json
 from multiformats import multihash
@@ -104,8 +105,13 @@ class KuboCAS(ContentAddressedStore):
 
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
         """@private"""
-        response = self.requests_session.post(self.rpc_url, files={"file": data})
+        response = await asyncio.to_thread(
+                self.requests_session.post,
+                self.rpc_url,
+                files={"file": data},
+        )
         response.raise_for_status()
+        
 
         cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
         cid = CID.decode(cid_str)
@@ -121,6 +127,11 @@ class KuboCAS(ContentAddressedStore):
     ) -> bytes:
         """@private"""
         url = self.gateway_base_url + str(id)
-        response = self.requests_session.get(url)
+        # If this coroutine is running inside an event loop,         #
+        # off-load the *blocking* requests call to a worker thread.  #
+        response = await asyncio.to_thread(
+            self.requests_session.get,  # same session you already keep
+            url,
+        )
         response.raise_for_status()
         return response.content
