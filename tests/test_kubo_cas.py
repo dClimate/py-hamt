@@ -29,6 +29,14 @@ async def test_kubo_default_urls(data: IPLDKind):
         result = dag_cbor.decode(await kubo_cas.load(cid))
         assert data == result
 
+    kubo_cas = KuboCAS(gateway_base_url=None, rpc_base_url=None)
+    cids = []
+    for codec in ["raw", "dag-cbor"]:
+        cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)  # type: ignore
+        cids.append(cid)
+        result = dag_cbor.decode(await kubo_cas.load(cid))
+        assert data == result
+
 
 @pytest.mark.asyncio
 @given(data=ipld_strategy())

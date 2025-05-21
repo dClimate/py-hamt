@@ -73,10 +73,12 @@ class KuboCAS(ContentAddressedStore):
         self,
         hasher: str = "blake3",
         requests_session: requests.Session | None = None,
-        rpc_base_url=KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
-        gateway_base_url=KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
+        rpc_base_url: str | None = KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
+        gateway_base_url: str | None = KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
     ):
         """
+        If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
+
         ### `requests.Session` Management
         If `requests_session` is not provided, it will be automatically initialized. It is the responsibility of the user to close this at an appropriate time, as a class instance cannot know when it will no longer be in use.
 
@@ -89,6 +91,11 @@ class KuboCAS(ContentAddressedStore):
 
         self.hasher = hasher
         """The hash function to send to IPFS when storing bytes. Cannot be changed after initialization. The default blake3 follows the default hashing algorithm used by HAMT."""
+
+        if rpc_base_url is None:
+            rpc_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_RPC_BASE_URL
+        if gateway_base_url is None:
+            gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
         self.rpc_url = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
         """@private"""
