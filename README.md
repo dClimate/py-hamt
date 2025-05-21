@@ -45,6 +45,9 @@ We use `pytest` with 100% code coverage, and with test inputs that are both hand
 > [!NOTE]
 > Due to the randomized test inputs, it is possible sometimes to get 99% or lower test coverage by pure chance. Rerun the tests to get back complete code coverage. If this happens on a GitHub action, try rerunning the action.
 
+> [!NOTE]
+> Due to the restricted performance on GitHub actions runners, you may also sometimes see hypothesis tests running with errors because they exceeded test deadlines. Rerun the action if this happens.
+
 ## CPU and Memory Profiling
 We use python's native `cProfile` for running CPU profiles and snakeviz for visualizing the profile. We use `memray` for the memory profiling. We will walk through using the profiling tools on the test suite.
 
