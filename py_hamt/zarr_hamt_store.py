@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator, Iterable
+from dag_cbor import IPLDKind
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
@@ -44,6 +45,9 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
         ##### A note about the zarr chunk separator, "/" vs "."
         While Zarr v2 used periods by default, Zarr v3 uses forward slashes, and that is assumed here as well.
+
+        #### Metadata Read Cache
+        `ZarrHAMTStore` has an internal read cache for metadata. In practice metadata "zarr.json" files are very very frequently and duplicately requested compared to all other keys, and there are significant speed improvements gotten by implementing this cache. In terms of memory management, in practice this cache does not need an eviction step since "zarr.json" files are much smaller than the memory requirement of the zarr data.
         """
         super().__init__(read_only=read_only)
 
@@ -54,6 +58,9 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         The internal HAMT.
         Once done with write operations, the hamt can be set to read only mode as usual to get your root node ID.
         """
+
+        self.metadata_read_cache: dict[IPLDKind, bytes] = dict()
+        """@private"""
 
     @property
     def read_only(self) -> bool:
@@ -74,7 +81,21 @@ class ZarrHAMTStore(zarr.abc.store.Store):
     ) -> zarr.core.buffer.Buffer | None:
         """@private"""
         try:
-            val: bytes = await self.hamt.get(key)  # type: ignore We know values received will always be bytes since we only store bytes in the HAMT
+            val: bytes
+            val_ptr: IPLDKind = await self.hamt.get_pointer(key)
+            if val_ptr in self.metadata_read_cache:
+                val = self.metadata_read_cache[val_ptr]
+            else:
+                val = await self.hamt.get(key)  # type: ignore We know values received will always be bytes since we only store bytes in the HAMT
+
+            # do len check to avoid indexing into overly short strings, 3.12 does not throw errors but we dont know if others will
+            is_metadata = (
+                len(key) >= 9 and key[-9:] == "zarr.json"
+            )  # if path ends with zarr.json
+
+            if is_metadata and val_ptr not in self.metadata_read_cache:
+                self.metadata_read_cache[val_ptr] = val
+
             return prototype.buffer.from_bytes(val)
         except KeyError:
             # Sometimes zarr queries keys that don't exist anymore, just return nothing on those cases

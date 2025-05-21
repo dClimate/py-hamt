@@ -572,6 +572,20 @@ class HAMT:
                 raise KeyError
 
     async def get(self, key: str) -> IPLDKind:
+        """Get a value."""
+        pointer = await self.get_pointer(key)
+        data = await self.cas.load(pointer)
+        if self.values_are_bytes:
+            return data
+        else:
+            return dag_cbor.decode(data)
+
+    async def get_pointer(self, key: str) -> IPLDKind:
+        """
+        Get a store ID that points to the value for this key.
+
+        This is useful for some applications that want to implement a read cache. Due to the restrictions of `ContentAddressedStore` on IDs, pointers are regarded as immutable by python so they can be easily used as IDs for read caches. This is utilized in `ZarrHAMTStore` for example.
+        """
         # If read only, no need to acquire a lock
         pointer: IPLDKind
         if self.read_only:
@@ -580,11 +594,7 @@ class HAMT:
             async with self.lock:
                 pointer = await self._get_pointer(key)
 
-        data = await self.cas.load(pointer)
-        if self.values_are_bytes:
-            return data
-        else:
-            return dag_cbor.decode(data)
+        return pointer
 
     # Callers MUST handle acquiring a lock
     async def _get_pointer(self, key: str) -> IPLDKind:
