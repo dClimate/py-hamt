@@ -71,7 +71,7 @@ async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):  # noqa
     start = time.perf_counter()
     # Do an initial write along with an append which is a common xarray/zarr operation
     test_ds.to_zarr(store=zhs)  # type: ignore
-    test_ds.to_zarr(store=zhs, mode="a", append_dim="time")  # type: ignore
+    test_ds.to_zarr(store=zhs, mode="a", append_dim="time", zarr_format=3)  # type: ignore
     end = time.perf_counter()
     elapsed = end - start
     print("=== Write Stats")

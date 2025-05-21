@@ -1,5 +1,4 @@
 from collections.abc import AsyncIterator, Iterable
-from dag_cbor import IPLDKind
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
@@ -59,7 +58,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         Once done with write operations, the hamt can be set to read only mode as usual to get your root node ID.
         """
 
-        self.metadata_read_cache: dict[IPLDKind, bytes] = dict()
+        self.metadata_read_cache: dict[str, bytes] = dict()
         """@private"""
 
     @property
@@ -82,19 +81,17 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         """@private"""
         try:
             val: bytes
-            val_ptr: IPLDKind = await self.hamt.get_pointer(key)
-            if val_ptr in self.metadata_read_cache:
-                val = self.metadata_read_cache[val_ptr]
-            else:
-                val = await self.hamt.get(key)  # type: ignore We know values received will always be bytes since we only store bytes in the HAMT
-
-            # do len check to avoid indexing into overly short strings, 3.12 does not throw errors but we dont know if others will
+            # do len check to avoid indexing into overly short strings, 3.12 does not throw errors but we dont know if other versions will
             is_metadata = (
                 len(key) >= 9 and key[-9:] == "zarr.json"
             )  # if path ends with zarr.json
 
-            if is_metadata and val_ptr not in self.metadata_read_cache:
-                self.metadata_read_cache[val_ptr] = val
+            if is_metadata and key in self.metadata_read_cache:
+                val = self.metadata_read_cache[key]
+            else:
+                val = await self.hamt.get(key)  # type: ignore We know values received will always be bytes since we only store bytes in the HAMT
+                if is_metadata:
+                    self.metadata_read_cache[key] = val
 
             return prototype.buffer.from_bytes(val)
         except KeyError:
@@ -129,6 +126,8 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
     async def set(self, key: str, value: zarr.core.buffer.Buffer) -> None:
         """@private"""
+        if key in self.metadata_read_cache:
+            self.metadata_read_cache[key] = value.to_bytes()
         await self.hamt.set(key, value.to_bytes())
 
     async def set_if_not_exists(self, key: str, value: zarr.core.buffer.Buffer) -> None:
@@ -151,6 +150,9 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         """@private"""
         try:
             await self.hamt.delete(key)
+            # In practice these lines never seem to be needed, creating and appending data are the only operations most zarrs actually undergo
+            # if key in self.metadata_read_cache:
+            #     del self.metadata_read_cache[key]
         # It's fine if the key was not in the HAMT
         # Sometimes zarr v3 calls deletes on keys that don't exist (or have already been deleted) for some reason, probably concurrency issues
         except KeyError:
