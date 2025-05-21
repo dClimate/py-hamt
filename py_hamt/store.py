@@ -106,12 +106,11 @@ class KuboCAS(ContentAddressedStore):
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
         """@private"""
         response = await asyncio.to_thread(
-                self.requests_session.post,
-                self.rpc_url,
-                files={"file": data},
+            self.requests_session.post,
+            self.rpc_url,
+            files={"file": data},
         )
         response.raise_for_status()
-        
 
         cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
         cid = CID.decode(cid_str)
