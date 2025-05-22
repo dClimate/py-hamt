@@ -4,6 +4,8 @@ import requests
 from msgspec import json
 from multiformats import multihash
 from multiformats import CID
+import aiohttp
+import weakref
 from multiformats.multihash import Multihash
 
 
@@ -79,6 +81,7 @@ class IPFSStore(Store):
         gateway_uri_stem: str = "http://127.0.0.1:8080",
         rpc_uri_stem: str = "http://127.0.0.1:5001",
         hasher: str = "blake3",
+<<<<<<< Updated upstream
         pin_on_add: bool = False,
         debug: bool = False,
         # Authentication parameters
@@ -86,6 +89,11 @@ class IPFSStore(Store):
         bearer_token: str | None = None,
         api_key: str | None = None,
         api_key_header: str = "X-API-Key",  # Customizable API key header
+=======
+        session: aiohttp.ClientSession | None = None,
+        rpc_base_url=KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
+        gateway_base_url=KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
+>>>>>>> Stashed changes
     ):
         self.timeout_seconds = timeout_seconds
         """
@@ -120,6 +128,7 @@ class IPFSStore(Store):
         self.api_key_header = api_key_header
         """Header name to use for API key authentication"""
 
+<<<<<<< Updated upstream
     def save(self, data: bytes, cid_codec: str) -> CID:
         """
         This saves the data to an ipfs daemon by calling the RPC API, and then returns the CID, with a multicodec set by the input cid_codec. We need to do this since the API always returns either a multicodec of raw or dag-pb if it had to shard the input data.
@@ -168,9 +177,58 @@ class IPFSStore(Store):
         # if everything is succesful, record debug information
         if self.debug:
             self.total_sent += len(data)  # type: ignore
+=======
+        concurrency = 32
+        self._session = session or aiohttp.ClientSession()
+        self._sem = asyncio.Semaphore(concurrency)
+        self._external_session = session
+        self._sessions: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = (
+            weakref.WeakKeyDictionary()
+        )
 
-        return cid
+    async def _loop_session(self) -> aiohttp.ClientSession:
+        """Return a ClientSession bound to *this* loop, lazily creating one."""
+        loop = asyncio.get_running_loop()
+        if self._external_session is not None:
+            # caller manages lifetime; just return it
+            return self._external_session                   # caller manages it
+        try:
+            return self._sessions[loop]                     # reuse if we made one
+        except KeyError:
+            sess = aiohttp.ClientSession()
+            self._sessions[loop] = sess
+            return sess
+        
+    async def aclose(self):
+        if self._external_session is None:
+            await asyncio.gather(*[s.close() for s in self._sessions.values()])
 
+    async def __aenter__(self): return self
+    async def __aexit__(self, *exc): await self.aclose()
+
+    async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
+        """@private"""
+        async with self._sem:  # throttle RPC calls if needed
+            session = await self._loop_session()          # your loop-local helper
+            form = aiohttp.FormData()
+            # field-name MUST be "file", filename can be anything
+            form.add_field("file",
+                        data,
+                        filename="blob",
+                        content_type="application/octet-stream")
+
+            async with session.post(self.rpc_url, data=form) as resp:
+                resp.raise_for_status()                   # no more 400s
+                cid_str = (await resp.json())["Hash"]
+
+            cid = CID.decode(cid_str)
+            if cid.codec.code != self.DAG_PB_MARKER:
+                cid = cid.set(codec=codec)
+>>>>>>> Stashed changes
+
+            return cid
+
+<<<<<<< Updated upstream
     def save_raw(self, data: bytes) -> CID:
         """See `save`"""
         return self.save(data, "raw")
@@ -203,3 +261,16 @@ class IPFSStore(Store):
             self.total_received += len(response.content)  # type: ignore
 
         return response.content
+=======
+    async def load(  # type: ignore CID is definitely in the IPLDKind type
+        self, id: CID
+    ) -> bytes:
+        """@private"""
+        url = self.gateway_base_url + str(id)
+        # If this coroutine is running inside an event loop,         #
+        # off-load the *blocking* requests call to a worker thread.  #
+        async with self._sem:                         # throttle gateway
+            async with (await self._loop_session()).get(self.gateway_base_url + str(id)) as r:
+                r.raise_for_status()
+                return await r.read()
+>>>>>>> Stashed changes
