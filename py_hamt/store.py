@@ -79,6 +79,7 @@ class KuboCAS(ContentAddressedStore):
         session: aiohttp.ClientSession | None = None,
         rpc_base_url: str | None = KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
         gateway_base_url: str | None = KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
+        concurrency: int = 32,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
@@ -106,11 +107,10 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url = gateway_base_url + "/ipfs/"
         """@private"""
 
-        concurrency = 32
         self._session = session or aiohttp.ClientSession()
         self._sem = asyncio.Semaphore(concurrency)
         self._external_session = session
-        self._sessions: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = (weakref.WeakKeyDictionary())
+        self._sessions: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = weakref.WeakKeyDictionary()
         # """@private"""
         # if requests_session is None:
         #     self.requests_session = requests.Session()
