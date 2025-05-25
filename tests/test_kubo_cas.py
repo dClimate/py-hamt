@@ -1,3 +1,4 @@
+import aiohttp
 import dag_cbor
 from dag_cbor import IPLDKind
 from hypothesis import given, settings
@@ -47,14 +48,15 @@ async def test_kubo_default_urls(data: IPLDKind):
 async def test_kubo_cas(create_ipfs, data: IPLDKind):  # noqa
     rpc_base_url, gateway_base_url = create_ipfs
 
-    # Provide our own requests Session, for complete code coverage
-    kubo_cas = KuboCAS(
-        rpc_base_url=rpc_base_url,
-        gateway_base_url=gateway_base_url,
-        requests_session=requests.Session(),
-    )
+    # Provide our own async Session, for complete code coverage
+    async with aiohttp.ClientSession() as session:
+        kubo_cas = KuboCAS(
+            rpc_base_url=rpc_base_url,
+            gateway_base_url=gateway_base_url,
+            session=session,
+        )
 
-    for codec in ["raw", "dag-cbor"]:
-        cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)  # type: ignore
-        result = dag_cbor.decode(await kubo_cas.load(cid))
-        assert data == result
+        for codec in ["raw", "dag-cbor"]:
+            cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)
+            result = dag_cbor.decode(await kubo_cas.load(cid))
+            assert data == result

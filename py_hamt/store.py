@@ -1,4 +1,6 @@
 import asyncio
+import aiohttp
+import weakref
 from typing import Literal
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
@@ -27,7 +29,8 @@ class ContentAddressedStore(ABC):
     async def save(self, data: bytes, codec: CodecInput) -> IPLDKind:
         """Save data to a storage mechanism, and return an ID for the data in the IPLDKind type.
 
-        `codec` will be set to "dag-cbor" if this data should be marked as special linked data a la IPLD data model."""
+        `codec` will be set to "dag-cbor" if this data should be marked as special linked data a la IPLD data model.
+        """
 
     @abstractmethod
     async def load(self, id: IPLDKind) -> bytes:
@@ -73,7 +76,7 @@ class KuboCAS(ContentAddressedStore):
     def __init__(
         self,
         hasher: str = "blake3",
-        requests_session: requests.Session | None = None,
+        session: aiohttp.ClientSession | None = None,
         rpc_base_url: str | None = KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
         gateway_base_url: str | None = KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
     ):
@@ -103,34 +106,70 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url = gateway_base_url + "/ipfs/"
         """@private"""
 
-        self.requests_session: requests.Session
-        """@private"""
-        if requests_session is None:
-            self.requests_session = requests.Session()
-        else:
-            self.requests_session = requests_session
+        concurrency = 32
+        self._session = session or aiohttp.ClientSession()
+        self._sem = asyncio.Semaphore(concurrency)
+        self._external_session = session
+        self._sessions: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = (weakref.WeakKeyDictionary())
+        # """@private"""
+        # if requests_session is None:
+        #     self.requests_session = requests.Session()
+        # else:
+        #     self.requests_session = requests_session
+
+    async def _loop_session(self) -> aiohttp.ClientSession:
+        """Return a ClientSession bound to *this* loop, lazily creating one."""
+        loop = asyncio.get_running_loop()
+        if self._external_session is not None:
+            # caller manages lifetime; just return it
+            return self._external_session  # caller manages it
+        try:
+            return self._sessions[loop]  # reuse if we made one
+        except KeyError:
+            sess = aiohttp.ClientSession()
+            self._sessions[loop] = sess
+            return sess
+
+    async def aclose(self):
+        if self._external_session is None:
+            await asyncio.gather(*[s.close() for s in self._sessions.values()])
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.aclose()
 
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
         """@private"""
-        response = await asyncio.to_thread(
-            self.requests_session.post, self.rpc_url, files={"file": data}
-        )
-        response.raise_for_status()
+        async with self._sem:  # throttle RPC calls if needed
+            session = await self._loop_session()  # your loop-local helper
+            form = aiohttp.FormData()
+            # field-name MUST be "file", filename can be anything
+            form.add_field(
+                "file", data, filename="blob", content_type="application/octet-stream"
+            )
 
-        cid_str: str = json.decode(response.content)["Hash"]  # type: ignore
-        cid = CID.decode(cid_str)
+            async with session.post(self.rpc_url, data=form) as resp:
+                resp.raise_for_status()  # no more 400s
+                cid_str = (await resp.json())["Hash"]
 
-        # If it's dag-pb it means we should not reset the cid codec, kubo shards large data into a UnixFS structure
-        if cid.codec.code != KuboCAS.DAG_PB_MARKER:
-            cid = cid.set(codec=codec)
+            cid = CID.decode(cid_str)
+            if cid.codec.code != self.DAG_PB_MARKER:
+                cid = cid.set(codec=codec)
 
-        return cid
+            return cid
 
     async def load(  # type: ignore CID is definitely in the IPLDKind type
         self, id: CID
     ) -> bytes:
         """@private"""
         url = self.gateway_base_url + str(id)
-        response = await asyncio.to_thread(self.requests_session.get, url)
-        response.raise_for_status()
-        return response.content
+        # If this coroutine is running inside an event loop,         #
+        # off-load the *blocking* requests call to a worker thread.  #
+        async with self._sem:  # throttle gateway
+            async with (await self._loop_session()).get(
+                self.gateway_base_url + str(id)
+            ) as r:
+                r.raise_for_status()
+                return await r.read()
