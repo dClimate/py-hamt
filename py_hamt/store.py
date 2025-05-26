@@ -106,11 +106,6 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url = gateway_base_url + "/ipfs/"
         """@private"""
 
-        # One shared session per KuboCAS instance.
-        self._session = session or aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=60),
-            connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
-        )
         self._session_per_loop: dict[
             asyncio.AbstractEventLoop, aiohttp.ClientSession
         ] = {}
@@ -127,7 +122,7 @@ class KuboCAS(ContentAddressedStore):
     # --------------------------------------------------------------------- #
     # helper: get or create the session bound to the current running loop   #
     # --------------------------------------------------------------------- #
-    def _session(self) -> aiohttp.ClientSession:
+    def _loop_session(self) -> aiohttp.ClientSession:
         loop = asyncio.get_running_loop()
         try:
             return self._session_per_loop[loop]
@@ -176,7 +171,7 @@ class KuboCAS(ContentAddressedStore):
                 "file", data, filename="blob", content_type="application/octet-stream"
             )
 
-            async with self._session().post(self.rpc_url, data=form) as resp:
+             async with self._loop_session().post(self.rpc_url, data=form) as resp:
                 resp.raise_for_status()
                 cid_str = (await resp.json())["Hash"]
 
@@ -191,6 +186,6 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
         url = self.gateway_base_url + str(id)
         async with self._sem:  # throttle gateway
-            async with self._session().get(url) as resp:
+            async with self._loop_session().get(url) as resp:
                 resp.raise_for_status()
                 return await resp.read()
