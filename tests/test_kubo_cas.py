@@ -45,9 +45,9 @@ async def test_kubo_default_urls(
                 # print(f"Loaded encoded data length: {len(loaded_encoded_data)}")
                 result = dag_cbor.decode(loaded_encoded_data)
                 # print(f"Decoded result: {result}")
-                assert (
-                    data == result
-                ), f"Data mismatch for codec {codec} with default URLs"
+                assert data == result, (
+                    f"Data mismatch for codec {codec} with default URLs"
+                )
             except Exception as e:
                 pytest.fail(
                     f"Error during KuboCAS default URL test (codec: {codec}): {e}"
