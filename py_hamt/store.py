@@ -171,7 +171,7 @@ class KuboCAS(ContentAddressedStore):
                 "file", data, filename="blob", content_type="application/octet-stream"
             )
 
-             async with self._loop_session().post(self.rpc_url, data=form) as resp:
+            async with self._loop_session().post(self.rpc_url, data=form) as resp:
                 resp.raise_for_status()
                 cid_str = (await resp.json())["Hash"]
 
