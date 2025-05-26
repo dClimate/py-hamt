@@ -16,7 +16,7 @@ from testing_utils import key_value_list
 @pytest.mark.asyncio
 @given(key_value_list)
 @settings(
-    deadline=500
+    deadline=1000
 )  # increase for github CI which sometimes takes longer than the default 250 ms
 async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     cas = InMemoryCAS()

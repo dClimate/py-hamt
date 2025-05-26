@@ -21,23 +21,23 @@ async def test_memory_store_exception():
 
 @pytest.mark.asyncio
 @given(data=ipld_strategy())
-@settings(deadline=500)  # this sometimes takes longer than the default 250 ms
+@settings(deadline=1000)  # this sometimes takes longer than the default 250 ms
 async def test_kubo_default_urls(data: IPLDKind):
-    kubo_cas = KuboCAS()
-    cids = []
-    for codec in ["raw", "dag-cbor"]:
-        cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)  # type: ignore
-        cids.append(cid)
-        result = dag_cbor.decode(await kubo_cas.load(cid))
-        assert data == result
+    async with KuboCAS() as kubo_cas:
+        cids = []
+        for codec in ["raw", "dag-cbor"]:
+            cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)  # type: ignore
+            cids.append(cid)
+            result = dag_cbor.decode(await kubo_cas.load(cid))
+            assert data == result
 
-    kubo_cas = KuboCAS(gateway_base_url=None, rpc_base_url=None)
-    cids = []
-    for codec in ["raw", "dag-cbor"]:
-        cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)  # type: ignore
-        cids.append(cid)
-        result = dag_cbor.decode(await kubo_cas.load(cid))
-        assert data == result
+    async with KuboCAS(gateway_base_url=None, rpc_base_url=None) as kubo_cas:
+        cids = []
+        for codec in ["raw", "dag-cbor"]:
+            cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)  # type: ignore
+            cids.append(cid)
+            result = dag_cbor.decode(await kubo_cas.load(cid))
+            assert data == result
 
 
 @pytest.mark.asyncio
@@ -50,13 +50,12 @@ async def test_kubo_cas(create_ipfs, data: IPLDKind):  # noqa
 
     # Provide our own async Session, for complete code coverage
     async with aiohttp.ClientSession() as session:
-        kubo_cas = KuboCAS(
+        async with KuboCAS(
             rpc_base_url=rpc_base_url,
             gateway_base_url=gateway_base_url,
             session=session,
-        )
-
-        for codec in ["raw", "dag-cbor"]:
-            cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)
-            result = dag_cbor.decode(await kubo_cas.load(cid))
-            assert data == result
+        ) as kubo_cas:
+            for codec in ["raw", "dag-cbor"]:
+                cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec)
+                result = dag_cbor.decode(await kubo_cas.load(cid))
+                assert data == result

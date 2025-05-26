@@ -106,33 +106,18 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url = gateway_base_url + "/ipfs/"
         """@private"""
 
-        concurrency = 32
-        self._session = session or aiohttp.ClientSession()
-        self._sem = asyncio.Semaphore(concurrency)
-        self._external_session = session
-        self._sessions: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = (weakref.WeakKeyDictionary())
-        # """@private"""
-        # if requests_session is None:
-        #     self.requests_session = requests.Session()
-        # else:
-        #     self.requests_session = requests_session
-
-    async def _loop_session(self) -> aiohttp.ClientSession:
-        """Return a ClientSession bound to *this* loop, lazily creating one."""
-        loop = asyncio.get_running_loop()
-        if self._external_session is not None:
-            # caller manages lifetime; just return it
-            return self._external_session  # caller manages it
-        try:
-            return self._sessions[loop]  # reuse if we made one
-        except KeyError:
-            sess = aiohttp.ClientSession()
-            self._sessions[loop] = sess
-            return sess
+        # One shared session per KuboCAS instance.
+        self._session = session or aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60),
+            connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
+        )
+        self._owns_session = session is None
+        self._sem = asyncio.Semaphore(64)
 
     async def aclose(self):
-        if self._external_session is None:
-            await asyncio.gather(*[s.close() for s in self._sessions.values()])
+        """Close our connector if we created it."""
+        if self._owns_session and not self._session.closed:
+            await self._session.close()
 
     async def __aenter__(self):
         return self
@@ -143,14 +128,13 @@ class KuboCAS(ContentAddressedStore):
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
         """@private"""
         async with self._sem:  # throttle RPC calls if needed
-            session = await self._loop_session()  # your loop-local helper
             form = aiohttp.FormData()
             # field-name MUST be "file", filename can be anything
             form.add_field(
                 "file", data, filename="blob", content_type="application/octet-stream"
             )
 
-            async with session.post(self.rpc_url, data=form) as resp:
+            async with self._session.post(self.rpc_url, data=form) as resp:
                 resp.raise_for_status()  # no more 400s
                 cid_str = (await resp.json())["Hash"]
 
@@ -168,8 +152,6 @@ class KuboCAS(ContentAddressedStore):
         # If this coroutine is running inside an event loop,         #
         # off-load the *blocking* requests call to a worker thread.  #
         async with self._sem:  # throttle gateway
-            async with (await self._loop_session()).get(
-                self.gateway_base_url + str(id)
-            ) as r:
+            async with self._session.get(url) as r:
                 r.raise_for_status()
                 return await r.read()
