@@ -134,18 +134,6 @@ class KuboCAS(ContentAddressedStore):
             self._session_per_loop[loop] = sess
             return sess
 
-    # ---------- internal helper ----------
-    def _get_session_for_current_loop(self) -> aiohttp.ClientSession:
-        loop = asyncio.get_running_loop()
-        sess = self._session_per_loop.get(loop)
-        if sess is None:
-            sess = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60),
-                connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
-            )
-            self._session_per_loop[loop] = sess
-        return sess
-
     # --------------------------------------------------------------------- #
     # graceful shutdown: close **all** sessions we own                      #
     # --------------------------------------------------------------------- #
