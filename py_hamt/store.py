@@ -1,14 +1,11 @@
 import asyncio
 import aiohttp
-import weakref
 from typing import Literal
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
-from msgspec import json
 from multiformats import multihash
 from multiformats import CID
 from multiformats.multihash import Multihash
-import requests
 
 
 class ContentAddressedStore(ABC):
@@ -106,33 +103,42 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url = gateway_base_url + "/ipfs/"
         """@private"""
 
-        concurrency = 32
-        self._session = session or aiohttp.ClientSession()
-        self._sem = asyncio.Semaphore(concurrency)
-        self._external_session = session
-        self._sessions: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = (weakref.WeakKeyDictionary())
-        # """@private"""
-        # if requests_session is None:
-        #     self.requests_session = requests.Session()
-        # else:
-        #     self.requests_session = requests_session
+        self._session_per_loop: dict[
+            asyncio.AbstractEventLoop, aiohttp.ClientSession
+        ] = {}
 
-    async def _loop_session(self) -> aiohttp.ClientSession:
-        """Return a ClientSession bound to *this* loop, lazily creating one."""
+        if session is not None:
+            # user supplied → bind it to *their* current loop
+            self._session_per_loop[asyncio.get_running_loop()] = session
+            self._owns_session = False
+        else:
+            self._owns_session = True  # we’ll create sessions lazily
+
+        self._sem = asyncio.Semaphore(64)
+
+    # --------------------------------------------------------------------- #
+    # helper: get or create the session bound to the current running loop   #
+    # --------------------------------------------------------------------- #
+    def _loop_session(self) -> aiohttp.ClientSession:
         loop = asyncio.get_running_loop()
-        if self._external_session is not None:
-            # caller manages lifetime; just return it
-            return self._external_session  # caller manages it
         try:
-            return self._sessions[loop]  # reuse if we made one
+            return self._session_per_loop[loop]
         except KeyError:
-            sess = aiohttp.ClientSession()
-            self._sessions[loop] = sess
+            sess = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60),
+                connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
+            )
+            self._session_per_loop[loop] = sess
             return sess
 
+    # --------------------------------------------------------------------- #
+    # graceful shutdown: close **all** sessions we own                      #
+    # --------------------------------------------------------------------- #
     async def aclose(self):
-        if self._external_session is None:
-            await asyncio.gather(*[s.close() for s in self._sessions.values()])
+        if self._owns_session:
+            for sess in list(self._session_per_loop.values()):
+                if not sess.closed:
+                    await sess.close()
 
     async def __aenter__(self):
         return self
@@ -140,36 +146,31 @@ class KuboCAS(ContentAddressedStore):
     async def __aexit__(self, *exc):
         await self.aclose()
 
+    # --------------------------------------------------------------------- #
+    # save() – now uses the per-loop session                                #
+    # --------------------------------------------------------------------- #
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
-        """@private"""
-        async with self._sem:  # throttle RPC calls if needed
-            session = await self._loop_session()  # your loop-local helper
+        async with self._sem:  # throttle RPC
             form = aiohttp.FormData()
-            # field-name MUST be "file", filename can be anything
             form.add_field(
                 "file", data, filename="blob", content_type="application/octet-stream"
             )
 
-            async with session.post(self.rpc_url, data=form) as resp:
-                resp.raise_for_status()  # no more 400s
+            async with self._loop_session().post(self.rpc_url, data=form) as resp:
+                resp.raise_for_status()
                 cid_str = (await resp.json())["Hash"]
 
-            cid = CID.decode(cid_str)
-            if cid.codec.code != self.DAG_PB_MARKER:
-                cid = cid.set(codec=codec)
-
-            return cid
+        cid = CID.decode(cid_str)
+        if cid.codec.code != self.DAG_PB_MARKER:
+            cid = cid.set(codec=codec)
+        return cid
 
     async def load(  # type: ignore CID is definitely in the IPLDKind type
         self, id: CID
     ) -> bytes:
         """@private"""
         url = self.gateway_base_url + str(id)
-        # If this coroutine is running inside an event loop,         #
-        # off-load the *blocking* requests call to a worker thread.  #
         async with self._sem:  # throttle gateway
-            async with (await self._loop_session()).get(
-                self.gateway_base_url + str(id)
-            ) as r:
-                r.raise_for_status()
-                return await r.read()
+            async with self._loop_session().get(url) as resp:
+                resp.raise_for_status()
+                return await resp.read()
