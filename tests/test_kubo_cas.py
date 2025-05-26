@@ -3,7 +3,6 @@ import dag_cbor
 from dag_cbor import IPLDKind
 from hypothesis import given, settings
 import pytest
-import requests
 
 from py_hamt import KuboCAS
 

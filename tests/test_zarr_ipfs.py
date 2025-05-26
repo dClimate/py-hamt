@@ -10,9 +10,6 @@ import zarr.core.buffer
 from py_hamt import HAMT, KuboCAS
 
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
-from testing_utils import (
-    create_ipfs,
-)  # noqa pytest detects by name but this shows up as unused import error
 
 
 @pytest.fixture(scope="module")

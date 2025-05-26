@@ -12,9 +12,6 @@ from hypothesis import strategies as st
 from hypothesis.strategies import SearchStrategy
 from multiformats import CID
 
-import aiohttp
-from py_hamt.store import KuboCAS  # Your KuboCAS import
-
 
 def cid_strategy() -> SearchStrategy:
     """Generate random CIDs for testing."""

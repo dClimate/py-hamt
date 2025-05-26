@@ -2,7 +2,6 @@ import asyncio
 import inspect
 from threading import Thread, Event
 
-import aiohttp
 import pytest
 
 from py_hamt.store import KuboCAS

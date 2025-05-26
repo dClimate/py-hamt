@@ -1,14 +1,11 @@
 import asyncio
 import aiohttp
-import weakref
 from typing import Literal
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
-from msgspec import json
 from multiformats import multihash
 from multiformats import CID
 from multiformats.multihash import Multihash
-import requests
 
 
 class ContentAddressedStore(ABC):
