@@ -111,16 +111,19 @@ class KuboCAS(ContentAddressedStore):
             timeout=aiohttp.ClientTimeout(total=60),
             connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
         )
-        self._session_per_loop: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+        self._session_per_loop: dict[
+            asyncio.AbstractEventLoop, aiohttp.ClientSession
+        ] = {}
 
         if session is not None:
             # user supplied → bind it to *their* current loop
             self._session_per_loop[asyncio.get_running_loop()] = session
             self._owns_session = False
         else:
-            self._owns_session = True          # we’ll create sessions lazily
+            self._owns_session = True  # we’ll create sessions lazily
 
         self._sem = asyncio.Semaphore(64)
+
     # --------------------------------------------------------------------- #
     # helper: get or create the session bound to the current running loop   #
     # --------------------------------------------------------------------- #
@@ -135,6 +138,7 @@ class KuboCAS(ContentAddressedStore):
             )
             self._session_per_loop[loop] = sess
             return sess
+
     # ---------- internal helper ----------
     def _get_session_for_current_loop(self) -> aiohttp.ClientSession:
         loop = asyncio.get_running_loop()
@@ -147,7 +151,7 @@ class KuboCAS(ContentAddressedStore):
             self._session_per_loop[loop] = sess
         return sess
 
-# --------------------------------------------------------------------- #
+    # --------------------------------------------------------------------- #
     # graceful shutdown: close **all** sessions we own                      #
     # --------------------------------------------------------------------- #
     async def aclose(self):
@@ -165,12 +169,12 @@ class KuboCAS(ContentAddressedStore):
     # --------------------------------------------------------------------- #
     # save() – now uses the per-loop session                                #
     # --------------------------------------------------------------------- #
-     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
-        async with self._sem:                                    # throttle RPC
+    async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
+        async with self._sem:  # throttle RPC
             form = aiohttp.FormData()
-            form.add_field("file", data,
-                           filename="blob",
-                           content_type="application/octet-stream")
+            form.add_field(
+                "file", data, filename="blob", content_type="application/octet-stream"
+            )
 
             async with self._session().post(self.rpc_url, data=form) as resp:
                 resp.raise_for_status()
