@@ -4,17 +4,12 @@ on: push
 
 jobs:
   validate:
-    needs: check-changes
     runs-on: ubuntu-latest
-    env:
-      SETUPTOOLS_USE_DISTUTILS: stdlib
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install base libraries
-        run: pip install nodeenv cython setuptools pip  --upgrade --quiet --user
       - uses: pre-commit/action@v3.0.1
   test:
     name: Create project environment, run all checks
