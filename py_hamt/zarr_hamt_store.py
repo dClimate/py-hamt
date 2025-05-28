@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator, Iterable
+from typing import Optional, Dict, List, Tuple, cast
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
@@ -52,13 +53,13 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
         assert hamt.read_only == read_only
         assert hamt.values_are_bytes
-        self.hamt = hamt
+        self.hamt: HAMT = hamt
         """
         The internal HAMT.
         Once done with write operations, the hamt can be set to read only mode as usual to get your root node ID.
         """
 
-        self.metadata_read_cache: dict[str, bytes] = dict()
+        self.metadata_read_cache: dict[str, bytes] = {}
         """@private"""
 
     @property
@@ -82,21 +83,23 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         try:
             val: bytes
             # do len check to avoid indexing into overly short strings, 3.12 does not throw errors but we dont know if other versions will
-            is_metadata = (
+            is_metadata: bool = (
                 len(key) >= 9 and key[-9:] == "zarr.json"
             )  # if path ends with zarr.json
 
             if is_metadata and key in self.metadata_read_cache:
                 val = self.metadata_read_cache[key]
             else:
-                val = await self.hamt.get(key)  # type: ignore We know values received will always be bytes since we only store bytes in the HAMT
+                val = cast(
+                    bytes, await self.hamt.get(key)
+                )  # We know values received will always be bytes since we only store bytes in the HAMT
                 if is_metadata:
                     self.metadata_read_cache[key] = val
 
             return prototype.buffer.from_bytes(val)
         except KeyError:
             # Sometimes zarr queries keys that don't exist anymore, just return nothing on those cases
-            return
+            return None
 
     async def get_partial_values(
         self,
@@ -168,22 +171,22 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         async for key in self.hamt.keys():
             yield key
 
-    async def list_prefix(self, prefix: str) -> AsyncIterator:
+    async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
         """@private"""
         async for key in self.hamt.keys():
             if key.startswith(prefix):
                 yield key
 
-    async def list_dir(self, prefix: str) -> AsyncIterator:
+    async def list_dir(self, prefix: str) -> AsyncIterator[str]:
         """
         @private
         """
         async for key in self.hamt.keys():
             if key.startswith(prefix):
-                suffix = key[len(prefix) :]
-                first_slash = suffix.find("/")
+                suffix: str = key[len(prefix) :]
+                first_slash: int = suffix.find("/")
                 if first_slash == -1:
                     yield suffix
                 else:
-                    name = suffix[0:first_slash]
+                    name: str = suffix[0:first_slash]
                     yield name

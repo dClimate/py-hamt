@@ -623,7 +623,7 @@ class HAMT:
         raw_hash: bytes = self.hash_fn(key.encode())
 
         current_id: IPLDKind = self.root_node_id
-        current_depth = 0
+        current_depth: int = 0
 
         # Don't check if result is none but use a boolean to indicate finding something, this is because None is a possible value of IPLDKind
         result_ptr: IPLDKind = None
@@ -643,7 +643,7 @@ class HAMT:
                     break
 
             if isinstance(item, list):
-                link = item[0]
+                link: IPLDKind = item[0]
                 current_id = link
                 current_depth += 1
                 continue
@@ -658,10 +658,10 @@ class HAMT:
 
     # Callers MUST handle locking or not on their own
     async def _iter_nodes(self) -> AsyncIterator[tuple[IPLDKind, Node]]:
-        node_id_stack = [self.root_node_id]
+        node_id_stack: List[IPLDKind] = [self.root_node_id]
         while len(node_id_stack) > 0:
-            top_id = node_id_stack.pop()
-            node = await self.node_store.load(top_id)
+            top_id: IPLDKind = node_id_stack.pop()
+            node: Node = await self.node_store.load(top_id)
             yield (top_id, node)
             node_id_stack.extend(list(node.iter_links()))
 
@@ -693,7 +693,7 @@ class HAMT:
 
         When the HAMT is write enabled, to maintain strong consistency it will acquire a lock and thus not allow any other operations to proceed until the length is fully done being calculated. If read only, then this can be run concurrently with other operations.
         """
-        count = 0
+        count: int = 0
         async for _ in self.keys():
             count += 1
 

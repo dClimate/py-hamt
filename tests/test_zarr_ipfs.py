@@ -120,20 +120,20 @@ async def test_write_read(
         async for k in zhs.hamt.keys():
             hamt_keys.add(k)
 
-        zhs_keys: set[str] = set()
+        zhs_keys_1: set[str] = set()
         async for k in zhs.list():
-            zhs_keys.add(k)
-        assert hamt_keys == zhs_keys
+            zhs_keys_1.add(k)
+        assert hamt_keys == zhs_keys_1
 
-        zhs_keys: set[str] = set()
+        zhs_keys_2: set[str] = set()
         async for k in zhs.list():
-            zhs_keys.add(k)
-        assert hamt_keys == zhs_keys
+            zhs_keys_2.add(k)
+        assert hamt_keys == zhs_keys_2
 
-        zhs_keys: set[str] = set()
+        zhs_keys_3: set[str] = set()
         async for k in zhs.list_prefix(""):
-            zhs_keys.add(k)
-        assert hamt_keys == zhs_keys
+            zhs_keys_3.add(k)
+        assert hamt_keys == zhs_keys_3
 
         with pytest.raises(NotImplementedError):
             await zhs.set_partial_values([])
@@ -164,11 +164,11 @@ async def test_write_read(
         await zhs.delete("zarr.json")
         # doing a duplicate delete should not result in an error
         await zhs.delete("zarr.json")
-        zhs_keys: set[str] = set()
+        zhs_keys_4: set[str] = set()
         async for k in zhs.list():
-            zhs_keys.add(k)
-        assert hamt_keys != zhs_keys
-        assert "zarr.json" not in zhs_keys
+            zhs_keys_4.add(k)
+        assert hamt_keys != zhs_keys_4
+        assert "zarr.json" not in zhs_keys_4
 
         await zhs.set_if_not_exists("zarr.json", previous_zarr_json)
         zarr_json_now = await zhs.get(
