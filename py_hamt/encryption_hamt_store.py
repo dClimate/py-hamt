@@ -7,6 +7,7 @@ from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
+
 class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
     """
     Write and read Zarr v3s with a HAMT, encrypting *everything* for maximum privacy.
@@ -141,10 +142,6 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
         byte_range: zarr.abc.store.ByteRequest | None = None,
     ) -> zarr.core.buffer.Buffer | None:
         """@private"""
-        if byte_range is not None:
-            raise NotImplementedError(
-                "Byte range requests are not supported by SimpleEncryptedZarrHAMTStore."
-            )
         try:
             # Fetch raw (encrypted) value from HAMT
             raw_val = await self.hamt.get(key)  # type: ignore

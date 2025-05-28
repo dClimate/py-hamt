@@ -25,6 +25,51 @@ def random_zarr_dataset():
     yield ds
 
 
+async def test_invalid_encryption_key_length():
+    """
+    Tests that SimpleEncryptedZarrHAMTStore raises a ValueError
+    if the encryption key is not exactly 32 bytes long.
+    """
+    async with KuboCAS() as kubo_cas:
+        hamt_write = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
+        header = b"test-header"
+        # --- Test with a key that is too short (31 bytes) ---
+        short_key = get_random_bytes(31)
+        with pytest.raises(
+            ValueError, match="Encryption key must be exactly 32 bytes long."
+        ):
+            print("\nTesting with a 31-byte key...")
+            SimpleEncryptedZarrHAMTStore(hamt_write, False, short_key, header)
+            print("Failed as expected.")
+
+        # --- Test with a key that is too long (33 bytes) ---
+        long_key = get_random_bytes(33)
+        with pytest.raises(
+            ValueError, match="Encryption key must be exactly 32 bytes long."
+        ):
+            print("Testing with a 33-byte key...")
+            SimpleEncryptedZarrHAMTStore(hamt_write, False, long_key, header)
+            print("Failed as expected.")
+
+        # --- Test with an empty key ---
+        empty_key = b""
+        with pytest.raises(
+            ValueError, match="Encryption key must be exactly 32 bytes long."
+        ):
+            print("Testing with an empty key...")
+            SimpleEncryptedZarrHAMTStore(hamt_write, False, empty_key, header)
+            print("Failed as expected.")
+
+        # --- Test with a correct key (should NOT raise) ---
+        correct_key = get_random_bytes(32)
+        try:
+            print("Testing with a 32-byte key...")
+            SimpleEncryptedZarrHAMTStore(hamt_write, False, correct_key, header)
+            print("Initialized successfully (as expected).")
+        except ValueError as e:
+            pytest.fail(f"Should NOT raise ValueError for a 32-byte key, but got: {e}")
+
+
 # Assume create_ipfs fixture exists and provides (rpc_base_url, gateway_base_url)
 # You might need to add: @pytest.mark.asyncio(loop_scope="session")
 @pytest.mark.asyncio
@@ -56,6 +101,10 @@ async def test_encrypted_write_read(
         ezhs_write = SimpleEncryptedZarrHAMTStore(
             hamt_write, False, correct_key, header
         )
+
+        # __eq__
+        assert ezhs_write == ezhs_write
+        assert ezhs_write != hamt_write
 
         assert ezhs_write.supports_writes
         test_ds.to_zarr(store=ezhs_write, mode="w", zarr_format=3)  # Use mode='w'
