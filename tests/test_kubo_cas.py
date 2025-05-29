@@ -19,6 +19,30 @@ async def test_memory_store_exception():
         await s.load(bytes())
 
 
+@pytest.mark.asyncio
+async def test_memory_store_invalid_key_type():
+    """Test that InMemoryCAS.load raises TypeError for non-bytes keys"""
+    s = InMemoryCAS()
+
+    # Test with various non-bytes types
+    invalid_keys = [
+        "string_key",
+        123,
+        12.34,
+        ["list", "key"],
+        {"dict": "key"},
+        None,
+        True,
+    ]
+
+    for invalid_key in invalid_keys:
+        with pytest.raises(
+            TypeError,
+            match=f"InMemoryCAS only supports byte‐hash keys; got {type(invalid_key).__name__}",
+        ):
+            await s.load(invalid_key)
+
+
 @pytest.mark.asyncio(loop_scope="session")
 @given(data=ipld_strategy())
 @settings(
@@ -52,9 +76,9 @@ async def test_kubo_default_urls(
                 # print(f"Loaded encoded data length: {len(loaded_encoded_data)}")
                 result = dag_cbor.decode(loaded_encoded_data)
                 # print(f"Decoded result: {result}")
-                assert data == result, (
-                    f"Data mismatch for codec {codec} with default URLs"
-                )
+                assert (
+                    data == result
+                ), f"Data mismatch for codec {codec} with default URLs"
             except Exception as e:
                 pytest.fail(
                     f"Error during KuboCAS default URL test (codec: {codec}): {e}"
