@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import Literal, Optional, Dict, cast, Any
+from typing import Literal, cast, Any
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
@@ -37,7 +37,7 @@ class ContentAddressedStore(ABC):
 class InMemoryCAS(ContentAddressedStore):
     """Used mostly for faster testing, this is why this is not exported. It hashes all inputs and uses that as a key to an in-memory python dict, mimicking a content addressed storage system. The hash bytes are the ID that `save` returns and `load` takes in."""
 
-    store: Dict[bytes, bytes]
+    store: dict[bytes, bytes]
     hash_alg: Multihash
 
     def __init__(self):
@@ -49,11 +49,26 @@ class InMemoryCAS(ContentAddressedStore):
         self.store[hash] = data
         return hash
 
-    async def load(self, id: bytes) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
-        if id in self.store:
-            return self.store[id]
+    async def load(self, id: IPLDKind) -> bytes:
+        """
+        `ContentAddressedStore` allows any IPLD scalar key.  For the in-memory
+        backend we *require* a `bytes` hash; anything else is rejected at run
+        time. In OO type-checking, a subclass may widen (make more general) argument types,
+        but it must never narrow them; otherwise callers that expect the base-class contract can break.
+        Mypy enforces this contra-variance rule and emits the “violates Liskov substitution principle” error.
+        This is why we use `cast` here, to tell mypy that we know what we are doing.
+        h/t https://stackoverflow.com/questions/75209249/overriding-a-method-mypy-throws-an-incompatible-with-super-type-error-when-ch
+        """
+        key = cast(bytes, id)
+        if not isinstance(key, (bytes, bytearray)):  # defensive guard
+            raise TypeError(
+                f"InMemoryCAS only supports byte‐hash keys; got {type(id).__name__}"
+            )
 
-        raise KeyError
+        try:
+            return self.store[key]
+        except KeyError as exc:
+            raise KeyError("Object not found in in-memory store") from exc
 
 
 class KuboCAS(ContentAddressedStore):

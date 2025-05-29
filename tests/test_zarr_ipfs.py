@@ -6,6 +6,7 @@ import xarray as xr
 import pytest
 import zarr
 import zarr.core.buffer
+from dag_cbor.ipld import IPLDKind
 
 from py_hamt import HAMT, KuboCAS
 
@@ -58,7 +59,7 @@ def random_zarr_dataset():
 # This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
 @pytest.mark.asyncio(loop_scope="session")  # ← match the loop of the fixture
 async def test_write_read(
-    create_ipfs,
+    create_ipfs: tuple[str, str],
     random_zarr_dataset: xr.Dataset,
 ):  # noqa for fixture which is imported above but then "redefined"
     rpc_base_url, gateway_base_url = create_ipfs
@@ -82,7 +83,7 @@ async def test_write_read(
         print(f"Total time in seconds: {elapsed:.2f}")
         print("=== Root CID")
         await hamt.make_read_only()
-        cid = hamt.root_node_id
+        cid: IPLDKind = hamt.root_node_id
         print(cid)
 
         print("=== Reading data back in and checking if identical")
@@ -116,7 +117,7 @@ async def test_write_read(
         assert not zhs.supports_partial_writes
         assert not zhs.supports_deletes
 
-        hamt_keys = set()
+        hamt_keys: set[str] = set()
         async for k in zhs.hamt.keys():
             hamt_keys.add(k)
 
@@ -143,16 +144,16 @@ async def test_write_read(
                 zarr.core.buffer.default_buffer_prototype(), []
             )
 
-        previous_zarr_json = await zhs.get(
+        previous_zarr_json: zarr.core.buffer.Buffer | None = await zhs.get(
             "zarr.json", zarr.core.buffer.default_buffer_prototype()
         )
         assert previous_zarr_json is not None
         # Setting a metadata file that should always exist should not change anything
         await zhs.set_if_not_exists(
             "zarr.json",
-            np.array([b"a"], dtype=np.bytes_),  # type: ignore
-        )  # type: ignore np.arrays, if dtype is bytes, is usable as a zarr buffer
-        zarr_json_now = await zhs.get(
+            np.array([b"a"], dtype=np.bytes_),  # type: ignore[arg-type]
+        )  # np.arrays, if dtype is bytes, is usable as a zarr buffer
+        zarr_json_now: zarr.core.buffer.Buffer | None = await zhs.get(
             "zarr.json", zarr.core.buffer.default_buffer_prototype()
         )
         assert zarr_json_now is not None

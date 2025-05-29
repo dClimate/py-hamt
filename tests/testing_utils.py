@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Generator, Tuple, Any
+
 
 import pytest
 from hypothesis import strategies as st
@@ -59,10 +61,10 @@ def find_free_port() -> int:
 
 
 @pytest.fixture(scope="module")
-def create_ipfs():
+def create_ipfs() -> Generator[Tuple[str, str], None, None]:
     # Create temporary directory, set it as the IPFS Path
-    temp_dir = Path(tempfile.mkdtemp())
-    custom_env = os.environ.copy()
+    temp_dir: Path = Path(tempfile.mkdtemp())
+    custom_env: dict[str, str] = os.environ.copy()
     custom_env["IPFS_PATH"] = str(temp_dir)
 
     # IPFS init
@@ -71,21 +73,23 @@ def create_ipfs():
     )
 
     # Edit the config file so that it serves on randomly selected and available ports to not conflict with any currently running ipfs daemons
-    swarm_port = find_free_port()
-    rpc_port = find_free_port()
-    gateway_port = find_free_port()
+    swarm_port: int = find_free_port()
+    rpc_port: int = find_free_port()
+    gateway_port: int = find_free_port()
 
-    config_path = temp_dir / "config"
-    config: dict
+    config_path: Path = temp_dir / "config"
+    config: dict[str, Any]
     with open(config_path, "r") as f:
         config = json.load(f)
 
     swarm_addrs: list[str] = config["Addresses"]["Swarm"]
-    new_port_swarm_addrs = [s.replace("4001", str(swarm_port)) for s in swarm_addrs]
+    new_port_swarm_addrs: list[str] = [
+        s.replace("4001", str(swarm_port)) for s in swarm_addrs
+    ]
     config["Addresses"]["Swarm"] = new_port_swarm_addrs
 
-    rpc_multiaddr = config["Addresses"]["API"]
-    gateway_multiaddr = config["Addresses"]["Gateway"]
+    rpc_multiaddr: str = config["Addresses"]["API"]
+    gateway_multiaddr: str = config["Addresses"]["Gateway"]
 
     config["Addresses"]["API"] = rpc_multiaddr.replace("5001", str(rpc_port))
     config["Addresses"]["Gateway"] = gateway_multiaddr.replace(
@@ -96,10 +100,12 @@ def create_ipfs():
         json.dump(config, f, indent=2)
 
     # Start the daemon
-    rpc_uri_stem = f"http://127.0.0.1:{rpc_port}"
-    gateway_uri_stem = f"http://127.0.0.1:{gateway_port}"
+    rpc_uri_stem: str = f"http://127.0.0.1:{rpc_port}"
+    gateway_uri_stem: str = f"http://127.0.0.1:{gateway_port}"
 
-    ipfs_process = subprocess.Popen(["ipfs", "daemon"], env=custom_env)
+    ipfs_process: subprocess.Popen[bytes] = subprocess.Popen(
+        ["ipfs", "daemon"], env=custom_env
+    )
     # Should be enough time for the ipfs daemon process to start up
     time.sleep(5)
 

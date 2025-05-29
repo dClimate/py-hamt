@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator, Iterable
-from typing import Optional, Dict, List, Tuple, cast
+from typing import cast
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
