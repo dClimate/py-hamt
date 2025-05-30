@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import Literal, Optional
+from typing import Literal, cast, Any, Optional
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
@@ -45,16 +45,27 @@ class InMemoryCAS(ContentAddressedStore):
         self.hash_alg = multihash.get("blake3")
 
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> bytes:
-        hash = self.hash_alg.digest(data, size=32)
+        hash: bytes = self.hash_alg.digest(data, size=32)
         self.store[hash] = data
         return hash
 
-    async def load(self, id: bytes, offset: Optional[int] = None, length: Optional[int] = None, suffix: Optional[int] = None) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
-        if id not in self.store:
-            raise KeyError
-        
-        data = self.store[id]
-
+    async def load(self, id: IPLDKind, offset: Optional[int] = None, length: Optional[int] = None, suffix: Optional[int] = None) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
+        """
+        `ContentAddressedStore` allows any IPLD scalar key.  For the in-memory
+        backend we *require* a `bytes` hash; anything else is rejected at run
+        time. In OO type-checking, a subclass may widen (make more general) argument types,
+        but it must never narrow them; otherwise callers that expect the base-class contract can break.
+        Mypy enforces this contra-variance rule and emits the “violates Liskov substitution principle” error.
+        This is why we use `cast` here, to tell mypy that we know what we are doing.
+        h/t https://stackoverflow.com/questions/75209249/overriding-a-method-mypy-throws-an-incompatible-with-super-type-error-when-ch
+        """
+        key = cast(bytes, id)
+        data: bytes
+        try:
+            data = self.store[key]
+        except KeyError as exc:
+            raise KeyError("Object not found in in-memory store") from exc
+    
         if offset is not None:
             start = offset
             if length is not None:
@@ -62,9 +73,9 @@ class InMemoryCAS(ContentAddressedStore):
                 return data[start:end]
             else:
                 return data[start:]
-        elif suffix is not None: # If only length is given, assume start from 0
+        elif suffix is not None:  # If only length is given, assume start from 0
             return data[-suffix:]
-        else: # Full load
+        else:  # Full load
             return data
 
 
@@ -75,10 +86,10 @@ class KuboCAS(ContentAddressedStore):
     `save` uses the RPC API and `load` uses the HTTP Gateway. This means that read-only HAMTs will only access the HTTP Gateway, so no RPC endpoint is required for use.
     """
 
-    KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL = "http://127.0.0.1:8080"
-    KUBO_DEFAULT_LOCAL_RPC_BASE_URL = "http://127.0.0.1:5001"
+    KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL: str = "http://127.0.0.1:8080"
+    KUBO_DEFAULT_LOCAL_RPC_BASE_URL: str = "http://127.0.0.1:5001"
 
-    DAG_PB_MARKER = 0x70
+    DAG_PB_MARKER: int = 0x70
     """@private"""
 
     # Take in a aiohttp session that can be reused across POSTs and GETs to a specific ipfs daemon, also allow for not doing that and creating our own single request lifetime session instead
@@ -102,7 +113,7 @@ class KuboCAS(ContentAddressedStore):
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
 
-        self.hasher = hasher
+        self.hasher: str = hasher
         """The hash function to send to IPFS when storing bytes. Cannot be changed after initialization. The default blake3 follows the default hashing algorithm used by HAMT."""
 
         if rpc_base_url is None:
@@ -110,9 +121,9 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
-        self.rpc_url = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
+        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
         """@private"""
-        self.gateway_base_url = gateway_base_url + "/ipfs/"
+        self.gateway_base_url: str = f"{gateway_base_url}/ipfs/"
         """@private"""
 
         self._session_per_loop: dict[
@@ -122,17 +133,17 @@ class KuboCAS(ContentAddressedStore):
         if session is not None:
             # user supplied → bind it to *their* current loop
             self._session_per_loop[asyncio.get_running_loop()] = session
-            self._owns_session = False
+            self._owns_session: bool = False
         else:
             self._owns_session = True  # we’ll create sessions lazily
 
-        self._sem = asyncio.Semaphore(64)
+        self._sem: asyncio.Semaphore = asyncio.Semaphore(64)
 
     # --------------------------------------------------------------------- #
     # helper: get or create the session bound to the current running loop   #
     # --------------------------------------------------------------------- #
     def _loop_session(self) -> aiohttp.ClientSession:
-        loop = asyncio.get_running_loop()
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
             return self._session_per_loop[loop]
         except KeyError:
@@ -146,16 +157,16 @@ class KuboCAS(ContentAddressedStore):
     # --------------------------------------------------------------------- #
     # graceful shutdown: close **all** sessions we own                      #
     # --------------------------------------------------------------------- #
-    async def aclose(self):
+    async def aclose(self) -> None:
         if self._owns_session:
             for sess in list(self._session_per_loop.values()):
                 if not sess.closed:
                     await sess.close()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "KuboCAS":
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, *exc: Any) -> None:
         await self.aclose()
 
     # --------------------------------------------------------------------- #
@@ -170,23 +181,24 @@ class KuboCAS(ContentAddressedStore):
 
             async with self._loop_session().post(self.rpc_url, data=form) as resp:
                 resp.raise_for_status()
-                cid_str = (await resp.json())["Hash"]
+                cid_str: str = (await resp.json())["Hash"]
 
-        cid = CID.decode(cid_str)
+        cid: CID = CID.decode(cid_str)
         if cid.codec.code != self.DAG_PB_MARKER:
             cid = cid.set(codec=codec)
         return cid
 
     async def load(  # type: ignore CID is definitely in the IPLDKind type
         self, 
-        id: CID,
+        id: IPLDKind,
         offset: Optional[int] = None,
         length: Optional[int] = None,
         suffix: Optional[int] = None
     ) -> bytes:
         """@private"""
-        url = self.gateway_base_url + str(id)
-        headers = {}
+        cid = cast(CID, id)
+        url: str = self.gateway_base_url + str(id)
+        headers: dict[str, str] = {}
 
         # Construct the Range header if required
         if offset is not None:
