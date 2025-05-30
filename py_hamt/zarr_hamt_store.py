@@ -112,6 +112,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
             if is_metadata and byte_range is None and key in self.metadata_read_cache:
                 val = self.metadata_read_cache[key]
             else:
+                offset, length, suffix = self._map_byte_request(byte_range)
                 val = cast(
                     bytes, await self.hamt.get(key, offset=offset, length=length, suffix=suffix)
                 )  # We know values received will always be bytes since we only store bytes in the HAMT
