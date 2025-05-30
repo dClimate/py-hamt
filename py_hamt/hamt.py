@@ -3,6 +3,7 @@ from typing import Callable, Iterator, AsyncIterator
 import uuid
 import asyncio
 from copy import deepcopy
+from typing import Optional
 
 import dag_cbor
 from dag_cbor.ipld import IPLDKind
@@ -571,10 +572,10 @@ class HAMT:
                 # If we didn't make a change, then this key must not exist within the HAMT
                 raise KeyError
 
-    async def get(self, key: str) -> IPLDKind:
+    async def get(self, key: str, offset: Optional[int] = None, length: Optional[int] = None, suffix: Optional[int] = None) -> IPLDKind:
         """Get a value."""
         pointer = await self.get_pointer(key)
-        data = await self.cas.load(pointer)
+        data = await self.cas.load(pointer, offset=offset, length=length, suffix=suffix)
         if self.values_are_bytes:
             return data
         else:

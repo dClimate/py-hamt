@@ -2,9 +2,10 @@ from collections.abc import AsyncIterator, Iterable
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
+from typing import Optional
+import asyncio
 
 from py_hamt.hamt import HAMT
-
 
 class ZarrHAMTStore(zarr.abc.store.Store):
     """
@@ -61,6 +62,27 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         self.metadata_read_cache: dict[str, bytes] = dict()
         """@private"""
 
+    def _map_byte_request(self, byte_range: Optional[zarr.abc.store.ByteRequest]) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        """Helper to map Zarr ByteRequest to offset, length, suffix."""
+        offset: Optional[int] = None
+        length: Optional[int] = None
+        suffix: Optional[int] = None
+
+        if byte_range:
+            if isinstance(byte_range, zarr.abc.store.RangeByteRequest):
+                offset = byte_range.start
+                length = byte_range.end - byte_range.start
+                if length < 0:
+                    raise ValueError("End must be >= start for RangeByteRequest")
+            elif isinstance(byte_range, zarr.abc.store.OffsetByteRequest):
+                offset = byte_range.offset
+            elif isinstance(byte_range, zarr.abc.store.SuffixByteRequest):
+                suffix = byte_range.suffix
+            else:
+                raise TypeError(f"Unsupported ByteRequest type: {type(byte_range)}")
+        
+        return offset, length, suffix
+
     @property
     def read_only(self) -> bool:
         """@private"""
@@ -86,25 +108,39 @@ class ZarrHAMTStore(zarr.abc.store.Store):
                 len(key) >= 9 and key[-9:] == "zarr.json"
             )  # if path ends with zarr.json
 
-            if is_metadata and key in self.metadata_read_cache:
+            if is_metadata and byte_range is None and key in self.metadata_read_cache:
                 val = self.metadata_read_cache[key]
             else:
-                val = await self.hamt.get(key)  # type: ignore We know values received will always be bytes since we only store bytes in the HAMT
-                if is_metadata:
+                offset, length, suffix = self._map_byte_request(byte_range)
+
+                val = await self.hamt.get(key, offset=offset, length=length, suffix=suffix)  # type: ignore We know values received will always be bytes since we only store bytes in the HAMT
+                # Update cache only on full metadata reads
+                if is_metadata and byte_range is None:
                     self.metadata_read_cache[key] = val
 
             return prototype.buffer.from_bytes(val)
         except KeyError:
             # Sometimes zarr queries keys that don't exist anymore, just return nothing on those cases
             return
+        except Exception as e:
+            print(f"Error getting key '{key}' with range {byte_range}: {e}")
+            raise
+
 
     async def get_partial_values(
         self,
         prototype: zarr.core.buffer.BufferPrototype,
         key_ranges: Iterable[tuple[str, zarr.abc.store.ByteRequest | None]],
     ) -> list[zarr.core.buffer.Buffer | None]:
-        """@private"""
-        raise NotImplementedError
+        """
+        Retrieves multiple keys or byte ranges concurrently using asyncio.gather.
+        """
+        tasks = [
+            self.get(key, prototype, byte_range)
+            for key, byte_range in key_ranges
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False) # Set return_exceptions=True for debugging
+        return results
 
     async def exists(self, key: str) -> bool:
         """@private"""

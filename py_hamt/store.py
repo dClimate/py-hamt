@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import Literal
+from typing import Literal, Optional
 from abc import ABC, abstractmethod
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
@@ -30,7 +30,7 @@ class ContentAddressedStore(ABC):
         """
 
     @abstractmethod
-    async def load(self, id: IPLDKind) -> bytes:
+    async def load(self, id: IPLDKind, offset: Optional[int] = None, length: Optional[int] = None, suffix: Optional[int] = None) -> bytes:
         """Retrieve data."""
 
 
@@ -49,11 +49,23 @@ class InMemoryCAS(ContentAddressedStore):
         self.store[hash] = data
         return hash
 
-    async def load(self, id: bytes) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
-        if id in self.store:
-            return self.store[id]
+    async def load(self, id: bytes, offset: Optional[int] = None, length: Optional[int] = None, suffix: Optional[int] = None) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
+        if id not in self.store:
+            raise KeyError
+        
+        data = self.store[id]
 
-        raise KeyError
+        if offset is not None:
+            start = offset
+            if length is not None:
+                end = start + length
+                return data[start:end]
+            else:
+                return data[start:]
+        elif suffix is not None: # If only length is given, assume start from 0
+            return data[-suffix:]
+        else: # Full load
+            return data
 
 
 class KuboCAS(ContentAddressedStore):
@@ -166,11 +178,31 @@ class KuboCAS(ContentAddressedStore):
         return cid
 
     async def load(  # type: ignore CID is definitely in the IPLDKind type
-        self, id: CID
+        self, 
+        id: CID,
+        offset: Optional[int] = None,
+        length: Optional[int] = None,
+        suffix: Optional[int] = None
     ) -> bytes:
         """@private"""
         url = self.gateway_base_url + str(id)
+        headers = {}
+
+        # Construct the Range header if required
+        if offset is not None:
+            start = offset
+            if length is not None:
+                # Standard HTTP Range: bytes=start-end (inclusive)
+                end = start + length - 1
+                headers["Range"] = f"bytes={start}-{end}"
+            else:
+                # Standard HTTP Range: bytes=start- (from start to end)
+                headers["Range"] = f"bytes={start}-"
+        elif suffix is not None:
+            # Standard HTTP Range: bytes=-N (last N bytes)
+            headers["Range"] = f"bytes=-{suffix}"
+
         async with self._sem:  # throttle gateway
-            async with self._loop_session().get(url) as resp:
+            async with self._loop_session().get(url, headers=headers or None) as resp:
                 resp.raise_for_status()
                 return await resp.read()
