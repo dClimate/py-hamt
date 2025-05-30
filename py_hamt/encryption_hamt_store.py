@@ -4,6 +4,7 @@ from py_hamt.hamt import HAMT
 from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
+from typing import cast
 
 
 class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
@@ -101,7 +102,7 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
             raise ValueError("Encryption key must be exactly 32 bytes long.")
         self.encryption_key = encryption_key
         self.header = header
-        self.metadata_read_cache: dict[str, bytes] = dict()
+        self.metadata_read_cache: dict[str, bytes] = {}
 
     def _encrypt(self, val: bytes) -> bytes:
         """Encrypts data using ChaCha20-Poly1305."""
@@ -145,14 +146,16 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
         """@private"""
         try:
             decrypted_val: bytes
-            is_metadata = (
+            is_metadata: bool = (
                 len(key) >= 9 and key[-9:] == "zarr.json"
             )  # if path ends with zarr.json
 
             if is_metadata and key in self.metadata_read_cache:
                 decrypted_val = self.metadata_read_cache[key]
             else:
-                raw_val = await self.hamt.get(key)  # type: ignore
+                raw_val = cast(
+                    bytes, await self.hamt.get(key)
+                )  # We know values received will always be bytes since we only store bytes in the HAMT
                 decrypted_val = self._decrypt(raw_val)
                 if is_metadata:
                     self.metadata_read_cache[key] = decrypted_val
