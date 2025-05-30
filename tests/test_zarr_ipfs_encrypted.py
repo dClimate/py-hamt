@@ -131,6 +131,10 @@ async def test_encrypted_write_read(
         xr.testing.assert_identical(test_ds, ds_read_ok)
         print("Data verified.")
 
+        # Open another zarr with the same store to ensure caching works
+        ds_check_again = xr.open_zarr(store=ezhs_read_ok)
+        xr.testing.assert_identical(test_ds, ds_check_again)
+
         # --- Test: Read with Incorrect Key ---
         print("\n--- Reading Encrypted Zarr (Incorrect Key) ---")
         hamt_read_bad_key = await HAMT.build(

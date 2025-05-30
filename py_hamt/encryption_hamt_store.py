@@ -1,7 +1,5 @@
-from collections.abc import AsyncIterator, Iterable
 import zarr.abc.store
 import zarr.core.buffer
-from zarr.core.common import BytesLike
 from py_hamt.hamt import HAMT
 from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
@@ -16,6 +14,8 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
     stored in the Zarr, including all metadata (`zarr.json`, `.zarray`, etc.)
     and data chunks. This provides strong privacy but means the Zarr store is
     completely opaque and unusable without the correct encryption key and header.
+
+    Note: For standard zarr encryption and decryption where metadata is available use the method in https://github.com/dClimate/jupyter-notebooks/blob/main/notebooks/202b%20-%20Encryption%20Example%20(Encryption%20with%20Zarr%20Codecs).ipynb
 
     #### Encryption Details
     - Uses XChaCha20_Poly1305 (via pycryptodome's ChaCha20_Poly1305 with a 24-byte nonce).
@@ -101,6 +101,7 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
             raise ValueError("Encryption key must be exactly 32 bytes long.")
         self.encryption_key = encryption_key
         self.header = header
+        self.metadata_read_cache: dict[str, bytes] = dict()
 
     def _encrypt(self, val: bytes) -> bytes:
         """Encrypts data using ChaCha20-Poly1305."""
@@ -143,10 +144,18 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
     ) -> zarr.core.buffer.Buffer | None:
         """@private"""
         try:
-            # Fetch raw (encrypted) value from HAMT
-            raw_val = await self.hamt.get(key)  # type: ignore
-            # Decrypt it
-            decrypted_val = self._decrypt(raw_val)
+            decrypted_val: bytes
+            is_metadata = (
+                len(key) >= 9 and key[-9:] == "zarr.json"
+            )  # if path ends with zarr.json
+
+            if is_metadata and key in self.metadata_read_cache:
+                decrypted_val = self.metadata_read_cache[key]
+            else:
+                raw_val = await self.hamt.get(key)  # type: ignore
+                decrypted_val = self._decrypt(raw_val)
+                if is_metadata:
+                    self.metadata_read_cache[key] = decrypted_val
             return prototype.buffer.from_bytes(decrypted_val)
         except KeyError:
             return None
@@ -157,6 +166,8 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
             raise Exception("Cannot write to a read-only store.")
 
         raw_bytes = value.to_bytes()
+        if key in self.metadata_read_cache:
+            self.metadata_read_cache[key] = raw_bytes
         # Encrypt it
         encrypted_bytes = self._encrypt(raw_bytes)
         await self.hamt.set(key, encrypted_bytes)
