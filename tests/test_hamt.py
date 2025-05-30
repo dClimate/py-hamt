@@ -5,6 +5,7 @@ from dag_cbor import IPLDKind
 from multiformats import CID
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from typing import cast
 import pytest
 
 from py_hamt.hamt import HAMT, Node
@@ -18,7 +19,7 @@ from testing_utils import key_value_list
 @settings(
     deadline=1000
 )  # increase for github CI which sometimes takes longer than the default 250 ms
-async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
+async def test_fuzz(kvs: list[tuple[str, IPLDKind]]) -> None:
     cas = InMemoryCAS()
     hamt = await HAMT.build(cas=cas)
 
@@ -39,7 +40,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     await hamt.make_read_only()
 
     # Verify completely concurrently
-    async def verify(k, v):
+    async def verify(k: str, v: IPLDKind):
         assert (await hamt.get(k)) == v
 
     await asyncio.gather(*[verify(k, v) for k, v in kvs])
@@ -57,7 +58,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     await hamt.enable_write()
 
     # HAMT should be throwing errors on keys that do not exist
-    ks = [k for k, _ in kvs]
+    ks: list[str] = [k for k, _ in kvs]
     key_that_cannot_exist = "".join(ks).join(
         "string to account for empty string key case"
     )
@@ -66,9 +67,9 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     with pytest.raises(KeyError):
         await hamt.delete(key_that_cannot_exist)
 
-    hamt_keys = [key async for key in hamt.keys()]
-    hamt_key_set = set(hamt_keys)
-    keys_set = set()
+    hamt_keys: list[str] = [key async for key in hamt.keys()]
+    hamt_key_set: set[str] = set(hamt_keys)
+    keys_set: set[str] = set()
     for key, _ in kvs:
         keys_set.add(key)
 
@@ -76,7 +77,9 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
 
     # Make sure all pointers actually exist in the store, this should not raise any exceptions
     for k, _ in kvs:
-        pointer: bytes = await hamt.get_pointer(k)  # type: ignore we know that InMemoryCAS only returns bytes for its IDs
+        pointer: bytes = cast(
+            bytes, await hamt.get_pointer(k)
+        )  # we know that InMemoryCAS only returns bytes for its IDs
         await cas.load(pointer)
 
     await hamt.make_read_only()
@@ -85,7 +88,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     with pytest.raises(Exception, match="Cannot call delete on a read only HAMT"):
         await hamt.delete("foo")
 
-    async def verify_kvs_and_len(h: HAMT):
+    async def verify_kvs_and_len(h: HAMT) -> None:
         for k, v in kvs:
             assert (await h.get(k)) == v
         assert len([key async for key in h.keys()]) == (await h.len()) == len(kvs)
@@ -121,13 +124,13 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
 
     # Cache size management code branches coverage, do it all in async concurrency
 
-    small_cache_size_bytes = 1000
+    small_cache_size_bytes: int = 1000
     # Read cache
     read_hamt = await HAMT.build(
         cas=cas, root_node_id=hamt.root_node_id, read_only=True
     )
 
-    async def get_and_vacate(k, v):
+    async def get_and_vacate(k: str, v: IPLDKind) -> None:
         assert (await read_hamt.get(k)) == v
         if (await read_hamt.cache_size()) > small_cache_size_bytes:
             await read_hamt.cache_vacate()
@@ -139,7 +142,7 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]):
     # set small max bucket size to force more linking and more nodes
     small_memory_tree = await HAMT.build(cas=cas, max_bucket_size=1)
 
-    async def set_and_vacate(k, v):
+    async def set_and_vacate(k: str, v: IPLDKind) -> None:
         await small_memory_tree.set(k, v)
         assert (await small_memory_tree.get(k)) == v
         if (await small_memory_tree.cache_size()) > small_cache_size_bytes:
