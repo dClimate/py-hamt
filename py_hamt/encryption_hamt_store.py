@@ -32,7 +32,7 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
     #### Sample Code
     ```python
     import xarray
-    from py_hamt import HAMT, IPFSStore # Assuming an IPFSStore or similar
+    from py_hamt import HAMT, KuboCAS # Assuming an KuboCAS or similar
     from Crypto.Random import get_random_bytes
     import numpy as np
 
@@ -41,12 +41,12 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
         {"data": (("y", "x"), np.arange(12).reshape(3, 4))},
         coords={"y": [1, 2, 3], "x": [10, 20, 30, 40]}
     )
-    cas = IPFSStore() # Example ContentAddressedStore
+    cas = KuboCAS() # Example ContentAddressedStore
     encryption_key = get_random_bytes(32)
     header = b"fully-encrypted-zarr"
 
     # --- Write ---
-    hamt_write = HAMT(cas=cas, values_are_bytes=True, read_only=False)
+    hamt_write = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
     ezhs_write = SimpleEncryptedZarrHAMTStore(
         hamt_write, False, encryption_key, header
     )
@@ -57,7 +57,9 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
     print(f"Wrote Zarr with root: {root_node_id}")
 
     # --- Read ---
-    hamt_read = HAMT(cas=cas, root_node_id=root_node_id, read_only=True, values_are_bytes=True)
+    hamt_read = await HAMT.build(
+            cas=kubo_cas, root_node_id=root_node_id, values_are_bytes=True, read_only=True
+        )
     ezhs_read = SimpleEncryptedZarrHAMTStore(
         hamt_read, True, encryption_key, header
     )
