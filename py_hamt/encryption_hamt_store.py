@@ -72,8 +72,11 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
 
     # --- Read with wrong key (demonstrates failure) ---
     wrong_key = get_random_bytes(32)
-    hamt_bad = HAMT(cas=cas, root_node_id=root_node_id, read_only=True, values_are_bytes=True)
+    hamt_bad = await HAMT.build(
+        cas=cas, root_node_id=root_node_id, read_only=True, values_are_bytes=True
+    )
     ezhs_bad = SimpleEncryptedZarrHAMTStore(
+        hamt_bad, True, wrong_key, header
         hamt_bad, True, wrong_key, header
     )
     print("\nAttempting to read with wrong key...")
