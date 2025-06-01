@@ -181,12 +181,17 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         """
         @private
         """
+        seen_names: set[str] = set()
         async for key in self.hamt.keys():
             if key.startswith(prefix):
                 suffix: str = key[len(prefix) :]
                 first_slash: int = suffix.find("/")
                 if first_slash == -1:
-                    yield suffix
+                    if suffix not in seen_names:
+                        seen_names.add(suffix)
+                        yield suffix
                 else:
                     name: str = suffix[0:first_slash]
-                    yield name
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        yield name
