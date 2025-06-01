@@ -46,7 +46,7 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
     header = b"fully-encrypted-zarr"
 
     # --- Write ---
-    hamt_write = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
+    hamt_write = await HAMT.build(cas=cas, values_are_bytes=True)
     ezhs_write = SimpleEncryptedZarrHAMTStore(
         hamt_write, False, encryption_key, header
     )
@@ -58,7 +58,7 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
 
     # --- Read ---
     hamt_read = await HAMT.build(
-            cas=kubo_cas, root_node_id=root_node_id, values_are_bytes=True, read_only=True
+            cas=cas, root_node_id=root_node_id, values_are_bytes=True, read_only=True
         )
     ezhs_read = SimpleEncryptedZarrHAMTStore(
         hamt_read, True, encryption_key, header
