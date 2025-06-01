@@ -11,27 +11,42 @@ class ZarrHAMTStore(zarr.abc.store.Store):
     """
     Write and read Zarr v3s with a HAMT.
 
+    Read **or** write a Zarr-v3 store whose key/value pairs live inside a
+    py-hamt mapping.
+
+    Keys are stored verbatim (``"temp/c/0/0/0"`` → same string in HAMT) and
+    the value is the raw byte payload produced by Zarr.  No additional
+    framing, compression, or encryption is applied by this class. For a zarr encryption example
+    see where metadata is available use the method in https://github.com/dClimate/jupyter-notebooks/blob/main/notebooks/202b%20-%20Encryption%20Example%20(Encryption%20with%20Zarr%20Codecs).ipynb
+    For a fully encrypted zarr store, where metadata is not available, please see
+    :class:`SimpleEncryptedZarrHAMTStore` but we do not recommend using it.
+
     #### A note about using the same `ZarrHAMTStore` for writing and then reading again
     If you write a Zarr to a HAMT, and then change it to read only mode, it's best to reinitialize a new ZarrHAMTStore with the proper read only setting. This is because this class, to err on the safe side, will not touch its super class's settings.
 
     #### Sample Code
     ```python
-    # Write
+    # --- Write ---
     ds: xarray.Dataset = # ...
     cas: ContentAddressedStore = # ...
     hamt: HAMT = # ... make sure values_are_bytes is True and read_only is False to enable writes
-    zhs = ZarrHAMTStore(hamt, False)
-    xarray.to_zarr(store=zhs)
-    await hamt.make_read_only()
+    hamt = await HAMT.build(cas, values_are_bytes=True)     # write-enabled
+    zhs  = ZarrHAMTStore(hamt, read_only=False)
+    ds.to_zarr(store=zhs, mode="w", zarr_format=3)
+    await hamt.make_read_only() # flush + freeze
     root_node_id = hamt.root_node_id
     print(root_node_id)
 
-    # Read
-    hamt_read = HAMT(cas=cas, root_node_id=root_node_id, read_only=True, values_are_bytes=True)
-    zhs_read = ZarrHAMTStore(hamt, True)
-    ds_read = xarray.open_zarr(store=zhs_read)
-    print(ds_read)
-    xarray.testing.assert_identical(ds, ds_read)
+     # --- read ---
+    hamt_ro = await HAMT.build(
+        cas, root_node_id=root_cid, read_only=True, values_are_bytes=True
+    )
+    zhs_ro  = ZarrHAMTStore(hamt_ro, read_only=True)
+    ds_ro = xarray.open_zarr(store=zhs_ro)
+
+
+    print(ds_ro)
+    xarray.testing.assert_identical(ds, ds_ro)
     ```
     """
 

@@ -77,7 +77,6 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
     )
     ezhs_bad = SimpleEncryptedZarrHAMTStore(
         hamt_bad, True, wrong_key, header
-        hamt_bad, True, wrong_key, header
     )
     print("\nAttempting to read with wrong key...")
     try:
