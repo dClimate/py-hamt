@@ -34,3 +34,6 @@ dev = [
     "mypy>=1.15.0",
     "pandas-stubs>=2.2.3.250527",
 ]
+
+[tool.ruff]
+lint.extend-select = ["I"]
