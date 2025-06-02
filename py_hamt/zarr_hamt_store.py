@@ -8,6 +8,7 @@ import asyncio
 
 from py_hamt.hamt import HAMT
 
+
 class ZarrHAMTStore(zarr.abc.store.Store):
     """
     Write and read Zarr v3s with a HAMT.

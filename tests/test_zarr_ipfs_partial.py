@@ -6,11 +6,12 @@ import xarray as xr
 import pytest
 import zarr
 import zarr.core.buffer
+
 # Make sure to import the ByteRequest types
 from zarr.abc.store import RangeByteRequest, OffsetByteRequest, SuffixByteRequest
 
 
-from py_hamt import HAMT, KuboCAS
+from py_hamt import HAMT, KuboCAS, InMemoryCAS
 
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
@@ -57,6 +58,7 @@ def random_zarr_dataset():
 
     yield ds
 
+
 # This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
 @pytest.mark.asyncio(loop_scope="session")  # ← match the loop of the fixture
 async def test_write_read(
@@ -67,7 +69,6 @@ async def test_write_read(
     test_ds = random_zarr_dataset
     print("=== Writing this xarray Dataset to a Zarr v3 on IPFS ===")
     print(test_ds)
-
 
     async with KuboCAS(  # <-- own and auto-close session
         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
@@ -210,3 +211,60 @@ async def test_write_read(
 
         with pytest.raises(NotImplementedError):
             await zhs_read.set_partial_values([])
+
+
+@pytest.mark.asyncio
+async def test_zarr_hamt_store_byte_request_errors():
+    """Tests error handling for unsupported or invalid ByteRequest types."""
+    cas = InMemoryCAS()
+    hamt = await HAMT.build(cas=cas, values_are_bytes=True)
+    zhs = ZarrHAMTStore(hamt)
+    proto = zarr.core.buffer.default_buffer_prototype()
+    await zhs.set("some_key", proto.buffer.from_bytes(b"0123456789"))
+
+    # Test for ValueError with an invalid range (end < start)
+    invalid_range_req = RangeByteRequest(start=10, end=5)
+    with pytest.raises(ValueError, match="End must be >= start for RangeByteRequest"):
+        await zhs.get("some_key", proto, byte_range=invalid_range_req)
+
+    # Test for TypeError with a custom, unsupported request type
+    class DummyUnsupportedRequest:
+        pass
+
+    unsupported_req = DummyUnsupportedRequest()
+    with pytest.raises(TypeError, match="Unsupported ByteRequest type"):
+        await zhs.get("some_key", proto, byte_range=unsupported_req)
+
+
+@pytest.mark.asyncio
+async def test_in_memory_cas_partial_reads():
+    """
+    Tests the partial read logic (offset, length, suffix) in the InMemoryCAS.
+    """
+    cas = InMemoryCAS()
+    test_data = b"0123456789abcdefghijklmnopqrstuvwxyz"  # 36 bytes long
+    data_id = await cas.save(test_data, "raw")
+
+    # Test case 1: offset and length
+    result = await cas.load(data_id, offset=10, length=5)
+    assert result == b"abcde"
+
+    # Test case 2: offset only
+    result = await cas.load(data_id, offset=30)
+    assert result == b"uvwxyz"
+
+    # Test case 3: suffix only
+    result = await cas.load(data_id, suffix=6)
+    assert result == b"uvwxyz"
+
+    # Test case 4: Full read (for completeness)
+    result = await cas.load(data_id)
+    assert result == test_data
+
+    # Test case 5: Key not found (covers `try...except KeyError`)
+    with pytest.raises(KeyError, match="Object not found in in-memory store"):
+        await cas.load(b"\x00\x01\x02\x03\x04")  # Some random, non-existent key
+
+    # Test case 6: Invalid key type (covers `isinstance` check)
+    with pytest.raises(TypeError, match="InMemoryCAS only supports byte‐hash keys"):
+        await cas.load(12345)  # Pass an integer instead of bytes
