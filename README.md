@@ -30,8 +30,10 @@ You can also see this library used in either our [data ETLs](https://github.com/
 Once uv is installed, run
 ```sh
 uv sync
+source .venv/bin/activate
+pre-commit install
 ```
-to create the project virtual environment at `.venv`. Don't worry about activating this virtual environment to run tests or formatting and linting, uv will automatically take care of that.
+to create the project virtual environment at `.venv`.
 
 ## Run tests, formatting, linting
 First, make sure you have the ipfs kubo daemon installed and running with the default endpoints open. Then run the script
