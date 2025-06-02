@@ -30,7 +30,13 @@ class ContentAddressedStore(ABC):
         """
 
     @abstractmethod
-    async def load(self, id: IPLDKind, offset: Optional[int] = None, length: Optional[int] = None, suffix: Optional[int] = None) -> bytes:
+    async def load(
+        self,
+        id: IPLDKind,
+        offset: Optional[int] = None,
+        length: Optional[int] = None,
+        suffix: Optional[int] = None,
+    ) -> bytes:
         """Retrieve data."""
 
 
@@ -49,7 +55,13 @@ class InMemoryCAS(ContentAddressedStore):
         self.store[hash] = data
         return hash
 
-    async def load(self, id: IPLDKind, offset: Optional[int] = None, length: Optional[int] = None, suffix: Optional[int] = None) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
+    async def load(
+        self,
+        id: IPLDKind,
+        offset: Optional[int] = None,
+        length: Optional[int] = None,
+        suffix: Optional[int] = None,
+    ) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
         """
         `ContentAddressedStore` allows any IPLD scalar key.  For the in-memory
         backend we *require* a `bytes` hash; anything else is rejected at run
@@ -60,12 +72,16 @@ class InMemoryCAS(ContentAddressedStore):
         h/t https://stackoverflow.com/questions/75209249/overriding-a-method-mypy-throws-an-incompatible-with-super-type-error-when-ch
         """
         key = cast(bytes, id)
+        if not isinstance(key, (bytes, bytearray)):  # defensive guard
+            raise TypeError(
+                f"InMemoryCAS only supports byte‐hash keys; got {type(id).__name__}"
+            )
         data: bytes
         try:
             data = self.store[key]
         except KeyError as exc:
             raise KeyError("Object not found in in-memory store") from exc
-    
+
         if offset is not None:
             start = offset
             if length is not None:
@@ -189,15 +205,15 @@ class KuboCAS(ContentAddressedStore):
         return cid
 
     async def load(  # type: ignore CID is definitely in the IPLDKind type
-        self, 
+        self,
         id: IPLDKind,
         offset: Optional[int] = None,
         length: Optional[int] = None,
-        suffix: Optional[int] = None
+        suffix: Optional[int] = None,
     ) -> bytes:
         """@private"""
         cid = cast(CID, id)
-        url: str = self.gateway_base_url + str(id)
+        url: str = self.gateway_base_url + str(cid)
         headers: dict[str, str] = {}
 
         # Construct the Range header if required

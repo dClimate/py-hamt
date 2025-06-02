@@ -63,7 +63,9 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         self.metadata_read_cache: dict[str, bytes] = {}
         """@private"""
 
-    def _map_byte_request(self, byte_range: Optional[zarr.abc.store.ByteRequest]) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    def _map_byte_request(
+        self, byte_range: Optional[zarr.abc.store.ByteRequest]
+    ) -> tuple[Optional[int], Optional[int], Optional[int]]:
         """Helper to map Zarr ByteRequest to offset, length, suffix."""
         offset: Optional[int] = None
         length: Optional[int] = None
@@ -81,7 +83,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
                 suffix = byte_range.suffix
             else:
                 raise TypeError(f"Unsupported ByteRequest type: {type(byte_range)}")
-        
+
         return offset, length, suffix
 
     @property
@@ -114,7 +116,10 @@ class ZarrHAMTStore(zarr.abc.store.Store):
             else:
                 offset, length, suffix = self._map_byte_request(byte_range)
                 val = cast(
-                    bytes, await self.hamt.get(key, offset=offset, length=length, suffix=suffix)
+                    bytes,
+                    await self.hamt.get(
+                        key, offset=offset, length=length, suffix=suffix
+                    ),
                 )  # We know values received will always be bytes since we only store bytes in the HAMT
                 if is_metadata and byte_range is None:
                     self.metadata_read_cache[key] = val
@@ -127,7 +132,6 @@ class ZarrHAMTStore(zarr.abc.store.Store):
             print(f"Error getting key '{key}' with range {byte_range}: {e}")
             raise
 
-
     async def get_partial_values(
         self,
         prototype: zarr.core.buffer.BufferPrototype,
@@ -136,11 +140,10 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         """
         Retrieves multiple keys or byte ranges concurrently using asyncio.gather.
         """
-        tasks = [
-            self.get(key, prototype, byte_range)
-            for key, byte_range in key_ranges
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=False) # Set return_exceptions=True for debugging
+        tasks = [self.get(key, prototype, byte_range) for key, byte_range in key_ranges]
+        results = await asyncio.gather(
+            *tasks, return_exceptions=False
+        )  # Set return_exceptions=True for debugging
         return results
 
     async def exists(self, key: str) -> bool:
