@@ -91,6 +91,7 @@ class KuboCAS(ContentAddressedStore):
         session: aiohttp.ClientSession | None = None,
         rpc_base_url: str | None = KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
         gateway_base_url: str | None = KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
+        concurrency: int = 32,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
@@ -129,7 +130,7 @@ class KuboCAS(ContentAddressedStore):
         else:
             self._owns_session = True  # we’ll create sessions lazily
 
-        self._sem: asyncio.Semaphore = asyncio.Semaphore(64)
+        self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
 
     # --------------------------------------------------------------------- #
     # helper: get or create the session bound to the current running loop   #
