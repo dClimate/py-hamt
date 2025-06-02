@@ -43,6 +43,7 @@ async def test_memory_store_invalid_key_type():
             await s.load(invalid_key)
 
 
+@pytest.mark.ipfs
 @pytest.mark.asyncio(loop_scope="session")
 @given(data=ipld_strategy())
 @settings(
