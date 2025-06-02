@@ -2,16 +2,15 @@ import time
 
 import numpy as np
 import pandas as pd
-import xarray as xr
 import pytest
+import xarray as xr
 import zarr
 import zarr.core.buffer
 from dag_cbor.ipld import IPLDKind
 
 from py_hamt import HAMT, KuboCAS
-
-from py_hamt.zarr_hamt_store import ZarrHAMTStore
 from py_hamt.store import InMemoryCAS
+from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
 @pytest.fixture(scope="module")
