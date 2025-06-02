@@ -137,6 +137,7 @@ class KuboCAS(ContentAddressedStore):
         session: aiohttp.ClientSession | None = None,
         rpc_base_url: str | None = KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
         gateway_base_url: str | None = KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
+        concurrency: int = 32,
         *,
         headers: dict[str, str] | None = None,
         auth: aiohttp.BasicAuth | None = None,
@@ -205,7 +206,7 @@ class KuboCAS(ContentAddressedStore):
         self._default_headers = headers
         self._default_auth = auth
 
-        self._sem: asyncio.Semaphore = asyncio.Semaphore(64)
+        self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
 
     # --------------------------------------------------------------------- #
     # helper: get or create the session bound to the current running loop   #
