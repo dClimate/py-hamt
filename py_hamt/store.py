@@ -1,10 +1,10 @@
 import asyncio
-import aiohttp
-from typing import Literal, cast, Any
 from abc import ABC, abstractmethod
+from typing import Any, Literal, cast
+
+import aiohttp
 from dag_cbor.ipld import IPLDKind
-from multiformats import multihash
-from multiformats import CID
+from multiformats import CID, multihash
 from multiformats.multihash import Multihash
 
 

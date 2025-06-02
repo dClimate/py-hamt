@@ -1,7 +1,9 @@
 # tests/test_kubocas_auth.py
+import inspect
+
 import aiohttp
 import pytest
-import inspect
+
 from py_hamt.store import KuboCAS
 
 

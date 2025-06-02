@@ -6,8 +6,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Generator, Tuple, Any
-
+from typing import Any, Generator, Tuple
 
 import pytest
 from hypothesis import strategies as st

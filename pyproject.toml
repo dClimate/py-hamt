@@ -34,3 +34,6 @@ dev = [
     "pandas-stubs>=2.2.3.250527",
     "pre-commit>=4.2.0",
 ]
+
+[tool.ruff]
+lint.extend-select = ["I"]

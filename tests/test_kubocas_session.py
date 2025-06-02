@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from threading import Thread, Event
+from threading import Event, Thread
 
 import pytest
 
