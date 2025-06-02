@@ -9,7 +9,6 @@ dependencies = [
     "dag-cbor>=0.3.3",
     "msgspec>=0.18.6",
     "multiformats[full]>=0.3.1.post4",
-    "requests>=2.32.3",
     "zarr>=3.0.8",
     "pycryptodome>=3.21.0",
 ]
@@ -33,6 +32,7 @@ dev = [
     "xarray[complete]>=2025.3.0",
     "mypy>=1.15.0",
     "pandas-stubs>=2.2.3.250527",
+    "pre-commit>=4.2.0",
 ]
 
 [tool.ruff]

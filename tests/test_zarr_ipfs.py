@@ -11,6 +11,7 @@ from dag_cbor.ipld import IPLDKind
 from py_hamt import HAMT, KuboCAS
 
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
+from py_hamt.store import InMemoryCAS
 
 
 @pytest.fixture(scope="module")
@@ -177,3 +178,15 @@ async def test_write_read(
         )
         assert zarr_json_now is not None
         assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
+
+
+@pytest.mark.asyncio
+async def test_list_dir_dedup():
+    cas = InMemoryCAS()
+    hamt = await HAMT.build(cas=cas, values_are_bytes=True)
+    zhs = ZarrHAMTStore(hamt)
+
+    await hamt.set("foo/bar/0", b"")
+    await hamt.set("foo/bar/1", b"")
+    results = [n async for n in zhs.list_dir("foo/")]
+    assert results == ["bar"]  # no duplicates
