@@ -145,8 +145,10 @@ class KuboCAS(ContentAddressedStore):
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
 
         ### `aiohttp.ClientSession` Management
-        If `session` is not provided, it will be automatically initialized. It is the responsibility of the user to close this at an appropriate time, as a class instance cannot know when it will no longer be in use.
-        Usually the best way to do this is to use the `async with` syntax, which will automatically close the session when the block is exited.
+        If `session` is not provided, it will be automatically initialized. It is the responsibility of the user to close this at an appropriate time, using `await cas.aclose()`
+        as a class instance cannot know when it will no longer be in use, unless explicitly told to do so.
+
+        If you are using the `KuboCAS` instance in an `async with` block, it will automatically close the session when the block is exited which is what we suggest below:
         ```python
         async with aiohttp.ClientSession() as session, KuboCAS(
             rpc_base_url=rpc_base_url,
@@ -158,7 +160,13 @@ class KuboCAS(ContentAddressedStore):
             # Use the KuboCAS instance as needed
             # ...
         ```
-        If you do not use the `async with` syntax, you should call `await cas.aclose()` when you are done using the instance to ensure that all resources are cleaned up.
+        As mentioned, if you do not use the `async with` syntax, you should call `await cas.aclose()` when you are done using the instance to ensure that all resources are cleaned up.
+        ``` python
+        cas = KuboCAS(rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url)
+        # Use the KuboCAS instance as needed
+        # ...
+        await cas.aclose()  # Ensure resources are cleaned up
+        ```
 
         ### Authenticated RPC/Gateway Access
         Users can set whatever headers and auth credentials they need if they are connecting to an authenticated kubo instance by setting them in their own `aiohttp.ClientSession` and then passing that in.
