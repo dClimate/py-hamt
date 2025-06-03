@@ -77,8 +77,8 @@ async def test_write_read(
         start = time.perf_counter()
         # Do an initial write along with an append which is a common xarray/zarr operation
         # Ensure chunks are not too small for partial value tests
-        test_ds.to_zarr(store=zhs, chunk_store={"time": 50, "lat": 18, "lon": 36})
-        test_ds.to_zarr(store=zhs, mode="a", append_dim="time", zarr_format=3)
+        test_ds.to_zarr(store=zhs, chunk_store={"time": 50, "lat": 18, "lon": 36}) # type: ignore
+        test_ds.to_zarr(store=zhs, mode="a", append_dim="time", zarr_format=3) # type: ignore
         end = time.perf_counter()
         elapsed = end - start
         print("=== Write Stats")
@@ -149,7 +149,7 @@ async def test_write_read(
         ]
 
         # Call get_partial_values
-        results = await zhs_read.get_partial_values(proto, key_ranges_to_test)
+        results = await zhs_read.get_partial_values(proto, key_ranges_to_test) # type: ignore
 
         # Assertions
         assert len(results) == 4
@@ -202,10 +202,10 @@ async def test_write_read(
             zhs_keys.add(k)
         assert hamt_keys == zhs_keys
 
-        zhs_keys: set[str] = set()
+        zhs_keys_prefix: set[str] = set()
         async for k in zhs_read.list_prefix(""):
-            zhs_keys.add(k)
-        assert hamt_keys == zhs_keys
+            zhs_keys_prefix.add(k)
+        assert hamt_keys == zhs_keys_prefix
 
         with pytest.raises(NotImplementedError):
             await zhs_read.set_partial_values([])

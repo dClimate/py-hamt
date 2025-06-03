@@ -61,7 +61,7 @@ class InMemoryCAS(ContentAddressedStore):
         offset: Optional[int] = None,
         length: Optional[int] = None,
         suffix: Optional[int] = None,
-    ) -> bytes:  # type: ignore since bytes is a subset of the IPLDKind type
+    ) -> bytes:
         """
         `ContentAddressedStore` allows any IPLD scalar key.  For the in-memory
         backend we *require* a `bytes` hash; anything else is rejected at run
@@ -283,7 +283,7 @@ class KuboCAS(ContentAddressedStore):
             cid = cid.set(codec=codec)
         return cid
 
-    async def load(  # type: ignore CID is definitely in the IPLDKind type
+    async def load(
         self,
         id: IPLDKind,
         offset: Optional[int] = None,
