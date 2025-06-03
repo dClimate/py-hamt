@@ -181,11 +181,6 @@ class KuboCAS(ContentAddressedStore):
         self.hasher: str = hasher
         """The hash function to send to IPFS when storing bytes. Cannot be changed after initialization. The default blake3 follows the default hashing algorithm used by HAMT."""
 
-        if rpc_base_url is None:
-            rpc_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_RPC_BASE_URL
-        if gateway_base_url is None:
-            gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
-
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
         """@private"""
         self.gateway_base_url: str = f"{gateway_base_url}/ipfs/"
