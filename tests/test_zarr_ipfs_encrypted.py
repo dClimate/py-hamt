@@ -193,7 +193,7 @@ async def test_encrypted_write_read(
             await ezhs_read_ok.set_partial_values([])
 
         with pytest.raises(Exception):
-            await ezhs_read_ok.set("new_key", np.array([b"a"], dtype=np.bytes_)) # type: ignore
+            await ezhs_read_ok.set("new_key", np.array([b"a"], dtype=np.bytes_))  # type: ignore
 
         with pytest.raises(Exception):
             await ezhs_read_ok.delete("zarr.json")

@@ -91,7 +91,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
             if isinstance(byte_range, zarr.abc.store.RangeByteRequest):
                 offset = byte_range.start
                 length = byte_range.end - byte_range.start
-                if length < 0:
+                if length is not None and length < 0:
                     raise ValueError("End must be >= start for RangeByteRequest")
             elif isinstance(byte_range, zarr.abc.store.OffsetByteRequest):
                 offset = byte_range.offset
