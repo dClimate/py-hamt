@@ -2,7 +2,6 @@ from urllib.parse import urlparse
 import os
 import socket
 import time
-
 import http.client
 
 import pytest
@@ -55,6 +54,8 @@ key_value_list = st.lists(
 def _rpc_is_up(url: str) -> bool:
     """POST /api/v0/version on the *RPC* port (5001 by default)."""
     p = urlparse(url)
+    if not p.hostname:
+        return False
     try:
         conn = http.client.HTTPConnection(p.hostname, p.port, timeout=1)
         conn.request("POST", "/api/v0/version")
@@ -66,6 +67,8 @@ def _rpc_is_up(url: str) -> bool:
 def _gw_is_up(url: str) -> bool:
     """HEAD / on the *gateway* port (8080 by default)."""
     p = urlparse(url)
+    if not p.hostname:
+        return False
     try:
         conn = http.client.HTTPConnection(p.hostname, p.port, timeout=1)
         conn.request("HEAD", "/")
@@ -87,39 +90,58 @@ except ImportError:
 
 
 def _docker_client_or_none():
-    # 1. first try env / default socket
+    """Try to get a working Docker client, with macOS Docker Desktop support."""
+
+    if docker is None:
+        return None
+
+    # Common Docker socket locations (in order of preference)
+    socket_locations = [
+        # Docker Desktop on macOS
+        f"unix://{os.path.expanduser('~')}/.docker/run/docker.sock",
+        # Docker Desktop alternative location
+        f"unix://{os.path.expanduser('~')}/.docker/desktop/docker.sock",
+        # Standard Linux locations
+        "unix:///var/run/docker.sock",
+        "unix:///run/docker.sock",
+    ]
+
+    # First, try with DOCKER_HOST if it's already set
+    existing_host = os.environ.get("DOCKER_HOST")
+    if existing_host:
+        try:
+            c = docker.DockerClient(base_url=existing_host)
+            c.ping()
+            return c
+        except Exception:
+            pass
+
+    # Try each known socket location
+    for socket_path in socket_locations:
+        try:
+            # Check if the socket file exists (for unix sockets)
+            if socket_path.startswith("unix://"):
+                socket_file = socket_path.replace("unix://", "")
+                if not os.path.exists(socket_file):
+                    continue
+
+            c = docker.DockerClient(base_url=socket_path)
+            c.ping()
+            # If successful, set DOCKER_HOST for any child processes
+            os.environ["DOCKER_HOST"] = socket_path
+            return c
+        except Exception:
+            continue
+
+    # Last resort: try docker.from_env() which might work with some setups
     try:
         c = docker.from_env()
         c.ping()
         return c
-    except docker.errors.DockerException:
-        pass
-
-    # 2. fall back to the *current* Docker context (Desktop, Colima, etc.)
-    try:
-        ctx_name = subprocess.check_output(
-            ["docker", "context", "show"], text=True
-        ).strip()
-        host = subprocess.check_output(
-            [
-                "docker",
-                "context",
-                "inspect",
-                "--format",
-                '{{ index .Endpoints "docker" "Host" }}',
-                ctx_name,
-            ],
-            text=True,
-        ).strip()
-        if host:
-            os.environ["DOCKER_HOST"] = host  # make visible to children
-            c = docker.DockerClient(base_url=host)
-            c.ping()
-            return c
     except Exception:
         pass
 
-    return None  # fixture will pytest.skip()
+    return None
 
 
 # ---------- fixture ---------------------------------------------------------
@@ -143,13 +165,10 @@ def create_ipfs():
         return
 
     # 2. fall back to Docker -------------------------------------------------
-    # if docker is None:
-    #     pytest.skip("Docker not available and no IPFS node listening")
     client = _docker_client_or_none()
     if client is None:
         pytest.skip("Neither IPFS daemon nor Docker available – skipping IPFS tests")
 
-    client = docker.from_env()
     image = "ipfs/kubo:v0.35.0"
     rpc_p = _free_port()
     gw_p = _free_port()
@@ -163,7 +182,16 @@ def create_ipfs():
     )
 
     try:
-        time.sleep(6)  # crude readiness wait
+        # Wait for container to be ready
+        for _ in range(30):  # 30 attempts, 0.5s each = 15s max
+            if _rpc_is_up(f"http://127.0.0.1:{rpc_p}") and _gw_is_up(
+                f"http://127.0.0.1:{gw_p}"
+            ):
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("IPFS container failed to start within timeout")
+
         yield f"http://127.0.0.1:{rpc_p}", f"http://127.0.0.1:{gw_p}"
     finally:
         container.stop(timeout=3)

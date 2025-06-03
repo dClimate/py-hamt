@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Run pytest with coverage
-uv run pytest --cov=py_hamt tests/
+uv run pytest --ipfs --cov=py_hamt tests/
 
 # Check coverage
 uv run coverage report --fail-under=100 --show-missing
