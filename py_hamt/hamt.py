@@ -8,8 +8,8 @@ from typing import (
     Callable,
     Dict,
     Iterator,
-    cast,
     Optional,
+    cast,
 )
 
 import dag_cbor

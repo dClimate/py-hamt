@@ -1,11 +1,10 @@
+import asyncio
 from collections.abc import AsyncIterator, Iterable
-from typing import cast
+from typing import Optional, cast
 
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
-from typing import Optional
-import asyncio
 
 from py_hamt.hamt import HAMT
 

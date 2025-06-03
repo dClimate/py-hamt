@@ -195,11 +195,6 @@ async def test_encrypted_write_read(
         with pytest.raises(NotImplementedError):
             await ezhs_read_ok.set_partial_values([])
 
-        with pytest.raises(NotImplementedError):
-            await ezhs_read_ok.get_partial_values(
-                zarr.core.buffer.default_buffer_prototype(), []
-            )
-
         with pytest.raises(Exception):
             await ezhs_read_ok.set("new_key", np.array([b"a"], dtype=np.bytes_))
 

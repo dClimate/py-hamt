@@ -1,7 +1,6 @@
 import asyncio
-import aiohttp
 from abc import ABC, abstractmethod
-from typing import Any, Literal, cast, Optional
+from typing import Any, Literal, Optional, cast
 
 import aiohttp
 from dag_cbor.ipld import IPLDKind

@@ -2,17 +2,15 @@ import time
 
 import numpy as np
 import pandas as pd
-import xarray as xr
 import pytest
+import xarray as xr
 import zarr
 import zarr.core.buffer
 
 # Make sure to import the ByteRequest types
-from zarr.abc.store import RangeByteRequest, OffsetByteRequest, SuffixByteRequest
+from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
 
-
-from py_hamt import HAMT, KuboCAS, InMemoryCAS
-
+from py_hamt import HAMT, InMemoryCAS, KuboCAS
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
