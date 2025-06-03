@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator, Iterable
 from typing import cast
+
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
@@ -233,13 +234,57 @@ class ZarrHAMTStore(zarr.abc.store.Store):
     async def list_dir(self, prefix: str) -> AsyncIterator[str]:
         """
         @private
+        List *immediate* children that live directly under **prefix**.
+
+        This is similar to :py:meth:`list_prefix` but collapses everything
+        below the first ``"/"`` after *prefix*.  Each child name is yielded
+        **exactly once** in the order of first appearance while scanning the
+        HAMT keys.
+
+        Parameters
+        ----------
+        prefix : str
+            Logical directory path.  *Must* end with ``"/"`` for the result to
+            make sense (e.g. ``"a/b/"``).
+
+        Yields
+        ------
+        str
+            The name of each direct child (file or sub-directory) of *prefix*.
+
+        Examples
+        --------
+        With keys ::
+
+            a/b/c/d
+            a/b/c/e
+            a/b/f
+            a/b/g/h/i
+
+        ``await list_dir("a/b/")`` produces ::
+
+            c
+            f
+            g
+
+        Notes
+        -----
+        • Internally uses a :class:`set` to deduplicate names; memory grows
+            with the number of *unique* children, not the total number of keys.
+        • Order is **not** sorted; it reflects the first encounter while
+            iterating over :py:meth:`HAMT.keys`.
         """
+        seen_names: set[str] = set()
         async for key in self.hamt.keys():
             if key.startswith(prefix):
                 suffix: str = key[len(prefix) :]
                 first_slash: int = suffix.find("/")
                 if first_slash == -1:
-                    yield suffix
+                    if suffix not in seen_names:
+                        seen_names.add(suffix)
+                        yield suffix
                 else:
                     name: str = suffix[0:first_slash]
-                    yield name
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        yield name

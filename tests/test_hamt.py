@@ -1,17 +1,16 @@
 import asyncio
 import random
+from typing import cast
 
+import pytest
 from dag_cbor import IPLDKind
-from multiformats import CID
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from typing import cast
-import pytest
+from multiformats import CID
+from testing_utils import key_value_list
 
 from py_hamt.hamt import HAMT, Node
 from py_hamt.store import InMemoryCAS
-
-from testing_utils import key_value_list
 
 
 @pytest.mark.asyncio

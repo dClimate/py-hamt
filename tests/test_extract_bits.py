@@ -1,5 +1,6 @@
-from py_hamt.hamt import extract_bits
 import pytest
+
+from py_hamt.hamt import extract_bits
 
 
 # Most of these tests were adapted over to python from rvagg's IAMap tests in JS

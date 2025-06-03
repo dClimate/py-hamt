@@ -1,10 +1,11 @@
 import asyncio
 import aiohttp
-from typing import Literal, cast, Any, Optional
 from abc import ABC, abstractmethod
+from typing import Any, Literal, cast, Optional
+
+import aiohttp
 from dag_cbor.ipld import IPLDKind
-from multiformats import multihash
-from multiformats import CID
+from multiformats import CID, multihash
 from multiformats.multihash import Multihash
 
 
@@ -97,9 +98,55 @@ class InMemoryCAS(ContentAddressedStore):
 
 class KuboCAS(ContentAddressedStore):
     """
-    Talks to a kubo daemon. The IDs in save and load are IPLD CIDs.
+    Connects to an **IPFS Kubo** daemon.
+
+    The IDs in save and load are IPLD CIDs.
+
+    * **save()**  → RPC  (`/api/v0/add`)
+    * **load()**  → HTTP gateway  (`/ipfs/{cid}`)
 
     `save` uses the RPC API and `load` uses the HTTP Gateway. This means that read-only HAMTs will only access the HTTP Gateway, so no RPC endpoint is required for use.
+
+    ### Authentication / custom headers
+    You have two options:
+
+    1. **Bring your own `aiohttp.ClientSession`**
+       Pass it via `session=...` — any default headers or `BasicAuth`
+       configured on that session are reused for **every** request.
+    2. **Let `KuboCAS` build the session** but pass
+       `headers=` *and*/or `auth=` kwargs; they are forwarded to the
+       internally–created `ClientSession`.
+
+    ```python
+    import aiohttp
+    from py_hamt import KuboCAS
+
+    # Option 1: user-supplied session
+    sess = aiohttp.ClientSession(
+        headers={"Authorization": "Bearer <token>"},
+        auth=aiohttp.BasicAuth("user", "pass"),
+    )
+    cas  = KuboCAS(session=sess)
+
+    # Option 2: let KuboCAS create the session
+    cas = KuboCAS(
+        headers={"X-My-Header": "yes"},
+        auth=aiohttp.BasicAuth("user", "pass"),
+    )
+    ```
+
+    ### Parameters
+    - **hasher** (str): multihash name (defaults to *blake3*).
+    - **session** (`aiohttp.ClientSession | None`): reuse an existing
+      session; if *None* KuboCAS will create one lazily.
+    - **headers** (dict[str, str] | None): default headers for the
+      internally-created session.
+    - **auth** (`aiohttp.BasicAuth | None`): authentication object for
+      the internally-created session.
+    - **rpc_base_url / gateway_base_url** (str | None): override daemon
+      endpoints (defaults match the local daemon ports).
+
+    ...
     """
 
     KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL: str = "http://127.0.0.1:8080"
@@ -115,15 +162,42 @@ class KuboCAS(ContentAddressedStore):
         session: aiohttp.ClientSession | None = None,
         rpc_base_url: str | None = KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
         gateway_base_url: str | None = KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
+        concurrency: int = 32,
+        *,
+        headers: dict[str, str] | None = None,
+        auth: aiohttp.BasicAuth | None = None,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
 
-        ### `requests.Session` Management
-        If `requests_session` is not provided, it will be automatically initialized. It is the responsibility of the user to close this at an appropriate time, as a class instance cannot know when it will no longer be in use.
+        ### `aiohttp.ClientSession` Management
+        If `session` is not provided, it will be automatically initialized. It is the responsibility of the user to close this at an appropriate time, using `await cas.aclose()`
+        as a class instance cannot know when it will no longer be in use, unless explicitly told to do so.
+
+        If you are using the `KuboCAS` instance in an `async with` block, it will automatically close the session when the block is exited which is what we suggest below:
+        ```python
+        async with aiohttp.ClientSession() as session, KuboCAS(
+            rpc_base_url=rpc_base_url,
+            gateway_base_url=gateway_base_url,
+            session=session,
+        ) as kubo_cas:
+            hamt = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
+            zhs = ZarrHAMTStore(hamt)
+            # Use the KuboCAS instance as needed
+            # ...
+        ```
+        As mentioned, if you do not use the `async with` syntax, you should call `await cas.aclose()` when you are done using the instance to ensure that all resources are cleaned up.
+        ``` python
+        cas = KuboCAS(rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url)
+        # Use the KuboCAS instance as needed
+        # ...
+        await cas.aclose()  # Ensure resources are cleaned up
+        ```
 
         ### Authenticated RPC/Gateway Access
-        Users can set whatever headers and auth credentials they need if they are connecting to an authenticated kubo instance by setting them in their own `requests.Session` and then passing that in.
+        Users can set whatever headers and auth credentials they need if they are connecting to an authenticated kubo instance by setting them in their own `aiohttp.ClientSession` and then passing that in.
+        Alternatively, they can pass in `headers` and `auth` parameters to the constructor, which will be used to create a new `aiohttp.ClientSession` if one is not provided.
+        If you do not need authentication, you can leave these parameters as `None`.
 
         ### RPC and HTTP Gateway Base URLs
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
@@ -153,7 +227,11 @@ class KuboCAS(ContentAddressedStore):
         else:
             self._owns_session = True  # we’ll create sessions lazily
 
-        self._sem: asyncio.Semaphore = asyncio.Semaphore(64)
+        # store for later use by _loop_session()
+        self._default_headers = headers
+        self._default_auth = auth
+
+        self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
 
     # --------------------------------------------------------------------- #
     # helper: get or create the session bound to the current running loop   #
@@ -166,6 +244,8 @@ class KuboCAS(ContentAddressedStore):
             sess = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=60),
                 connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
+                headers=self._default_headers,
+                auth=self._default_auth,
             )
             self._session_per_loop[loop] = sess
             return sess

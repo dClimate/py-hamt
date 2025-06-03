@@ -2,7 +2,7 @@ import aiohttp
 import pytest
 
 # re-export helpers so existing imports keep working (optional)
-from testing_utils import ipld_strategy, create_ipfs  # noqa: F401
+from testing_utils import create_ipfs, ipld_strategy  # noqa: F401
 
 
 @pytest.fixture(scope="session")
