@@ -1,10 +1,12 @@
+from typing import cast
+
 import zarr.abc.store
 import zarr.core.buffer
-from py_hamt.hamt import HAMT
 from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
+
+from py_hamt.hamt import HAMT
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
-from typing import cast
 
 
 class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):

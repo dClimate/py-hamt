@@ -1,14 +1,14 @@
+from typing import Literal, cast
+
 import aiohttp
 import dag_cbor
-from dag_cbor import IPLDKind
-from typing import Literal, cast
-from hypothesis import given, settings
 import pytest
+from dag_cbor import IPLDKind
+from hypothesis import given, settings
+from testing_utils import ipld_strategy  # noqa
 
 from py_hamt import KuboCAS
-
 from py_hamt.store import InMemoryCAS
-from testing_utils import ipld_strategy  # noqa
 
 
 # Just to cover this one case that isn't covered within test_hamt

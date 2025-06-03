@@ -34,4 +34,8 @@ dev = [
     "pandas-stubs>=2.2.3.250527",
     "docker>=7.1.0",
     "types-docker>=7.1.0.20250523",
+    "pre-commit>=4.2.0",
 ]
+
+[tool.ruff]
+lint.extend-select = ["I"]

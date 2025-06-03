@@ -1,5 +1,6 @@
 # tests/test_branch_anchors.py
 import pytest
+
 from py_hamt import HAMT, blake3_hashfn
 from py_hamt.store import InMemoryCAS
 

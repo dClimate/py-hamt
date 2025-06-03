@@ -4,9 +4,10 @@ This file can be run by pytest, but is not automatically included since it inclu
 This test suite contains various performance tests, which are meant to be run individually.
 """
 
-import pytest
-import time
 import asyncio
+import time
+
+import pytest
 
 from py_hamt import HAMT
 from py_hamt.store import InMemoryCAS

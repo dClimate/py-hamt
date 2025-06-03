@@ -1,8 +1,8 @@
-from urllib.parse import urlparse
+import http.client
 import os
 import socket
 import time
-import http.client
+from urllib.parse import urlparse
 
 import pytest
 from hypothesis import strategies as st
