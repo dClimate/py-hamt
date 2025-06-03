@@ -1,12 +1,8 @@
-import json
+import http.client
 import os
-import shutil
 import socket
-import subprocess
-import tempfile
 import time
-from pathlib import Path
-from typing import Any, Generator, Tuple
+from urllib.parse import urlparse
 
 import pytest
 from hypothesis import strategies as st
@@ -52,66 +48,150 @@ key_value_list = st.lists(
     ],  # ensure unique keys, otherwise we can't do the length and size checks when using these KVs for the HAMT
 )
 
+# ---------- helpers ---------------------------------------------------------
 
-def find_free_port() -> int:
+
+def _rpc_is_up(url: str) -> bool:
+    """POST /api/v0/version on the *RPC* port (5001 by default)."""
+    p = urlparse(url)
+    if not p.hostname:
+        return False
+    try:
+        conn = http.client.HTTPConnection(p.hostname, p.port, timeout=1)
+        conn.request("POST", "/api/v0/version")
+        return conn.getresponse().status == 200
+    except Exception:
+        return False
+
+
+def _gw_is_up(url: str) -> bool:
+    """HEAD / on the *gateway* port (8080 by default)."""
+    p = urlparse(url)
+    if not p.hostname:
+        return False
+    try:
+        conn = http.client.HTTPConnection(p.hostname, p.port, timeout=1)
+        conn.request("HEAD", "/")
+        return conn.getresponse().status in (200, 404)  # 404 = empty root
+    except Exception:
+        return False
+
+
+def _free_port() -> int:
     with socket.socket() as s:
-        s.bind(("", 0))  # Bind to a free port provided by the host.
-        return int(s.getsockname()[1])  # Return the port number assigned.
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def create_ipfs() -> Generator[Tuple[str, str], None, None]:
-    # Create temporary directory, set it as the IPFS Path
-    temp_dir: Path = Path(tempfile.mkdtemp())
-    custom_env: dict[str, str] = os.environ.copy()
-    custom_env["IPFS_PATH"] = str(temp_dir)
+try:
+    import docker
+except ImportError:
+    docker = None
 
-    # IPFS init
-    subprocess.run(
-        ["ipfs", "init", "--profile", "pebbleds"], check=True, env=custom_env
-    )
 
-    # Edit the config file so that it serves on randomly selected and available ports to not conflict with any currently running ipfs daemons
-    swarm_port: int = find_free_port()
-    rpc_port: int = find_free_port()
-    gateway_port: int = find_free_port()
+def _docker_client_or_none():
+    """Try to get a working Docker client, with macOS Docker Desktop support."""
 
-    config_path: Path = temp_dir / "config"
-    config: dict[str, Any]
-    with open(config_path, "r") as f:
-        config = json.load(f)
+    if docker is None:
+        return None
 
-    swarm_addrs: list[str] = config["Addresses"]["Swarm"]
-    new_port_swarm_addrs: list[str] = [
-        s.replace("4001", str(swarm_port)) for s in swarm_addrs
+    # Common Docker socket locations (in order of preference)
+    socket_locations = [
+        # Docker Desktop on macOS
+        f"unix://{os.path.expanduser('~')}/.docker/run/docker.sock",
+        # Docker Desktop alternative location
+        f"unix://{os.path.expanduser('~')}/.docker/desktop/docker.sock",
+        # Standard Linux locations
+        "unix:///var/run/docker.sock",
+        "unix:///run/docker.sock",
     ]
-    config["Addresses"]["Swarm"] = new_port_swarm_addrs
 
-    rpc_multiaddr: str = config["Addresses"]["API"]
-    gateway_multiaddr: str = config["Addresses"]["Gateway"]
+    # First, try with DOCKER_HOST if it's already set
+    existing_host = os.environ.get("DOCKER_HOST")
+    if existing_host:
+        try:
+            c = docker.DockerClient(base_url=existing_host)
+            c.ping()
+            return c
+        except Exception:
+            pass
 
-    config["Addresses"]["API"] = rpc_multiaddr.replace("5001", str(rpc_port))
-    config["Addresses"]["Gateway"] = gateway_multiaddr.replace(
-        "8080", str(gateway_port)
+    # Try each known socket location
+    for socket_path in socket_locations:
+        try:
+            # Check if the socket file exists (for unix sockets)
+            if socket_path.startswith("unix://"):
+                socket_file = socket_path.replace("unix://", "")
+                if not os.path.exists(socket_file):
+                    continue
+
+            c = docker.DockerClient(base_url=socket_path)
+            c.ping()
+            # If successful, set DOCKER_HOST for any child processes
+            os.environ["DOCKER_HOST"] = socket_path
+            return c
+        except Exception:
+            continue
+
+    # Last resort: try docker.from_env() which might work with some setups
+    try:
+        c = docker.from_env()
+        c.ping()
+        return c
+    except Exception:
+        pass
+
+    return None
+
+
+# ---------- fixture ---------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def create_ipfs():
+    """Yield `(rpc_url, gateway_url)`.
+
+    Order of preference:
+    1.  reuse an already-running daemon (checked via RPC probe)
+    2.  launch Docker container (if docker is installed & running)
+    3.  skip the IPFS-marked tests
+    """
+    rpc = os.getenv("IPFS_RPC_URL") or "http://127.0.0.1:5001"
+    gw = os.getenv("IPFS_GATEWAY_URL") or "http://127.0.0.1:8080"
+
+    # 1. reuse existing node -------------------------------------------------
+    if _rpc_is_up(rpc) and _gw_is_up(gw):
+        yield rpc, gw
+        return
+
+    # 2. fall back to Docker -------------------------------------------------
+    client = _docker_client_or_none()
+    if client is None:
+        pytest.skip("Neither IPFS daemon nor Docker available – skipping IPFS tests")
+
+    image = "ipfs/kubo:v0.35.0"
+    rpc_p = _free_port()
+    gw_p = _free_port()
+
+    container = client.containers.run(
+        image,
+        "daemon --init --offline",
+        ports={"5001/tcp": rpc_p, "8080/tcp": gw_p},
+        detach=True,
+        auto_remove=True,
     )
 
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+    try:
+        # Wait for container to be ready
+        for _ in range(30):  # 30 attempts, 0.5s each = 15s max
+            if _rpc_is_up(f"http://127.0.0.1:{rpc_p}") and _gw_is_up(
+                f"http://127.0.0.1:{gw_p}"
+            ):
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("IPFS container failed to start within timeout")
 
-    # Start the daemon
-    rpc_uri_stem: str = f"http://127.0.0.1:{rpc_port}"
-    gateway_uri_stem: str = f"http://127.0.0.1:{gateway_port}"
-
-    ipfs_process: subprocess.Popen[bytes] = subprocess.Popen(
-        ["ipfs", "daemon"], env=custom_env
-    )
-    # Should be enough time for the ipfs daemon process to start up
-    time.sleep(5)
-
-    yield rpc_uri_stem, gateway_uri_stem
-
-    # Close the daemon
-    ipfs_process.kill()
-
-    # Delete the temporary directory
-    shutil.rmtree(temp_dir)
+        yield f"http://127.0.0.1:{rpc_p}", f"http://127.0.0.1:{gw_p}"
+    finally:
+        container.stop(timeout=3)
