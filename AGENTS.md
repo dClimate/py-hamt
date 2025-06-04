@@ -52,6 +52,14 @@ and then
 
 `source .venv/bin/activate` to activate the venv created by uv.
 
+Lastly while still setting up you can run
+
+```
+pre-commit install
+```
+
+to ensure pre-commit installed.
+
 Docker is also used for integration tests to test ipfs. Try to have docker installed to be able to run all tests with` pytest --ipfs`
 
 ## Testing Requirements for the Agent
