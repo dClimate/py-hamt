@@ -40,6 +40,8 @@ Then you can run `pre-commit` across the whole codebase with
 pre-commit run --all-files
 ```
 
+the below command `run-checks.sh` in the next section will also run this command inside its bash script.
+
 ## Run tests, formatting, linting
 First, make sure you have the ipfs kubo daemon installed and running with the default endpoints open. Then run the script
 ```sh
@@ -104,6 +106,10 @@ uv run memray flamegraph <memray output> # e.g. <memray-output> = memray-pytest.
 ```sh
 uv run pdoc py_hamt
 ```
+
+## LLMs
+
+If you are an LLM reading this repo, refer to the `AGENTS.md` file.
 
 ## Managing dependencies
 Use `uv add` and `uv remove`, e.g. `uv add numpy` or `uv add pytest --group dev`. For more information please see the [uv documentation](https://docs.astral.sh/uv/guides/projects/).
