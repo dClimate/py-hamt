@@ -235,6 +235,199 @@ async def test_zarr_hamt_store_byte_request_errors():
 
 
 @pytest.mark.asyncio
+async def test_ipfs_gateway_compression_behavior(create_ipfs):
+    """
+    Test to verify whether IPFS gateways decompress data before applying
+    byte range requests, which would negate compression benefits for partial reads.
+
+    This test creates highly compressible data, stores it via IPFS, and then
+    compares the bytes returned by partial vs full reads to determine if
+    the gateway is operating on compressed or decompressed data.
+    """
+    rpc_base_url, gateway_base_url = create_ipfs
+
+    print("\n=== IPFS Gateway Compression Behavior Test ===")
+
+    # Create highly compressible test data
+    print("Creating highly compressible test data...")
+    data = np.zeros((50, 50, 50), dtype=np.float32)  # 500KB of zeros
+    # Add small amount of variation
+    data[0:5, 0:5, 0:5] = np.random.randn(5, 5, 5)
+
+    ds = xr.Dataset({"compressible_var": (["x", "y", "z"], data)})
+
+    print(f"Original data shape: {data.shape}")
+    print(f"Original data size: {data.nbytes:,} bytes")
+
+    # Custom CAS to track actual network transfers
+    class NetworkTrackingKuboCAS(KuboCAS):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.load_sizes = {}
+            self.save_sizes = {}
+
+        async def save(self, data, codec=None):
+            cid = await super().save(data, codec)
+            self.save_sizes[str(cid)] = len(data)
+            print(f"Saved to IPFS: {str(cid)[:12]}... ({len(data):,} bytes)")
+            return cid
+
+        async def load(self, cid, offset=None, length=None, suffix=None):
+            result = await super().load(cid, offset, length, suffix)
+
+            range_desc = "full"
+            if offset is not None or length is not None or suffix is not None:
+                range_desc = f"offset={offset}, length={length}, suffix={suffix}"
+
+            key = f"{str(cid)[:12]}... ({range_desc})"
+            self.load_sizes[key] = len(result)
+            print(f"Loaded from IPFS: {key} -> {len(result):,} bytes")
+            return result
+
+    async with NetworkTrackingKuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as tracking_cas:
+        # Write dataset with compression
+        print("\n=== Writing to IPFS with Blosc compression ===")
+        hamt = await HAMT.build(cas=tracking_cas, values_are_bytes=True)
+        store = ZarrHAMTStore(hamt)
+
+        # Use smaller chunks to ensure meaningful compression
+        ds.chunk({"x": 25, "y": 25, "z": 25}).to_zarr(
+            store=store, mode="w", zarr_format=3
+        )
+
+        await hamt.make_read_only()
+        root_cid = hamt.root_node_id
+        print(f"Root CID: {root_cid}")
+
+        # Read back and test compression behavior
+        print("\n=== Testing Compression vs Partial Reads ===")
+        hamt_read = await HAMT.build(
+            cas=tracking_cas,
+            root_node_id=root_cid,
+            values_are_bytes=True,
+            read_only=True,
+        )
+        store_read = ZarrHAMTStore(hamt_read, read_only=True)
+
+        # Find the largest data chunk (likely the actual array data)
+        chunk_key = None
+        chunk_size = 0
+        async for key in store_read.list():
+            if (
+                "compressible_var" in key
+                and not key.endswith(".zarray")
+                and not key.endswith("zarr.json")
+            ):
+                # Get size to find the largest chunk
+                proto = zarr.core.buffer.default_buffer_prototype()
+                chunk_buffer = await store_read.get(key, proto)
+                if chunk_buffer and len(chunk_buffer.to_bytes()) > chunk_size:
+                    chunk_key = key
+                    chunk_size = len(chunk_buffer.to_bytes())
+
+        assert chunk_key is not None, "No data chunk found"
+        print(f"Testing with largest chunk: {chunk_key}")
+
+        # Get full chunk for baseline
+        proto = zarr.core.buffer.default_buffer_prototype()
+        full_chunk = await store_read.get(chunk_key, proto)
+        full_compressed_size = len(full_chunk.to_bytes())
+        print(f"Full chunk compressed size: {full_compressed_size:,} bytes")
+
+        # Calculate expected uncompressed size
+        # 25x25x25 float32 = 62,500 bytes uncompressed
+        expected_uncompressed_size = 25 * 25 * 25 * 4
+        compression_ratio = expected_uncompressed_size / full_compressed_size
+        print(f"Estimated compression ratio: {compression_ratio:.1f}:1")
+
+        # Test different partial read sizes
+        test_ranges = [
+            (0, full_compressed_size // 4, "25% of compressed"),
+            (0, full_compressed_size // 2, "50% of compressed"),
+            (full_compressed_size // 4, full_compressed_size // 2, "25%-50% range"),
+        ]
+
+        print("\n=== Partial Read Analysis ===")
+        print("If gateway operates on compressed data:")
+        print("  - Partial reads should return exactly the requested byte ranges")
+        print("  - Network transfer should be proportional to compressed size")
+        print("If gateway decompresses before range requests:")
+        print("  - Partial reads may return more data than expected")
+        print("  - Network transfer loses compression benefits")
+        print()
+
+        compression_preserved = True
+
+        for start, end, description in test_ranges:
+            length = end - start
+            byte_req = RangeByteRequest(start=start, end=end)
+
+            # Clear the load tracking for this specific test
+            original_load_count = len(tracking_cas.load_sizes)
+
+            partial_chunk = await store_read.get(chunk_key, proto, byte_range=byte_req)
+            partial_size = len(partial_chunk.to_bytes())
+
+            # Find the new load entry
+            new_loads = list(tracking_cas.load_sizes.items())[original_load_count:]
+            network_bytes = new_loads[0][1] if new_loads else partial_size
+
+            expected_percentage = length / full_compressed_size
+            actual_percentage = partial_size / full_compressed_size
+            network_efficiency = network_bytes / full_compressed_size
+
+            print(f"Range request: {description}")
+            print(
+                f"  Requested: {length:,} bytes ({expected_percentage:.1%} of compressed)"
+            )
+            print(
+                f"  Received: {partial_size:,} bytes ({actual_percentage:.1%} of compressed)"
+            )
+            print(
+                f"  Network transfer: {network_bytes:,} bytes ({network_efficiency:.1%} of compressed)"
+            )
+
+            # Key test: if we get significantly more data than requested,
+            # the gateway is likely decompressing before applying ranges
+            if partial_size > length * 1.1:  # 10% tolerance for overhead
+                compression_preserved = False
+                print(
+                    f"  ⚠️  Received {partial_size / length:.1f}x more data than requested!"
+                )
+                print("  ⚠️  Gateway appears to decompress before applying ranges")
+            else:
+                print("  ✅ Range applied efficiently to compressed data")
+
+            # Verify the partial data makes sense
+            full_data = full_chunk.to_bytes()
+            expected_partial = full_data[start:end]
+            assert partial_chunk.to_bytes() == expected_partial, (
+                "Partial data doesn't match expected range"
+            )
+            print("  ✅ Partial data content verified")
+            print()
+
+        # Summary analysis
+        print("=== Final Analysis ===")
+        if compression_preserved:
+            print("✅ IPFS gateway preserves compression benefits for partial reads")
+            print("   - Byte ranges are applied to compressed data")
+            print("   - Network transfers are efficient")
+        else:
+            print("⚠️  IPFS gateway appears to decompress before applying ranges")
+            print("   - Partial reads may not provide expected bandwidth savings")
+            print("   - Consider alternative storage strategies (sharding, etc.)")
+
+        print("\nCompression statistics:")
+        print(f"  - Uncompressed chunk size: {expected_uncompressed_size:,} bytes")
+        print(f"  - Compressed chunk size: {full_compressed_size:,} bytes")
+        print(f"  - Compression ratio: {compression_ratio:.1f}:1")
+        print(f"  - Compression preserved in partial reads: {compression_preserved}")
+
+
+@pytest.mark.asyncio
 async def test_in_memory_cas_partial_reads():
     """
     Tests the partial read logic (offset, length, suffix) in the InMemoryCAS.
