@@ -1,10 +1,14 @@
-from typing import Literal, cast
+import asyncio
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Awaitable, Callable, Literal, cast
 
 import aiohttp
 import dag_cbor
 import pytest
+from aiohttp import web
 from dag_cbor import IPLDKind
 from hypothesis import given, settings
+from multiformats import CID
 from testing_utils import ipld_strategy  # noqa
 
 from py_hamt import KuboCAS
@@ -161,3 +165,49 @@ async def test_kubo_multi_gateway(create_ipfs, global_client_session):
         cid = await kubo_cas.save(b"hello", codec="raw")
         result = await kubo_cas.load(cid)
         assert result == b"hello"
+
+
+@asynccontextmanager
+async def _run_server(
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> AsyncIterator[str]:
+    app = web.Application()
+    app.router.add_get("/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_gateway_race_has_fallback():
+    async def fail(request: web.Request) -> web.Response:
+        raise web.HTTPInternalServerError()
+
+    async def ok(request: web.Request) -> web.Response:
+        await asyncio.sleep(0.05)
+        return web.Response(body=b"ok")
+
+    async with _run_server(fail) as bad, _run_server(ok) as good:
+        cid = CID.decode("bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+        async with KuboCAS(gateway_base_url=good, gateway_base_urls=[bad, good]) as cas:
+            assert await cas.load(cid) == b"ok"
+
+
+@pytest.mark.asyncio
+async def test_gateway_race_all_fail():
+    async def fail(request: web.Request) -> web.Response:
+        raise web.HTTPInternalServerError()
+
+    async with _run_server(fail) as bad1, _run_server(fail) as bad2:
+        cid = CID.decode("bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+        async with KuboCAS(
+            gateway_base_url=bad1, gateway_base_urls=[bad1, bad2]
+        ) as cas:
+            with pytest.raises(RuntimeError, match="All gateway requests failed"):
+                await cas.load(cid)
