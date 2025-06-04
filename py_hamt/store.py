@@ -121,7 +121,8 @@ class KuboCAS(ContentAddressedStore):
     - **rpc_base_url / gateway_base_url** (str | None): override daemon
       endpoints (defaults match the local daemon ports).
     - **gateway_base_urls** (list[str] | None): optional list of additional
-      gateway URLs to try in parallel when loading blocks.
+      gateway URLs to try in parallel when loading blocks. Each base URL is
+      normalized to end with ``/ipfs/``.
 
     ...
     """
@@ -191,10 +192,14 @@ class KuboCAS(ContentAddressedStore):
 
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
         """@private"""
-        self.gateway_base_urls: list[str] = (
-            gateway_base_urls if gateway_base_urls else [gateway_base_url]
-        )
-        self.gateway_base_url: str = self.gateway_base_urls[0]
+
+        def _normalize(url: str) -> str:
+            """Ensure URL ends with '/ipfs/'."""
+            return url.rstrip("/") + "/ipfs/"
+
+        bases = gateway_base_urls if gateway_base_urls else [gateway_base_url]
+        self.gateway_base_urls = [_normalize(u) for u in bases]
+        self.gateway_base_url = self.gateway_base_urls[0]
         """@private"""
 
         self._session_per_loop: dict[
