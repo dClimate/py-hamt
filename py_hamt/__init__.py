@@ -1,6 +1,6 @@
 from .encryption_hamt_store import SimpleEncryptedZarrHAMTStore
 from .hamt import HAMT, blake3_hashfn
-from .store import ContentAddressedStore, KuboCAS
+from .store import ContentAddressedStore, InMemoryCAS, KuboCAS
 from .zarr_hamt_store import ZarrHAMTStore
 
 __all__ = [
@@ -9,5 +9,6 @@ __all__ = [
     "ContentAddressedStore",
     "KuboCAS",
     "ZarrHAMTStore",
+    "InMemoryCAS",
     "SimpleEncryptedZarrHAMTStore",
 ]
