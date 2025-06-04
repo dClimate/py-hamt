@@ -144,3 +144,20 @@ async def test_kubo_cas(create_ipfs, data: IPLDKind):  # noqa
                 cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec_typed)
                 result = dag_cbor.decode(await kubo_cas.load(cid))
                 assert data == result
+
+
+@pytest.mark.ipfs
+@pytest.mark.asyncio(loop_scope="session")
+async def test_kubo_multi_gateway(create_ipfs, global_client_session):
+    """Verify that multiple gateway URLs work."""
+    rpc_url, gateway_url = create_ipfs
+
+    async with KuboCAS(
+        rpc_base_url=rpc_url,
+        gateway_base_url=gateway_url,
+        gateway_base_urls=[gateway_url, gateway_url],
+        session=global_client_session,
+    ) as kubo_cas:
+        cid = await kubo_cas.save(b"hello", codec="raw")
+        result = await kubo_cas.load(cid)
+        assert result == b"hello"
