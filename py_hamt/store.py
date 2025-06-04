@@ -120,6 +120,9 @@ class KuboCAS(ContentAddressedStore):
       the internally-created session.
     - **rpc_base_url / gateway_base_url** (str | None): override daemon
       endpoints (defaults match the local daemon ports).
+    - **gateway_base_urls** (list[str] | None): optional list of additional
+      gateway URLs to try in parallel when loading blocks. Each base URL is
+      normalized to end with ``/ipfs/``.
 
     ...
     """
@@ -137,6 +140,7 @@ class KuboCAS(ContentAddressedStore):
         session: aiohttp.ClientSession | None = None,
         rpc_base_url: str | None = KUBO_DEFAULT_LOCAL_RPC_BASE_URL,
         gateway_base_url: str | None = KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL,
+        gateway_base_urls: list[str] | None = None,
         concurrency: int = 32,
         *,
         headers: dict[str, str] | None = None,
@@ -188,7 +192,14 @@ class KuboCAS(ContentAddressedStore):
 
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
         """@private"""
-        self.gateway_base_url: str = f"{gateway_base_url}/ipfs/"
+
+        def _normalize(url: str) -> str:
+            """Ensure URL ends with '/ipfs/'."""
+            return url.rstrip("/") + "/ipfs/"
+
+        bases = gateway_base_urls if gateway_base_urls else [gateway_base_url]
+        self.gateway_base_urls = [_normalize(u) for u in bases]
+        self.gateway_base_url = self.gateway_base_urls[0]
         """@private"""
 
         self._session_per_loop: dict[
@@ -262,8 +273,31 @@ class KuboCAS(ContentAddressedStore):
     async def load(self, id: IPLDKind) -> bytes:
         """@private"""
         cid = cast(CID, id)  # CID is definitely in the IPLDKind type
-        url: str = self.gateway_base_url + str(cid)
-        async with self._sem:  # throttle gateway
-            async with self._loop_session().get(url) as resp:
-                resp.raise_for_status()
-                return await resp.read()
+
+        async def _fetch(base: str) -> bytes:
+            url: str = base + str(cid)
+            async with self._sem:
+                async with self._loop_session().get(url) as resp:
+                    resp.raise_for_status()
+                    return await resp.read()
+
+        if len(self.gateway_base_urls) == 1:
+            return await _fetch(self.gateway_base_urls[0])
+
+        tasks = [asyncio.create_task(_fetch(base)) for base in self.gateway_base_urls]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    result = await coro
+                except Exception:  # keep racing
+                    continue
+                else:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    return result
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+        raise RuntimeError("All gateway requests failed")
