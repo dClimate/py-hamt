@@ -105,4 +105,15 @@ and
 uv run pre-commit run --all-files --show-diff-on-failure
 ```
 
-instead. All checks must pass before the Agent generated code can be merged. AGENTS.md helps ensure the Agent follows these requirements.
+instead.
+
+
+If there is an error with formatting for ruff and it can be autofixed you can normally run
+
+```
+uv run ruff check --fix
+```
+
+to fix it.
+
+All checks must pass before the Agent generated code can be merged. AGENTS.md helps ensure the Agent follows these requirements.
