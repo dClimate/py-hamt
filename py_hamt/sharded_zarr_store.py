@@ -138,8 +138,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._root_obj = dag_cbor.decode(root_bytes)
 
         if self._root_obj.get("manifest_version") != "sharded_zarr_v1":
-            raise ValueError(f"Incompatible manifest version: {self._root_obj.get('manifest_version')}. Expected 'sharded_zarr_v1'.")
-
+            raise ValueError(f"Incompatible manifest version: {self._root_obj.get('manifest_version')}. Expected 'sharded_zarr_v1'.")   
         chunk_info = self._root_obj["chunks"]
         self._array_shape = tuple(chunk_info["array_shape"])
         self._chunk_shape = tuple(chunk_info["chunk_shape"])
@@ -446,7 +445,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
             chunk_cid_bytes: Optional[bytes] = None
 
             if shard_idx in self._shard_data_cache:
-                print(f"DEBUG: get() - Shard {shard_idx} found in cache. Key: {key}")
                 cached_shard_data = self._shard_data_cache[shard_idx]
                 if offset_in_shard_bytes + self._cid_len <= len(cached_shard_data):
                     chunk_cid_bytes = bytes(cached_shard_data[offset_in_shard_bytes : offset_in_shard_bytes + self._cid_len])
@@ -464,7 +462,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
             if chunk_cid_bytes is None: # Not in cache or cache was invalid
                 # print(f"DEBUG: get() - Shard {shard_idx} not in cache or invalid. Fetching specific CID. Key: {key}")
                 try:
-                    print("FETCHING SPECIFIC CID BYTES FROM SHARD Until Shard is cached. Key:", key)
                     chunk_cid_bytes = await self.cas.load(
                         target_shard_cid, offset=offset_in_shard_bytes, length=self._cid_len
                     )
@@ -522,12 +519,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # Save the actual chunk data to CAS first, to get its CID
         chunk_data_cid_obj = await self.cas.save(raw_chunk_data_bytes, codec="raw") # Chunks are typically raw bytes
         chunk_data_cid_str = str(chunk_data_cid_obj)
+        await self.set_pointer(key, chunk_data_cid_str) # Store the CID in the index
 
+    async def set_pointer(
+        self, key: str, pointer: str
+    ) -> None:
         # Ensure the CID (as ASCII bytes) fits in the allocated slot, padding with nulls
-        chunk_data_cid_ascii_bytes = chunk_data_cid_str.encode("ascii")
+        chunk_data_cid_ascii_bytes = pointer.encode("ascii")
         if len(chunk_data_cid_ascii_bytes) > self._cid_len:
             raise ValueError(
-                f"Encoded CID byte length ({len(chunk_data_cid_ascii_bytes)}) exceeds configured CID length ({self._cid_len}). CID: {chunk_data_cid_str}"
+                f"Encoded CID byte length ({len(chunk_data_cid_ascii_bytes)}) exceeds configured CID length ({self._cid_len}). CID: {pointer}"
             )
         padded_chunk_data_cid_bytes = chunk_data_cid_ascii_bytes.ljust(self._cid_len, b'\0')
 
@@ -539,7 +540,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             # So, we store the metadata content, get its CID, and put *that* CID in root_obj.
             # This means the `value_cid_str` for metadata should be from `raw_chunk_data_bytes`.
             # This seems to align with FlatZarrStore, where `value_cid` is used for both.
-            self._root_obj["metadata"][key] = chunk_data_cid_str # Store the string CID of the metadata content
+            self._root_obj["metadata"][key] = pointer # Store the string CID of the metadata content
             self._dirty_root = True
             return
 
