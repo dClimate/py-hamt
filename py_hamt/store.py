@@ -212,13 +212,22 @@ class KuboCAS(ContentAddressedStore):
     # helper: get or create the session bound to the current running loop   #
     # --------------------------------------------------------------------- #
     def _loop_session(self) -> aiohttp.ClientSession:
+        """Get or create a session for the current event loop with improved cleanup."""
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
             return self._session_per_loop[loop]
         except KeyError:
+            # Create a session with a connector that closes more quickly
+            connector = aiohttp.TCPConnector(
+                limit=64,
+                limit_per_host=32,
+                force_close=True,  # Force close connections
+                enable_cleanup_closed=True,  # Enable cleanup of closed connections
+            )
+
             sess = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=60),
-                connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
+                connector=connector,
                 headers=self._default_headers,
                 auth=self._default_auth,
             )
@@ -229,11 +238,56 @@ class KuboCAS(ContentAddressedStore):
     # graceful shutdown: close **all** sessions we own                      #
     # --------------------------------------------------------------------- #
     async def aclose(self) -> None:
-        if self._owns_session:
-            for sess in list(self._session_per_loop.values()):
-                if not sess.closed:
-                    await sess.close()
+        """
+        Close all sessions we own, properly handling multi-loop scenarios.
 
+        - Sessions in the current loop are properly awaited and closed
+        - Sessions in other loops are removed from tracking (can't be safely closed from here)
+        - All references are cleaned up to allow garbage collection
+        """
+        if not self._owns_session:
+            # User provided the session, they're responsible for closing it
+            return
+
+        # Get the current event loop if one exists
+        current_loop = None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running event loop - just clear all references
+            # The sessions will be garbage collected eventually
+            self._session_per_loop.clear()
+            return
+
+        # Separate sessions by whether they belong to the current loop
+        sessions_to_close = []
+        loops_to_remove = []
+
+        for loop, sess in list(self._session_per_loop.items()):
+            if loop == current_loop:
+                # This session belongs to our current loop
+                if not sess.closed:
+                    sessions_to_close.append(sess)
+                loops_to_remove.append(loop)
+            else:
+                # Session belongs to a different loop
+                # We can't safely close it from here, but we should remove our reference
+                loops_to_remove.append(loop)
+
+        # Close all sessions that belong to the current loop
+        for sess in sessions_to_close:
+            try:
+                await sess.close()
+            except Exception:
+                # If closing fails, continue anyway
+                pass
+
+        # Remove all references (both current loop and other loops)
+        for loop in loops_to_remove:
+            self._session_per_loop.pop(loop, None)
+
+    # At this point, _session_per_loop should be empty or only contain
+    # sessions from loops we haven't seen (which shouldn't happen in practice)
     async def __aenter__(self) -> "KuboCAS":
         return self
 
