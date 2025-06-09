@@ -1,9 +1,10 @@
-from py_hamt.hamt import extract_bits
 import pytest
+
+from py_hamt.hamt import extract_bits
 
 
 # Most of these tests were adapted over to python from rvagg's IAMap tests in JS
-def test_extract_bits():
+def test_extract_bits() -> None:
     assert extract_bits(bytes([0b11111111]), 0, 5) == 0b11111
     assert extract_bits(bytes([0b10101010]), 0, 5) == 0b10101
     assert extract_bits(bytes([0b10000000]), 0, 5) == 0b10000

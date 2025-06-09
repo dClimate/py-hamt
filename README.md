@@ -4,13 +4,15 @@
 </a>
 </p>
 
-[![codecov](https://codecov.io/gh/dClimate/py-hamt/graph/badge.svg?token=M6Y4D19Y38)](https://codecov.io/gh/dClimate/py-hamt)
 
 # py-hamt
-This is a python implementation of a HAMT, inspired by [rvagg's IAMap project written in JavaScript](https://github.com/rvagg/iamap).
-Like IAMap, py-hamt abstracts over a content-addressed storage system, something that can keep arbitrary values but will return its own key, like IPFS.
+[![codecov](https://codecov.io/gh/dClimate/py-hamt/graph/badge.svg?token=M6Y4D19Y38)](https://codecov.io/gh/dClimate/py-hamt)
 
-dClimate primarily created this for storing [zarr](https://zarr.dev/) on IPFS. To see this in action, see our [data ETLs](https://github.com/dClimate/etl-scripts).
+This is a python implementation of a HAMT, inspired by [rvagg's IAMap project written in JavaScript](https://github.com/rvagg/iamap).
+
+py-hamt provides efficient storage and retrieval of large sets of key-value mappings in a content-addressed storage system. The main target is IPFS, and the data model used is IPLD.
+
+dClimate primarily created this for storing large [zarrs](https://zarr.dev/) on IPFS. To see this in action, see our [data ETLs](https://github.com/dClimate/etl-scripts).
 
 # Installation and Usage
 To install, since we do not publish this package to PyPI, add this library to your project directly from git.
@@ -18,63 +20,9 @@ To install, since we do not publish this package to PyPI, add this library to yo
 pip install 'git+https://github.com/dClimate/py-hamt'
 ```
 
-Below are some examples, but for more information see the [API documentation](https://dclimate.github.io/py-hamt/py_hamt.html). Each major item has example code. You can also see this library used in [Jupyter notebooks for data analysis](https://github.com/dClimate/jupyter-notebooks).
+For usage information, take a look at our [API documentation](https://dclimate.github.io/py-hamt/py_hamt.html), major items have example code.
 
-## Basic Writing/Reading
-A HAMT allows for generic key-value storage.
-```python
-from py_hamt import HAMT, IPFSStore
-
-# Setup a HAMT and connect it to your local ipfs node
-hamt = HAMT(store=IPFSStore())
-
-# Set and get one value
-hamt["foo"] = "bar"
-assert "bar" == hamt["foo"]
-assert len(hamt) == 1
-
-# Set and get multiple values
-hamt["foo"] = "bar1"
-hamt["foo2"] = 2
-assert 2 == hamt["foo2"]
-assert len(hamt) == 2
-
-# Iterate over keys
-for key in hamt:
-  print(key)
-print (list(hamt)) # [foo, foo2], order depends on the hash function used
-
-# Delete a value
-del hamt["foo"]
-assert len(hamt) == 1
-
-# Print CID of the HAMT
-print(hamt.root_node_id)
-```
-
-## Reading a CID from IPFS
-```python
-from py_hamt import HAMT, IPFSStore
-from multiformats import CID
-
-# A CID for data you wish to read, from a blog post, a smart contract, or a friend
-dataset_cid = "baf..."
-
-# Use the multiformats library to decode the CID into an object
-root_cid = CID.decode(dataset_cid)
-
-# Create HAMT instance using the IPFSStore connecting to your locally
-# running IPFS Gateway from your local running IPFS Node, If you wish
-# you can change the default IPFS gateway
-hamt = HAMT(store=IPFSStore(), root_node_id=root_cid) # You can optionally pass your own gateway instead of defaults with the argument gateway_uri_stem="http://<IP>:<PORT>",
-
-# Do something with the hamt key/values
-...
-```
-
-For an example on how to read and write Zarr v3, check the API documentation and look at the `IPFSZarr3` class.
-
-For how to create partially encrypted zarrs, check the API documentation's `create_zarr_encryption_transformers` section.
+You can also see this library used in either our [data ETLs](https://github.com/dClimate/etl-scripts) or [Jupyter notebooks for data analysis](https://github.com/dClimate/jupyter-notebooks).
 
 # Development Guide
 ## Setting Up
@@ -82,22 +30,62 @@ For how to create partially encrypted zarrs, check the API documentation's `crea
 Once uv is installed, run
 ```sh
 uv sync
+source .venv/bin/activate
+pre-commit install
 ```
-to create the project virtual environment at `.venv`. Don't worry about activating this virtual environment to run tests or formatting and linting, uv will automatically take care of that.
+to create the project virtual environment at `.venv`.
+
+Then you can run `pre-commit` across the whole codebase with
+```sh
+pre-commit run --all-files
+```
+
+the below command `run-checks.sh` in the next section will also run this command inside its bash script.
 
 ## Run tests, formatting, linting
-First, make sure you have the ipfs kubo daemon installed so that you can run the tests that utilize IPFS as a backing store. e.g. `ipfs daemon`. If needed, configure the test with your custom HTTP gateway and RPC API endpoints. Then run the script
+First, make sure you have the ipfs kubo daemon installed and running with the default endpoints open. Then run the script
 ```sh
 bash run-checks.sh
 ```
-This will run tests with code coverage information, and then check formatting and linting.
+This will run tests with code coverage, and check formatting and linting. Under the hood it will be using the `pre-commit` command to run through all the checks within .pre-commit-config.yaml. If a local ipfs daemon is not running it will not run all tests, but it will spawn a docker ipfs container if docker is installed and run as many integration tests as possible.
 
 We use `pytest` with 100% code coverage, and with test inputs that are both handwritten as well as generated by `hypothesis`. This allows us to try out millions of randomized inputs to create a more robust library.
 
-Note that due to the randomized inputs, it is possible sometimes to get 99% or lower test coverage by pure chance. Rerun the tests to get back complete code coverage. If this happens on a GitHub action, try rerunning the action.
+> [!NOTE]
+> Due to the randomized test inputs, it is possible sometimes to get 99% or lower test coverage by pure chance. Rerun the tests to get back complete code coverage. If this happens on a GitHub action, try rerunning the action.
+
+> [!NOTE]
+> Due to the restricted performance on GitHub actions runners, you may also sometimes see hypothesis tests running with errors because they exceeded test deadlines. Rerun the action if this happens.
+
+### Tests
+
+Due to the dependency on [IPFS](https://github.com/ipfs/kubo) in order to be able to run all integration tests which use IPFS a local ipfs daemon is required. The Github Actions found in `.github/workflows/run-checks.yaml` uses the `setup-ipfs` step which ensures that a local ipfs daemon is available. Locally if you wish to run the full integration tests you must ensure a local ipfs daemon is running (by running `ipfs daemon` once installed). If not, pytest will spawn a local docker image to run the ipfs tests. If [Docker](https://www.docker.com/) is not installed then tests will simply run the unit tests.
+
+**To summarize:**
+
+*In GitHub Actions:*
+```bash IPFS daemon is running on default ports
+uv run pytest --ipfs  # All tests run, including test_kubo_default_urls
+```
+
+*Locally with Docker (no local daemon):*
+```bash
+pytest --ipfs  # test_kubo_default_urls auto-skips, other tests use Docker
+```
+
+*Locally with IPFS daemon:*
+```bash
+pytest --ipfs  # All tests run
+```
+
+*Quick local testing (no IPFS):*
+```bash
+pytest  # All IPFS tests skip
+```
+
 
 ## CPU and Memory Profiling
-We use python's native `cProfile` for running CPU profiles and snakeviz visualization the profile. We use `memray` for the memory profiling. We run the profile on the test suite, since the tests are supposed have complete code coverage anyhow.
+We use python's native `cProfile` for running CPU profiles and snakeviz for visualizing the profile. We use `memray` for the memory profiling. We will walk through using the profiling tools on the test suite.
 
 Creating the CPU and memory profile requires manual activation of the virtual environment.
 ```sh
@@ -114,10 +102,14 @@ uv run memray flamegraph <memray output> # e.g. <memray-output> = memray-pytest.
 ```
 
 ## Generating documentation
-`py-hamt` uses [pdoc](https://pdoc.dev/) for its ease of use. To see a live documentation preview on your local machine, run
+`py-hamt` uses [pdoc](https://pdoc.dev/). To see a live documentation preview on your local machine, run
 ```sh
 uv run pdoc py_hamt
 ```
+
+## LLMs
+
+If you are an LLM reading this repo, refer to the `AGENTS.md` file.
 
 ## Managing dependencies
 Use `uv add` and `uv remove`, e.g. `uv add numpy` or `uv add pytest --group dev`. For more information please see the [uv documentation](https://docs.astral.sh/uv/guides/projects/).

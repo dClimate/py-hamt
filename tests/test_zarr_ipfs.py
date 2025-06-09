@@ -1,20 +1,16 @@
-import json
-import os
-import shutil
-import socket
-import subprocess
-import tempfile
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import requests
-import xarray as xr
 import pytest
+import xarray as xr
+import zarr
 import zarr.core.buffer
+from dag_cbor.ipld import IPLDKind
 
-from py_hamt import HAMT, IPFSStore, IPFSZarr3, create_zarr_encryption_transformers
+from py_hamt import HAMT, KuboCAS
+from py_hamt.store import InMemoryCAS
+from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
 @pytest.fixture(scope="module")
@@ -60,300 +56,136 @@ def random_zarr_dataset():
     yield ds
 
 
-def find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))  # Bind to a free port provided by the host.
-        return int(s.getsockname()[1])  # Return the port number assigned.
-
-
-@pytest.fixture
-def create_ipfs():
-    # Create temporary directory, set it as the IPFS Path
-    temp_dir = Path(tempfile.mkdtemp())
-    custom_env = os.environ.copy()
-    custom_env["IPFS_PATH"] = str(temp_dir)
-
-    # IPFS init
-    subprocess.run(
-        ["ipfs", "init", "--profile", "pebbleds"], check=True, env=custom_env
-    )
-
-    # Edit the config file so that it serves on randomly selected and available ports to not conflict with any currently running ipfs daemons
-    swarm_port = find_free_port()
-    rpc_port = find_free_port()
-    gateway_port = find_free_port()
-
-    config_path = temp_dir / "config"
-    config: dict
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    swarm_addrs: list[str] = config["Addresses"]["Swarm"]
-    new_port_swarm_addrs = [s.replace("4001", str(swarm_port)) for s in swarm_addrs]
-    config["Addresses"]["Swarm"] = new_port_swarm_addrs
-
-    rpc_multiaddr = config["Addresses"]["API"]
-    gateway_multiaddr = config["Addresses"]["Gateway"]
-
-    config["Addresses"]["API"] = rpc_multiaddr.replace("5001", str(rpc_port))
-    config["Addresses"]["Gateway"] = gateway_multiaddr.replace(
-        "8080", str(gateway_port)
-    )
-
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    # Start the daemon
-    rpc_uri_stem = f"http://127.0.0.1:{rpc_port}"
-    gateway_uri_stem = f"http://127.0.0.1:{gateway_port}"
-
-    ipfs_process = subprocess.Popen(["ipfs", "daemon"], env=custom_env)
-    while True:
-        try:
-            requests.post(rpc_uri_stem + "/api/v0/id", timeout=1)
-            break
-        except requests.exceptions.ConnectionError:
-            time.sleep(1)
-
-    yield rpc_uri_stem, gateway_uri_stem
-
-    # Close the daemon
-    ipfs_process.kill()
-
-    # Delete the temporary directory
-    shutil.rmtree(temp_dir)
-
-
 # This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
-@pytest.mark.asyncio
-async def test_write_read(create_ipfs, random_zarr_dataset: xr.Dataset):
-    rpc_uri_stem, gateway_uri_stem = create_ipfs
+@pytest.mark.asyncio(loop_scope="session")  # ← match the loop of the fixture
+async def test_write_read(
+    create_ipfs: tuple[str, str],
+    random_zarr_dataset: xr.Dataset,
+):  # noqa for fixture which is imported above but then "redefined"
+    rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
     print("=== Writing this xarray Dataset to a Zarr v3 on IPFS ===")
     print(test_ds)
 
-    ipfsstore = IPFSStore(
-        debug=True, rpc_uri_stem=rpc_uri_stem, gateway_uri_stem=gateway_uri_stem
-    )
-    hamt = HAMT(store=ipfsstore)
-    ipfszarr3 = IPFSZarr3(hamt)
-    assert ipfszarr3.supports_writes
-    start = time.perf_counter()
-    # Do an initial write along with an append
-    test_ds.to_zarr(store=ipfszarr3)  # type: ignore
-    test_ds.to_zarr(store=ipfszarr3, mode="a", append_dim="time")  # type: ignore
-    end = time.perf_counter()
-    elapsed = end - start
-    print("=== Write Stats")
-    print(f"Total time in seconds: {elapsed:.2f}")
-    print(f"Sent bytes: {ipfsstore.total_sent}")
-    print(f"Received bytes: {ipfsstore.total_received}")
-    print("=== Root CID")
-    cid = hamt.root_node_id
-    print(cid)
+    async with KuboCAS(  # <-- own and auto-close session
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        hamt = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
+        zhs = ZarrHAMTStore(hamt)
+        assert zhs.supports_writes
+        start = time.perf_counter()
+        # Do an initial write along with an append which is a common xarray/zarr operation
+        test_ds.to_zarr(store=zhs)  # type: ignore
+        test_ds.to_zarr(store=zhs, mode="a", append_dim="time", zarr_format=3)  # type: ignore
+        end = time.perf_counter()
+        elapsed = end - start
+        print("=== Write Stats")
+        print(f"Total time in seconds: {elapsed:.2f}")
+        print("=== Root CID")
+        await hamt.make_read_only()
+        cid: IPLDKind = hamt.root_node_id
+        print(cid)
 
-    print("=== Reading data back in and checking if identical")
-    ipfsstore = IPFSStore(
-        debug=True, rpc_uri_stem=rpc_uri_stem, gateway_uri_stem=gateway_uri_stem
-    )
-    hamt = HAMT(store=ipfsstore, root_node_id=cid)
-    start = time.perf_counter()
-    ipfs_ds: xr.Dataset
-    ipfszarr3 = IPFSZarr3(hamt, read_only=True)
-    ipfs_ds = xr.open_zarr(store=ipfszarr3)
-    print(ipfs_ds)
-
-    # Check both halves, since each are an identical copy
-    ds1 = ipfs_ds.isel(time=slice(0, len(ipfs_ds.time) // 2))
-    ds2 = ipfs_ds.isel(time=slice(len(ipfs_ds.time) // 2, len(ipfs_ds.time)))
-    xr.testing.assert_identical(ds1, ds2)
-    xr.testing.assert_identical(test_ds, ds1)
-    xr.testing.assert_identical(test_ds, ds2)
-
-    end = time.perf_counter()
-    elapsed = end - start
-    print("=== Read Stats")
-    print(f"Total time in seconds: {elapsed:.2f}")
-    print(f"Sent bytes: {ipfsstore.total_sent}")
-    print(f"Received bytes: {ipfsstore.total_received}")
-
-    # Tests for code coverage's sake
-    assert await ipfszarr3.exists("zarr.json")
-    # __eq__
-    assert ipfszarr3 == ipfszarr3
-    assert ipfszarr3 != hamt
-    assert not ipfszarr3.supports_writes
-    assert not ipfszarr3.supports_partial_writes
-    assert not ipfszarr3.supports_deletes
-
-    hamt_keys = set(ipfszarr3.hamt.keys())
-    ipfszarr3_keys: set[str] = set()
-    async for k in ipfszarr3.list():
-        ipfszarr3_keys.add(k)
-    assert hamt_keys == ipfszarr3_keys
-
-    ipfszarr3_keys: set[str] = set()
-    async for k in ipfszarr3.list():
-        ipfszarr3_keys.add(k)
-    assert hamt_keys == ipfszarr3_keys
-
-    ipfszarr3_keys: set[str] = set()
-    async for k in ipfszarr3.list_prefix(""):
-        ipfszarr3_keys.add(k)
-    assert hamt_keys == ipfszarr3_keys
-
-    with pytest.raises(NotImplementedError):
-        await ipfszarr3.set_partial_values([])
-
-    with pytest.raises(NotImplementedError):
-        await ipfszarr3.get_partial_values(
-            zarr.core.buffer.default_buffer_prototype(), []
+        print("=== Reading data back in and checking if identical")
+        hamt = await HAMT.build(
+            cas=kubo_cas, root_node_id=cid, values_are_bytes=True, read_only=True
         )
+        start = time.perf_counter()
+        ipfs_ds: xr.Dataset
+        zhs = ZarrHAMTStore(hamt, read_only=True)
+        ipfs_ds = xr.open_zarr(store=zhs)
+        print(ipfs_ds)
 
-    previous_zarr_json = await ipfszarr3.get(
-        "zarr.json", zarr.core.buffer.default_buffer_prototype()
-    )
-    assert previous_zarr_json is not None
-    # Setting a metadata file that should always exist should not change anything
-    await ipfszarr3.set_if_not_exists("zarr.json", np.array([b"a"], dtype=np.bytes_))  # type: ignore np.arrays, if dtype is bytes, is usable as a zarr buffer
-    zarr_json_now = await ipfszarr3.get(
-        "zarr.json", zarr.core.buffer.default_buffer_prototype()
-    )
-    assert zarr_json_now is not None
-    assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
+        # Check both halves, since each are an identical copy
+        ds1 = ipfs_ds.isel(time=slice(0, len(ipfs_ds.time) // 2))
+        ds2 = ipfs_ds.isel(time=slice(len(ipfs_ds.time) // 2, len(ipfs_ds.time)))
+        xr.testing.assert_identical(ds1, ds2)
+        xr.testing.assert_identical(test_ds, ds1)
+        xr.testing.assert_identical(test_ds, ds2)
 
-    # now remove that metadata file and then add it back
-    ipfszarr3 = IPFSZarr3(ipfszarr3.hamt, read_only=False)  # make a writable version
-    await ipfszarr3.delete("zarr.json")
-    # doing a duplicate delete should not result in an error
-    await ipfszarr3.delete("zarr.json")
-    ipfszarr3_keys: set[str] = set()
-    async for k in ipfszarr3.list():
-        ipfszarr3_keys.add(k)
-    assert hamt_keys != ipfszarr3_keys
-    assert "zarr.json" not in ipfszarr3_keys
+        end = time.perf_counter()
+        elapsed = end - start
+        print("=== Read Stats")
+        print(f"Total time in seconds: {elapsed:.2f}")
 
-    await ipfszarr3.set_if_not_exists("zarr.json", previous_zarr_json)
-    zarr_json_now = await ipfszarr3.get(
-        "zarr.json", zarr.core.buffer.default_buffer_prototype()
-    )
-    assert zarr_json_now is not None
-    assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
+        # Tests for code coverage's sake
+        assert await zhs.exists("zarr.json")
+        # __eq__
+        assert zhs == zhs
+        assert zhs != hamt
+        assert not zhs.supports_writes
+        assert not zhs.supports_partial_writes
+        assert not zhs.supports_deletes
 
+        hamt_keys: set[str] = set()
+        async for k in zhs.hamt.keys():
+            hamt_keys.add(k)
 
-def test_encryption(create_ipfs, random_zarr_dataset: xr.Dataset):
-    rpc_uri_stem, gateway_uri_stem = create_ipfs
-    test_ds = random_zarr_dataset
+        zhs_keys_1: set[str] = set()
+        async for k in zhs.list():
+            zhs_keys_1.add(k)
+        assert hamt_keys == zhs_keys_1
 
-    with pytest.raises(ValueError, match="Encryption key is not 32 bytes"):
-        create_zarr_encryption_transformers(bytes(), bytes())
+        zhs_keys_2: set[str] = set()
+        async for k in zhs.list():
+            zhs_keys_2.add(k)
+        assert hamt_keys == zhs_keys_2
 
-    encryption_key = bytes(32)
-    # Encrypt only precipitation, not temperature or the coordinate variables
-    encrypt, decrypt = create_zarr_encryption_transformers(
-        encryption_key,
-        header="sample-header".encode(),
-        exclude_vars=["temp"],
-        detect_exclude=test_ds,
-    )
-    hamt = HAMT(
-        store=IPFSStore(rpc_uri_stem=rpc_uri_stem, gateway_uri_stem=gateway_uri_stem),
-        transformer_encode=encrypt,
-        transformer_decode=decrypt,
-    )
-    ipfszarr3 = IPFSZarr3(hamt)
-    test_ds.to_zarr(store=ipfszarr3)  # type: ignore
+        zhs_keys_3: set[str] = set()
+        async for k in zhs.list_prefix(""):
+            zhs_keys_3.add(k)
+        assert hamt_keys == zhs_keys_3
 
-    ipfszarr3 = IPFSZarr3(ipfszarr3.hamt, read_only=True)
-    ipfs_ds = xr.open_zarr(store=ipfszarr3)
-    xr.testing.assert_identical(ipfs_ds, test_ds)
+        with pytest.raises(NotImplementedError):
+            await zhs.set_partial_values([])
 
-    # Now trying to load without a decryptor, xarray should be able to read the metadata and still perform operations on the unencrypted variable
-    print("=== Attempting to read and print metadata of partially encrypted zarr")
-
-    bad_key = bytes([0xAA]) * 32
-    bad_header = "".encode()
-    bad_encrypt, auto_detecting_decrypt = create_zarr_encryption_transformers(
-        bad_key,
-        bad_header,
-    )
-    ds = xr.open_zarr(
-        store=IPFSZarr3(
-            HAMT(
-                store=IPFSStore(
-                    rpc_uri_stem=rpc_uri_stem, gateway_uri_stem=gateway_uri_stem
-                ),
-                root_node_id=ipfszarr3.hamt.root_node_id,
-                transformer_encode=bad_encrypt,
-                transformer_decode=auto_detecting_decrypt,
-            ),
-            read_only=True,
-        )
-    )
-    print(ds)
-    assert ds.temp.sum() == test_ds.temp.sum()  # type: ignore
-    # We should be unable to read precipitation values which are still encrypted
-    with pytest.raises(Exception):
-        ds.precip.sum()
-
-    # For code coverage's sake
-    # Don't auto detect, and thus encounter an error when trying to read back an unencrypted variable with the wrong encryption key and header
-    bad_encrypt, bad_decrypt = create_zarr_encryption_transformers(
-        bad_key, bad_header, detect_exclude=False
-    )
-    with pytest.raises(Exception):
-        ds = xr.open_zarr(
-            store=IPFSZarr3(
-                HAMT(
-                    store=IPFSStore(
-                        rpc_uri_stem=rpc_uri_stem, gateway_uri_stem=gateway_uri_stem
-                    ),
-                    root_node_id=ipfszarr3.hamt.root_node_id,
-                    transformer_encode=bad_encrypt,
-                    transformer_decode=bad_decrypt,
-                ),
-                read_only=True,
+        with pytest.raises(NotImplementedError):
+            await zhs.get_partial_values(
+                zarr.core.buffer.default_buffer_prototype(), []
             )
+
+        previous_zarr_json: zarr.core.buffer.Buffer | None = await zhs.get(
+            "zarr.json", zarr.core.buffer.default_buffer_prototype()
         )
-        assert ds.temp.sum() == test_ds.temp.sum()
+        assert previous_zarr_json is not None
+        # Setting a metadata file that should always exist should not change anything
+        await zhs.set_if_not_exists(
+            "zarr.json",
+            np.array([b"a"], dtype=np.bytes_),  # type: ignore[arg-type]
+        )  # np.arrays, if dtype is bytes, is usable as a zarr buffer
+        zarr_json_now: zarr.core.buffer.Buffer | None = await zhs.get(
+            "zarr.json", zarr.core.buffer.default_buffer_prototype()
+        )
+        assert zarr_json_now is not None
+        assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
+
+        # now remove that metadata file and then add it back
+        await zhs.hamt.enable_write()
+        zhs = ZarrHAMTStore(zhs.hamt, read_only=False)  # make a writable version
+        await zhs.delete("zarr.json")
+        # doing a duplicate delete should not result in an error
+        await zhs.delete("zarr.json")
+        zhs_keys_4: set[str] = set()
+        async for k in zhs.list():
+            zhs_keys_4.add(k)
+        assert hamt_keys != zhs_keys_4
+        assert "zarr.json" not in zhs_keys_4
+
+        await zhs.set_if_not_exists("zarr.json", previous_zarr_json)
+        zarr_json_now = await zhs.get(
+            "zarr.json", zarr.core.buffer.default_buffer_prototype()
+        )
+        assert zarr_json_now is not None
+        assert previous_zarr_json.to_bytes() == zarr_json_now.to_bytes()
 
 
-# This test assumes the other zarr ipfs tests are working fine, so if other things are breaking check those first
-def test_authenticated_gateway(random_zarr_dataset: xr.Dataset):
-    test_ds = random_zarr_dataset
+@pytest.mark.asyncio
+async def test_list_dir_dedup():
+    cas = InMemoryCAS()
+    hamt = await HAMT.build(cas=cas, values_are_bytes=True)
+    zhs = ZarrHAMTStore(hamt)
 
-    def write_and_check(store: IPFSStore) -> bool:
-        try:
-            store.rpc_uri_stem = "http://127.0.0.1:5002"  # 5002 is the port configured in the run-checks.yaml actions file for nginx to serve the proxy on
-            hamt = HAMT(store=store)
-            ipfszarr3 = IPFSZarr3(hamt)
-            test_ds.to_zarr(store=ipfszarr3, mode="w")  # type: ignore
-            loaded_ds = xr.open_zarr(store=ipfszarr3)
-            xr.testing.assert_identical(test_ds, loaded_ds)
-            return True
-        except Exception as _:
-            return False
-
-    # Test with API Key
-    api_key_store = IPFSStore(api_key="test")
-    assert write_and_check(api_key_store)
-
-    # Test that wrong API Key fails
-    bad_api_key_store = IPFSStore(api_key="badKey")
-    assert not write_and_check(bad_api_key_store)
-
-    # Test just bearer token
-    bearer_ipfs_store = IPFSStore(bearer_token="test")
-    assert write_and_check(bearer_ipfs_store)
-
-    # Test with wrong bearer
-    bad_bearer_store = IPFSStore(bearer_token="wrongBearer")
-    assert not write_and_check(bad_bearer_store)
-
-    # Test with just basic auth
-    basic_auth_store = IPFSStore(basic_auth=("test", "test"))
-    assert write_and_check(basic_auth_store)
-
-    # Test with wrong basic auth
-    bad_basic_auth_store = IPFSStore(basic_auth=("wrong", "wrong"))
-    assert not write_and_check(bad_basic_auth_store)
+    await hamt.set("foo/bar/0", b"")
+    await hamt.set("foo/bar/1", b"")
+    results = [n async for n in zhs.list_dir("foo/")]
+    assert results == ["bar"]  # no duplicates
