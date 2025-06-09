@@ -3,7 +3,7 @@ import asyncio
 import json
 import time
 from typing import Dict, Any
-from py_hamt import HAMT, KuboCAS, FlatZarrStore, ShardedZarrStore
+from py_hamt import HAMT, KuboCAS, ShardedZarrStore
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 import xarray as xr
 from multiformats import CID
@@ -34,22 +34,14 @@ async def convert_hamt_to_sharded(
     source_dataset = xr.open_zarr(store=source_store, consolidated=True)
     # 2. Introspect the source array to get its configuration
     print("Reading metadata from source store...")
-    try:
-        # Read the stores metadata to get array shape and chunk shape
-        print("Fetching metadata...")
-        ordered_dims = list(source_dataset.dims)
-        array_shape_tuple = tuple(source_dataset.dims[dim] for dim in ordered_dims)
-        chunk_shape_tuple = tuple(source_dataset.chunks[dim][0] for dim in ordered_dims)
-        array_shape = array_shape_tuple
-        chunk_shape = chunk_shape_tuple
-        print("Metadata read successfully.")
-        print(f"Found Array Shape: {array_shape}")
-        print(f"Found Chunk Shape: {chunk_shape}")
 
-    except KeyError as e:
-        raise RuntimeError(
-            f"Could not find required metadata in source .zarray: {e}"
-        ) from e
+    # Read the stores metadata to get array shape and chunk shape
+    ordered_dims = list(source_dataset.dims)
+    array_shape_tuple = tuple(source_dataset.dims[dim] for dim in ordered_dims)
+    chunk_shape_tuple = tuple(source_dataset.chunks[dim][0] for dim in ordered_dims)
+    array_shape = array_shape_tuple
+    chunk_shape = chunk_shape_tuple
+
 
     # 3. Create the destination ShardedZarrStore for writing
     print(f"Initializing new ShardedZarrStore with {chunks_per_shard} chunks per shard...")
@@ -71,14 +63,12 @@ async def convert_hamt_to_sharded(
         count += 1
         # Read the raw data (metadata or chunk) from the source
         cid: CID = await hamt_ro.get_pointer(key)
-        if cid is None:
-            continue
         cid_base32_str = str(cid.encode("base32"))
 
         # Write the exact same key-value pair to the destination.
         await dest_store.set_pointer(key, cid_base32_str)
-        if count % 200 == 0:
-            print(f"Migrated {count} keys...")
+        if count % 200 == 0: # pragma: no cover
+            print(f"Migrated {count} keys...") # pragma: no cover
 
     print(f"Migration of {count} total keys complete.")
 
@@ -93,7 +83,7 @@ async def convert_hamt_to_sharded(
     return new_root_cid
 
 
-async def main():
+async def sharded_converter_cli():
     parser = argparse.ArgumentParser(
         description="Convert a Zarr HAMT store to a Sharded Zarr store."
     )
@@ -109,7 +99,7 @@ async def main():
     parser.add_argument(
         "--rpc-url",
         type=str,
-        default="http://127.0.0.1:5001/api/v0",
+        default="http://127.0.0.1:5001",
         help="The URL of the IPFS Kubo RPC API.",
     )
     parser.add_argument(
@@ -119,6 +109,7 @@ async def main():
         help="The URL of the IPFS Gateway.",
     )
     args = parser.parse_args()
+    # Initialize the KuboCAS client with the provided RPC and Gateway URLs
     async with KuboCAS(
         rpc_base_url=args.rpc_url, gateway_base_url=args.gateway_url
     ) as cas_client:
@@ -132,4 +123,4 @@ async def main():
             print(f"\nAn error occurred: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(sharded_converter_cli()) # pragma: no cover

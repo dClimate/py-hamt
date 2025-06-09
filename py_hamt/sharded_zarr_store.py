@@ -118,7 +118,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         self._root_obj = {
             "manifest_version": "sharded_zarr_v1",
-            "metadata": {}, # For .zgroup, .zarray, .zattrs etc.
+            "metadata": {}, # For .json
             "chunks": { # Information about the chunk index itself
                 "array_shape": list(self._array_shape), # Original array shape
                 "chunk_shape": list(self._chunk_shape), # Original chunk shape
@@ -133,7 +133,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
     async def _load_root_from_cid(self):
         if not self._root_cid:
-            raise ValueError("Cannot load root without a root_cid.")
+            raise RuntimeError("Cannot load root without a root_cid.")
         root_bytes = await self.cas.load(self._root_cid)
         self._root_obj = dag_cbor.decode(root_bytes)
 
@@ -171,15 +171,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
         Manages removal from _pending_shard_loads.
         """
         try:
-            # Double check if it got cached by another operation while this task was scheduled
-            if shard_idx in self._shard_data_cache:
-                return
-
             shard_data_bytes = await self.cas.load(shard_cid) # Load full shard
             self._shard_data_cache[shard_idx] = bytearray(shard_data_bytes)
-            # print(f"DEBUG: Successfully cached full shard {shard_idx} (CID: {shard_cid})")
-
         except Exception as e:
+            print(e)
             # Handle or log the exception appropriately
             print(f"Warning: Failed to cache full shard {shard_idx} (CID: {shard_cid}): {e}")
             # If it fails, subsequent requests might try again if it's still not in cache.
@@ -251,8 +246,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
             return None
 
     def _get_linear_chunk_index(self, chunk_coords: Tuple[int, ...]) -> int:
-        if not self._chunks_per_dim:
-             raise RuntimeError("Store not initialized: _chunks_per_dim is None.")
         linear_index = 0
         multiplier = 1
         # Convert N-D chunk coordinates to a flat 1-D index (row-major order)
@@ -271,68 +264,38 @@ class ShardedZarrStore(zarr.abc.store.Store):
         index_in_shard = linear_chunk_index % self._chunks_per_shard
         return shard_idx, index_in_shard
 
-    def _get_actual_chunks_in_shard(self, shard_idx: int) -> int:
-        return self._chunks_per_shard
-        # if self._num_shards is None or self._total_chunks is None or self._chunks_per_shard is None:
-        #      raise RuntimeError("Store not properly initialized for shard calculation (_num_shards, _total_chunks, or _chunks_per_shard is None).")
-        # if not (0 <= shard_idx < self._num_shards): # Handles case where _num_shards can be 0
-        #     if self._num_shards == 0 and shard_idx == 0 and self._total_chunks == 0: # special case for 0-size array
-        #         return 0
-        #     raise ValueError(f"Invalid shard index: {shard_idx}. Num shards: {self._num_shards}")
-
-        # if shard_idx == self._num_shards - 1: # Last shard
-        #     remaining_chunks = self._total_chunks - shard_idx * self._chunks_per_shard
-        #     return remaining_chunks
-        # else:
-        #     return self._chunks_per_shard
-
     async def _load_or_initialize_shard_cache(self, shard_idx: int) -> bytearray:
         if shard_idx in self._shard_data_cache:
             return self._shard_data_cache[shard_idx]
 
-        # Check if a background load for this shard is already in progress
         if shard_idx in self._pending_shard_loads:
-            # print(f"DEBUG: _load_or_initialize_shard_cache - Shard {shard_idx} has a pending load. Awaiting it.")
             try:
                 await self._pending_shard_loads[shard_idx]
-                # After awaiting, it should be in the cache if the task was successful
                 if shard_idx in self._shard_data_cache:
                     return self._shard_data_cache[shard_idx]
                 else:
-                    # Task finished but didn't populate cache (e.g., an error occurred in the task)
-                    # print(f"DEBUG: _load_or_initialize_shard_cache - Pending load for {shard_idx} completed but shard not in cache. Proceeding to load manually.")
-                    pass # Fall through to normal loading
+                    pass  # Fall through to normal loading
             except asyncio.CancelledError:
-                # print(f"DEBUG: _load_or_initialize_shard_cache - Pending load for {shard_idx} was cancelled. Proceeding to load manually.")
-                # Ensure it's removed if cancelled before its finally block ran
                 if shard_idx in self._pending_shard_loads:
                     del self._pending_shard_loads[shard_idx]
                 # Fall through to normal loading
             except Exception as e:
-                # The pending task itself might have failed with an exception
                 print(f"Warning: Pending shard load for {shard_idx} failed: {e}. Attempting fresh load.")
-                # Fall through to normal loading. The pending task's finally block should have cleaned it up.
 
         if self._root_obj is None:
             raise RuntimeError("Root object not loaded or initialized (_root_obj is None).")
         if not (0 <= shard_idx < self._num_shards if self._num_shards is not None else False):
              raise ValueError(f"Shard index {shard_idx} out of bounds for {self._num_shards} shards.")
 
-
         shard_cid = self._root_obj["chunks"]["shard_cids"][shard_idx]
         if shard_cid:
             shard_data_bytes = await self.cas.load(shard_cid)
-            # Verify length?
-            # expected_len = self._get_actual_chunks_in_shard(shard_idx) * self._cid_len
-            # if len(shard_data_bytes) != expected_len:
-            #     raise ValueError(f"Shard {shard_idx} (CID: {shard_cid}) has unexpected length. Got {len(shard_data_bytes)}, expected {expected_len}")
             self._shard_data_cache[shard_idx] = bytearray(shard_data_bytes)
         else:
             if self._cid_len is None: # Should be set
                 raise RuntimeError("Store not initialized: _cid_len is None for shard initialization.")
             # New shard or shard not yet written, initialize with zeros
-            num_chunks_in_this_shard = self._get_actual_chunks_in_shard(shard_idx)
-            shard_size_bytes = num_chunks_in_this_shard * self._cid_len
+            shard_size_bytes = self._chunks_per_shard * self._cid_len
             self._shard_data_cache[shard_idx] = bytearray(shard_size_bytes) # Filled with \x00
         return self._shard_data_cache[shard_idx]
 
@@ -404,107 +367,69 @@ class ShardedZarrStore(zarr.abc.store.Store):
         byte_range: Optional[zarr.abc.store.ByteRequest] = None,
     ) -> Optional[zarr.core.buffer.Buffer]:
         if self._root_obj is None:
-            if not self._root_cid:
-                 raise ValueError("Store not initialized and no root_cid to load from.")
-            await self._load_root_from_cid() # This will populate self._root_obj
-            if self._root_obj is None: # Should be loaded by _load_root_from_cid
-                 raise RuntimeError("Failed to load root object after _load_root_from_cid call.")
+            raise RuntimeError("Load the root object first before accessing data.")
 
         chunk_coords = self._parse_chunk_key(key)
-        try:
-            # Metadata request (e.g., ".zarray", ".zgroup")
-            if chunk_coords is None:
-                metadata_cid = self._root_obj["metadata"].get(key)
-                if metadata_cid is None:
-                    return None
-                # byte_range is not typically applicable to metadata JSON objects themselves
-                if byte_range is not None:
-                     # Consider if this should be an error or ignored for metadata
-                     print(f"Warning: byte_range requested for metadata key '{key}'. Ignoring range.")
-                data = await self.cas.load(metadata_cid)
-                return prototype.buffer.from_bytes(data)
-
-            # Chunk data request (e.g., "c/0/0/0")
-            if self._cid_len is None: # Should be set during init/load
-                raise RuntimeError("Store not properly initialized: _cid_len is None.")
-
-            linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
-            shard_idx, index_in_shard = self._get_shard_info(linear_chunk_index)
-            # print("SHARD LOCATION", linear_chunk_index, shard_idx, index_in_shard) # Debugging info
-
-
-            if not (0 <= shard_idx < len(self._root_obj["chunks"]["shard_cids"])):
-                 # This case implies linear_chunk_index was out of _total_chunks bounds or bad sharding logic
-                 return None 
-
-            target_shard_cid = self._root_obj["chunks"]["shard_cids"][shard_idx]
-            if target_shard_cid is None: # This shard has no data (all chunks within it are implicitly empty)
+        # Metadata request (e.g., ".json")
+        if chunk_coords is None:
+            metadata_cid = self._root_obj["metadata"].get(key)
+            if metadata_cid is None:
                 return None
-
-            offset_in_shard_bytes = index_in_shard * self._cid_len
-            chunk_cid_bytes: Optional[bytes] = None
-
-            if shard_idx in self._shard_data_cache:
-                cached_shard_data = self._shard_data_cache[shard_idx]
-                if offset_in_shard_bytes + self._cid_len <= len(cached_shard_data):
-                    chunk_cid_bytes = bytes(cached_shard_data[offset_in_shard_bytes : offset_in_shard_bytes + self._cid_len])
-                else:
-                    # This would indicate an inconsistency or error in shard data/cache.
-                    print(f"Warning: Cached shard {shard_idx} is smaller than expected for key {key}. Re-fetching CID.")
-                    # Fall through to fetch from CAS, and potentially re-cache full shard.
-                    # To be very robust, you might consider invalidating this cache entry here.
-                    del self._shard_data_cache[shard_idx] # Invalidate corrupted/short cache entry
-                    if shard_idx in self._pending_shard_loads: # Cancel if a load was pending for this now-invalidated cache
-                        self._pending_shard_loads[shard_idx].cancel()
-                        del self._pending_shard_loads[shard_idx]
-                    # Fallthrough to load chunk_cid_bytes directly
-
-            if chunk_cid_bytes is None: # Not in cache or cache was invalid
-                # print(f"DEBUG: get() - Shard {shard_idx} not in cache or invalid. Fetching specific CID. Key: {key}")
-                try:
-                    chunk_cid_bytes = await self.cas.load(
-                        target_shard_cid, offset=offset_in_shard_bytes, length=self._cid_len
-                    )
-                except Exception as e: # Handle error from CAS load (e.g. shard CID not found, network issue)
-                    # print(f"Error: Failed to load specific CID bytes from shard {target_shard_cid} for key {key}: {e}")
-                    return None # Chunk CID couldn't be retrieved
-
-                # After successfully fetching the specific CID bytes,
-                # check if we should initiate a background load of the full shard.
-                if shard_idx not in self._shard_data_cache and shard_idx not in self._pending_shard_loads:
-                    # print(f"DEBUG: get() - Initiating background cache for full shard {shard_idx} (CID: {target_shard_cid}). Key: {key}")
-                    self._pending_shard_loads[shard_idx] = asyncio.create_task(
-                        self._fetch_and_cache_full_shard(shard_idx, target_shard_cid)
-                    )
-
-            # Load the specific CID from the shard
-            # chunk_cid_bytes = await self.cas.load(
-            #     target_shard_cid, offset=offset_in_shard_bytes, length=self._cid_len
-            # )
-
-            if all(b == 0 for b in chunk_cid_bytes): # Check for null CID placeholder (e.g. \x00 * cid_len)
-                return None  # Chunk doesn't exist or is considered empty
-
-            # Decode CID (assuming ASCII, remove potential null padding)
-            chunk_cid_str = chunk_cid_bytes.decode("ascii").rstrip('\x00')
-            if not chunk_cid_str: # Empty string after rstrip if all were \x00 (already caught above)
-                 return None
-
-            # Actual chunk data load using the retrieved chunk_cid_str
-            req_offset = byte_range.start if byte_range else None
-            req_length = None
-            if byte_range:
-                if byte_range.stop is not None:
-                    if byte_range.start > byte_range.stop: # Zarr allows start == stop for 0 length
-                         raise ValueError(f"Byte range start ({byte_range.start}) cannot be greater than stop ({byte_range.stop})")
-                    req_length = byte_range.stop - byte_range.start
-            
-            data = await self.cas.load(chunk_cid_str, offset=req_offset, length=req_length)
+            # byte_range is not typically applicable to metadata JSON objects themselves
+            if byte_range is not None:
+                    # Consider if this should be an error or ignored for metadata
+                    print(f"Warning: byte_range requested for metadata key '{key}'. Ignoring range.")
+            data = await self.cas.load(metadata_cid)
             return prototype.buffer.from_bytes(data)
 
-        except (KeyError, IndexError, TypeError, ValueError) as e:
-            # print(f"Error during get for key {key} (coords: {chunk_coords}): {type(e).__name__} - {e}") # for debugging
-            return None # Consistent with Zarr behavior for missing keys
+        linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
+        shard_idx, index_in_shard = self._get_shard_info(linear_chunk_index)
+
+        if not (0 <= shard_idx < len(self._root_obj["chunks"]["shard_cids"])):
+                # This case implies linear_chunk_index was out of _total_chunks bounds or bad sharding logic
+                return None 
+
+        target_shard_cid = self._root_obj["chunks"]["shard_cids"][shard_idx]
+        if target_shard_cid is None: # This shard has no data (all chunks within it are implicitly empty)
+            return None
+
+        offset_in_shard_bytes = index_in_shard * self._cid_len
+        chunk_cid_bytes: Optional[bytes] = None
+
+        if shard_idx in self._shard_data_cache:
+            cached_shard_data = self._shard_data_cache[shard_idx]
+            chunk_cid_bytes = bytes(cached_shard_data[offset_in_shard_bytes : offset_in_shard_bytes + self._cid_len])
+
+        if chunk_cid_bytes is None: # Not in cache or cache was invalid
+            chunk_cid_bytes = await self.cas.load(
+                target_shard_cid, offset=offset_in_shard_bytes, length=self._cid_len
+            )
+            # After successfully fetching the specific CID bytes,
+            # check if we should initiate a background load of the full shard.
+            if shard_idx not in self._shard_data_cache and shard_idx not in self._pending_shard_loads:
+                self._pending_shard_loads[shard_idx] = asyncio.create_task(
+                    self._fetch_and_cache_full_shard(shard_idx, target_shard_cid)
+                )
+
+        if all(b == 0 for b in chunk_cid_bytes): # Check for null CID placeholder (e.g. \x00 * cid_len)
+            return None  # Chunk doesn't exist or is considered empty
+
+        # Decode CID (assuming ASCII, remove potential null padding)
+        chunk_cid_str = chunk_cid_bytes.decode("ascii").rstrip('\x00')
+        if not chunk_cid_str: # Empty string after rstrip if all were \x00 (already caught above)
+                return None
+
+        # Actual chunk data load using the retrieved chunk_cid_str
+        req_offset = byte_range.start if byte_range else None
+        req_length = None
+        if byte_range:
+            if byte_range.end is not None:
+                if byte_range.start > byte_range.end: # Zarr allows start == stop for 0 length
+                    raise ValueError(f"Byte range start ({byte_range.start}) cannot be greater than end ({byte_range.end})")
+                req_length = byte_range.end - byte_range.start
+
+        data = await self.cas.load(chunk_cid_str, offset=req_offset, length=req_length)
+        return prototype.buffer.from_bytes(data)
 
 
     async def set(self, key: str, value: zarr.core.buffer.Buffer) -> None:
@@ -512,8 +437,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise ValueError("Cannot write to a read-only store.")
         if self._root_obj is None:
             raise RuntimeError("Store not initialized for writing (root_obj is None). Call open() first.")
-        if self._cid_len is None:
-            raise RuntimeError("Store not initialized for writing (_cid_len is None).")
 
         raw_chunk_data_bytes = value.to_bytes()
         # Save the actual chunk data to CAS first, to get its CID
@@ -568,20 +491,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
     async def exists(self, key: str) -> bool:
         if self._root_obj is None:
-            if not self._root_cid: return False
-            try:
-                await self._load_root_from_cid()
-            except Exception: # If loading fails, it doesn't exist in this store
-                return False
-            if self._root_obj is None: return False
-
+            raise RuntimeError("Root object not loaded. Call _load_root_from_cid() first.")
 
         chunk_coords = self._parse_chunk_key(key)
         if chunk_coords is None: # Metadata
             return key in self._root_obj.get("metadata", {})
-
-        # Chunk
-        if self._cid_len is None: return False # Store not properly configured
 
         try:
             linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
@@ -631,15 +545,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if self.read_only:
             raise ValueError("Cannot delete from a read-only store.")
         if self._root_obj is None:
-            if self._root_cid: # Try loading if deleting from an existing, non-modified store
-                try:
-                    await self._load_root_from_cid()
-                except Exception as e: # If load fails, can't proceed
-                    raise RuntimeError(f"Failed to load store for deletion: {e}")
-            if self._root_obj is None: # Still None after attempt
-                 raise RuntimeError("Store not initialized for deletion (root_obj is None).")
-        if self._cid_len is None:
-            raise RuntimeError("Store not properly initialized for deletion (_cid_len is None).")
+            raise RuntimeError("Store not initialized for deletion (root_obj is None).")
 
         chunk_coords = self._parse_chunk_key(key)
         if chunk_coords is None: # Metadata
@@ -685,28 +591,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
     @property
     def supports_listing(self) -> bool:
-        return True # Can list metadata keys
+        return True
 
     async def list(self) -> AsyncIterator[str]:
-        if self._root_obj is None:
-            if not self._root_cid:
-                return # Equivalent to `yield from ()` for async iterators
-            try:
-                await self._load_root_from_cid()
-            except Exception: # If loading fails, store is effectively empty for listing
-                return
-            if self._root_obj is None:
-                return
-
         for key in self._root_obj.get("metadata", {}):
             yield key
-        # Listing all actual chunk keys would require iterating all shards and
-        # checking for non-null CIDs, which is expensive and not implemented here.
-        # This behavior is consistent with the provided FlatZarrStore example.
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
-        # Only lists metadata keys matching prefix.
-        async for key in self.list(): # self.list() currently only yields metadata keys
+        async for key in self.list():
             if key.startswith(prefix):
                 yield key
 
@@ -714,12 +606,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # This simplified version only works for the root directory (prefix == "") of metadata.
         # It lists unique first components of metadata keys.
         if self._root_obj is None:
-            if not self._root_cid: return
-            try:
-                await self._load_root_from_cid()
-            except Exception:
-                return
-            if self._root_obj is None: return
+            raise RuntimeError("Root object not loaded. Call _load_root_from_cid() first.")
 
         seen: Set[str] = set()
         if prefix == "":
@@ -736,11 +623,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
             # Zarr spec: list_dir(path) should yield children (both objects and "directories")
             # For simplicity, and consistency with original FlatZarrStore, keeping this minimal.
             # To make it more compliant for prefix="foo/":
-            # normalized_prefix = prefix if prefix.endswith('/') else prefix + '/'
-            # async for key in self.list_prefix(normalized_prefix):
-            #    remainder = key[len(normalized_prefix):]
-            #    child = remainder.split('/', 1)[0]
-            #    if child not in seen:
-            #        seen.add(child)
-            #        yield child
-            pass # Or raise NotImplementedError for non-empty prefixes if strict.
+            normalized_prefix = prefix if prefix.endswith('/') else prefix + '/'
+            async for key in self.list_prefix(normalized_prefix):
+               remainder = key[len(normalized_prefix):]
+               child = remainder.split('/', 1)[0]
+               if child not in seen:
+                   seen.add(child)
+                   yield child

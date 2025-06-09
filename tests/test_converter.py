@@ -1,6 +1,9 @@
 import asyncio
 import time
 import uuid
+import sys
+from unittest.mock import patch
+import aiohttp
 
 import numpy as np
 import pandas as pd
@@ -8,7 +11,7 @@ import pytest
 import xarray as xr
 
 # Import store implementations
-from py_hamt import HAMT, KuboCAS, FlatZarrStore, ShardedZarrStore, convert_hamt_to_sharded
+from py_hamt import HAMT, KuboCAS, ShardedZarrStore, convert_hamt_to_sharded, sharded_converter_cli
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
@@ -127,3 +130,126 @@ async def test_converter_produces_identical_dataset(
         
         print("\n✅ Verification successful! The datasets are identical.")
         print("=" * 80)
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hamt_to_sharded_cli_success(
+    create_ipfs: tuple[str, str],
+    converter_test_dataset: xr.Dataset,
+    capsys
+):
+    """
+    Tests the CLI for successful conversion of a HAMT store to a ShardedZarrStore.
+    """
+    rpc_base_url, gateway_base_url = create_ipfs
+    test_ds = converter_test_dataset
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # Step 1: Create a HAMT store with the test dataset
+        hamt_write = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
+        source_hamt_store = ZarrHAMTStore(hamt_write)
+        test_ds.to_zarr(store=source_hamt_store, mode="w", consolidated=True)
+        await hamt_write.make_read_only()
+        hamt_root_cid = str(hamt_write.root_node_id)
+
+        # Step 2: Simulate CLI execution with valid arguments
+        test_args = [
+            "script.py",  # Dummy script name
+            hamt_root_cid,
+            "--chunks-per-shard", "64",
+            "--rpc-url", rpc_base_url,
+            "--gateway-url", gateway_base_url
+        ]
+        with patch.object(sys, "argv", test_args):
+            await sharded_converter_cli()
+
+        # Step 3: Capture and verify CLI output
+        captured = capsys.readouterr()
+        assert "Starting Conversion from HAMT Root" in captured.out
+        assert "Conversion Complete!" in captured.out
+        assert f"New ShardedZarrStore Root CID" in captured.out
+
+        # Step 4: Verify the converted dataset
+        # Extract the new root CID from output (assuming it's the last line)
+        output_lines = captured.out.strip().split("\n")
+        new_root_cid = output_lines[-1].split(": ")[-1]
+        dest_store_ro = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=new_root_cid
+        )
+        ds_from_sharded = xr.open_zarr(dest_store_ro)
+        xr.testing.assert_identical(test_ds, ds_from_sharded)
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hamt_to_sharded_cli_default_args(
+    create_ipfs: tuple[str, str],
+    converter_test_dataset: xr.Dataset,
+    capsys
+):
+    """
+    Tests the CLI with default argument values.
+    """
+    rpc_base_url, gateway_base_url = create_ipfs
+    test_ds = converter_test_dataset
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # Create a HAMT store
+        hamt_write = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
+        source_hamt_store = ZarrHAMTStore(hamt_write)
+        test_ds.to_zarr(store=source_hamt_store, mode="w", consolidated=True)
+        await hamt_write.make_read_only()
+        hamt_root_cid = str(hamt_write.root_node_id)
+
+        # Simulate CLI with only hamt_cid and gateway URLs.
+        test_args = [
+            "script.py",  # Dummy script name
+            hamt_root_cid,
+            "--rpc-url", rpc_base_url,
+            "--gateway-url", gateway_base_url
+        ]
+        with patch.object(sys, "argv", test_args):
+            await sharded_converter_cli()
+
+        # Verify output and conversion
+        captured = capsys.readouterr()
+        output_lines = captured.out.strip().split("\n")
+        print("Captured CLI Output:")
+        for line in output_lines:
+            print(line)
+        new_root_cid = output_lines[-1].split(": ")[-1]
+        dest_store_ro = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=new_root_cid
+        )
+        ds_from_sharded = xr.open_zarr(dest_store_ro)
+        xr.testing.assert_identical(test_ds, ds_from_sharded)
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hamt_to_sharded_cli_invalid_cid(
+    create_ipfs: tuple[str, str],
+    capsys
+):
+    """
+    Tests the CLI with an invalid hamt_cid.
+    """
+    rpc_base_url, gateway_base_url = create_ipfs
+    invalid_cid = "invalid_cid"
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        test_args = [
+            "script.py",
+            invalid_cid,
+            "--chunks-per-shard", "64",
+            "--rpc-url", rpc_base_url,
+            "--gateway-url", gateway_base_url
+        ]
+        with patch.object(sys, "argv", test_args):
+            await sharded_converter_cli()
+
+        # Verify error handling
+        captured = capsys.readouterr()
+        assert "An error occurred" in captured.out
+        assert f"{invalid_cid}" in captured.out
