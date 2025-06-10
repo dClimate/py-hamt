@@ -238,53 +238,20 @@ class KuboCAS(ContentAddressedStore):
     # graceful shutdown: close **all** sessions we own                      #
     # --------------------------------------------------------------------- #
     async def aclose(self) -> None:
-        """
-        Close all sessions we own, properly handling multi-loop scenarios.
-
-        - Sessions in the current loop are properly awaited and closed
-        - Sessions in other loops are removed from tracking (can't be safely closed from here)
-        - All references are cleaned up to allow garbage collection
-        """
+        """Close all internally-created sessions."""
         if not self._owns_session:
-            # User provided the session, they're responsible for closing it
+            # User supplied the session; they are responsible for closing it.
             return
 
-        # Get the current event loop if one exists
-        current_loop = None
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running event loop - just clear all references
-            # The sessions will be garbage collected eventually
-            self._session_per_loop.clear()
-            return
+        for sess in list(self._session_per_loop.values()):
+            if not sess.closed:
+                try:
+                    await sess.close()
+                except Exception:
+                    # Best-effort cleanup; ignore errors during shutdown
+                    pass
 
-        # Separate sessions by whether they belong to the current loop
-        sessions_to_close = []
-        loops_to_remove = []
-
-        for loop, sess in list(self._session_per_loop.items()):
-            if loop == current_loop:
-                # This session belongs to our current loop
-                if not sess.closed:
-                    sessions_to_close.append(sess)
-                loops_to_remove.append(loop)
-            else:
-                # Session belongs to a different loop
-                # We can't safely close it from here, but we should remove our reference
-                loops_to_remove.append(loop)
-
-        # Close all sessions that belong to the current loop
-        for sess in sessions_to_close:
-            try:
-                await sess.close()
-            except Exception:
-                # If closing fails, continue anyway
-                pass
-
-        # Remove all references (both current loop and other loops)
-        for loop in loops_to_remove:
-            self._session_per_loop.pop(loop, None)
+        self._session_per_loop.clear()
 
     # At this point, _session_per_loop should be empty or only contain
     # sessions from loops we haven't seen (which shouldn't happen in practice)
