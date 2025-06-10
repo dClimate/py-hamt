@@ -20,7 +20,7 @@ class ContentAddressedStore(ABC):
     2. No `None` values since this is used in HAMT's `__init__` to indicate that an empty HAMT needs to be initialized.
     """
 
-    type CodecInput = Literal["raw", "dag-cbor"]
+    CodecInput = Literal["raw", "dag-cbor"]
 
     @abstractmethod
     async def save(self, data: bytes, codec: CodecInput) -> IPLDKind:
