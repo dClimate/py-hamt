@@ -98,5 +98,4 @@ async def test_distinct_loops_get_distinct_sessions():
 
     # Clean‑up
     await kubo.aclose()
-    if not secondary_session.closed:
-        await asyncio.to_thread(secondary_session.close)
+    assert secondary_session.closed
