@@ -130,3 +130,121 @@ async def test_kubocas_session_already_closed():
 
     # Verify cleanup
     assert len(cas._session_per_loop) == 0
+
+
+# tests/test_kubocas_session.py (add this test to the existing file)
+
+
+@pytest.mark.asyncio
+async def test_aclose_handles_session_close_failure():
+    """Test that aclose() gracefully handles exceptions when closing sessions."""
+
+    kubo = KuboCAS(
+        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080"
+    )
+
+    # Create a session in the current loop
+    sess = kubo._loop_session()
+
+    # Mock the session's close method to raise an exception
+    original_close = sess.close
+
+    async def failing_close():
+        raise RuntimeError("Simulated close failure")
+
+    sess.close = failing_close
+
+    # aclose should handle the exception gracefully without propagating it
+    try:
+        await kubo.aclose()
+    except Exception as e:
+        pytest.fail(
+            f"aclose() should not propagate session close exceptions, but got: {e}"
+        )
+
+    # Verify that the session was removed from tracking despite the close failure
+    assert len(kubo._session_per_loop) == 0
+
+    # Clean up - restore original close method and close manually if needed
+    sess.close = original_close
+    if not sess.closed:
+        await sess.close()
+
+
+@pytest.mark.asyncio
+async def test_aclose_handles_multiple_close_failures():
+    """Test that aclose() handles exceptions when closing sessions multiple times."""
+
+    kubo = KuboCAS(
+        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080"
+    )
+
+    # Create a session
+    sess1 = kubo._loop_session()
+    current_loop = asyncio.get_running_loop()
+
+    # Mock session to raise on close
+    async def failing_close():
+        raise ValueError("Simulated close failure")
+
+    original_close = sess1.close
+    sess1.close = failing_close
+
+    # Pretend there's another session (same object, different loop simulated)
+    kubo._session_per_loop[current_loop] = sess1
+
+    # Run aclose, expecting it to suppress errors
+    try:
+        await kubo.aclose()
+    except Exception as e:
+        pytest.fail(
+            f"aclose() should not propagate session close exceptions, but got: {e}"
+        )
+
+    # Ensure sessions are cleared
+    assert len(kubo._session_per_loop) == 0
+
+    # Restore original close
+    sess1.close = original_close
+    if not sess1.closed:
+        await sess1.close()
+
+
+@pytest.mark.asyncio
+async def test_aclose_handles_multiple_session_close_failures():
+    """Test that aclose() handles exceptions when closing multiple sessions."""
+
+    kubo = KuboCAS(
+        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080"
+    )
+
+    # Create a session
+    sess1 = kubo._loop_session()
+    current_loop = asyncio.get_running_loop()
+
+    # Mock session to raise on close
+    async def failing_close():
+        raise ValueError("Simulated close failure")
+
+    original_close = sess1.close
+    sess1.close = failing_close
+
+    # Pretend there's another session (same object, different loop simulated)
+    kubo._session_per_loop[current_loop] = sess1
+    kubo._session_per_loop[object()] = sess1  # Fake a second loop
+
+    # Run aclose, expecting it to suppress errors
+    try:
+        await kubo.aclose()
+    except Exception as e:
+        pytest.fail(
+            f"aclose() should not propagate session close exceptions, but got: {e}"
+        )
+
+    # Ensure sessions are cleared
+    assert len(kubo._session_per_loop) == 0
+
+    # Restore original close
+    sess1.close = original_close
+    if not sess1.closed:
+        await sess1.close()
