@@ -212,13 +212,22 @@ class KuboCAS(ContentAddressedStore):
     # helper: get or create the session bound to the current running loop   #
     # --------------------------------------------------------------------- #
     def _loop_session(self) -> aiohttp.ClientSession:
+        """Get or create a session for the current event loop with improved cleanup."""
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
             return self._session_per_loop[loop]
         except KeyError:
+            # Create a session with a connector that closes more quickly
+            connector = aiohttp.TCPConnector(
+                limit=64,
+                limit_per_host=32,
+                force_close=True,  # Force close connections
+                enable_cleanup_closed=True,  # Enable cleanup of closed connections
+            )
+
             sess = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=60),
-                connector=aiohttp.TCPConnector(limit=64, limit_per_host=32),
+                connector=connector,
                 headers=self._default_headers,
                 auth=self._default_auth,
             )
@@ -229,11 +238,23 @@ class KuboCAS(ContentAddressedStore):
     # graceful shutdown: close **all** sessions we own                      #
     # --------------------------------------------------------------------- #
     async def aclose(self) -> None:
-        if self._owns_session:
-            for sess in list(self._session_per_loop.values()):
-                if not sess.closed:
-                    await sess.close()
+        """Close all internally-created sessions."""
+        if not self._owns_session:
+            # User supplied the session; they are responsible for closing it.
+            return
 
+        for sess in list(self._session_per_loop.values()):
+            if not sess.closed:
+                try:
+                    await sess.close()
+                except Exception:
+                    # Best-effort cleanup; ignore errors during shutdown
+                    pass
+
+        self._session_per_loop.clear()
+
+    # At this point, _session_per_loop should be empty or only contain
+    # sessions from loops we haven't seen (which shouldn't happen in practice)
     async def __aenter__(self) -> "KuboCAS":
         return self
 
