@@ -217,12 +217,13 @@ class KuboCAS(ContentAddressedStore):
         try:
             return self._session_per_loop[loop]
         except KeyError:
-            # Create a session with a connector that closes more quickly
+            # Create a connector that keeps connections alive for reuse.
+            # Cleaning up closed connections ensures resources are eventually
+            # released even if the user forgets to explicitly close the session.
             connector = aiohttp.TCPConnector(
                 limit=64,
                 limit_per_host=32,
-                force_close=True,  # Force close connections
-                enable_cleanup_closed=True,  # Enable cleanup of closed connections
+                enable_cleanup_closed=True,
             )
 
             sess = aiohttp.ClientSession(
@@ -260,6 +261,24 @@ class KuboCAS(ContentAddressedStore):
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.aclose()
+
+    def __del__(self) -> None:
+        """Best-effort close for internally-created sessions."""
+        if not self._owns_session:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        try:
+            if loop is None or not loop.is_running():
+                asyncio.run(self.aclose())
+            else:
+                loop.create_task(self.aclose())
+        except Exception:
+            # Suppress all errors during interpreter shutdown or loop teardown
+            pass
 
     # --------------------------------------------------------------------- #
     # save() – now uses the per-loop session                                #
