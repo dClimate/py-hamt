@@ -99,3 +99,24 @@ async def test_distinct_loops_get_distinct_sessions():
     # Clean‑up
     await kubo.aclose()
     assert secondary_session.closed
+
+
+@pytest.mark.asyncio
+async def test_del_closes_session():
+    """`KuboCAS` should close sessions when the instance is garbage collected."""
+    kubo = KuboCAS(
+        rpc_base_url="http://127.0.0.1:5001",
+        gateway_base_url="http://127.0.0.1:8080",
+    )
+
+    session = await _maybe_await(kubo._loop_session())
+    assert not session.closed
+
+    # Drop the reference and force garbage collection
+    del kubo
+    import gc
+
+    gc.collect()
+    await asyncio.sleep(0)
+
+    assert session.closed
