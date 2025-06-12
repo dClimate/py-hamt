@@ -14,7 +14,7 @@ async def get_pinned_cids(rpc_base_url: str) -> set[str]:
     url = f"{rpc_base_url}/api/v0/pin/ls"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, params={'type': 'all'}) as resp:
+            async with session.post(url, params={"type": "all"}) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
                 return set(data.get("Keys", {}).keys())
@@ -38,7 +38,6 @@ async def get_all_dataset_cids(store: ShardedZarrStore) -> set[str]:
         if cid:
             cids.add(cid)
 
-
     # Gather shard and all chunk CIDs within them
     for shard_cid in store._root_obj["chunks"]["shard_cids"]:
         if not shard_cid:
@@ -52,7 +51,7 @@ async def get_all_dataset_cids(store: ShardedZarrStore) -> set[str]:
                 if all(b == 0 for b in cid_bytes):  # Skip null/empty CID slots
                     continue
 
-                chunk_cid_str = cid_bytes.decode("ascii").rstrip('\x00')
+                chunk_cid_str = cid_bytes.decode("ascii").rstrip("\x00")
                 if chunk_cid_str:
                     cids.add(chunk_cid_str)
         except Exception as e:
@@ -123,7 +122,9 @@ async def test_sharded_zarr_store_pinning(
 
         # Check if all our dataset's CIDs are in the main pin list
         missing_pins = expected_cids - currently_pinned
-        assert not missing_pins, f"The following CIDs were expected to be pinned but were not: {missing_pins}"
+        assert not missing_pins, (
+            f"The following CIDs were expected to be pinned but were not: {missing_pins}"
+        )
 
         # --- 4. Unpin the dataset and verify ---
         await store.unpin_entire_dataset(target_rpc=rpc_base_url)
@@ -135,4 +136,6 @@ async def test_sharded_zarr_store_pinning(
 
         # Check that none of our dataset's CIDs are in the pin list anymore
         lingering_pins = expected_cids.intersection(pinned_after_unpin)
-        assert not lingering_pins, f"The following CIDs were expected to be unpinned but still exist: {lingering_pins}"
+        assert not lingering_pins, (
+            f"The following CIDs were expected to be unpinned but still exist: {lingering_pins}"
+        )
