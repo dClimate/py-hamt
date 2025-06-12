@@ -1538,7 +1538,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "dag-cbor", specifier = ">=0.3.3" },
-    { name = "httpx", extras = ["http2"], specifier = ">=0.27.0" },
+    { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "msgspec", specifier = ">=0.18.6" },
     { name = "multiformats", extras = ["full"], specifier = ">=0.3.1.post4" },
     { name = "pycryptodome", specifier = ">=3.21.0" },

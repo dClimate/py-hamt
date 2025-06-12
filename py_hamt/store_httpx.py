@@ -182,7 +182,7 @@ class KuboCAS(ContentAddressedStore):
         """The hash function to send to IPFS when storing bytes. Cannot be changed after initialization. The default blake3 follows the default hashing algorithm used by HAMT."""
 
         if rpc_base_url is None:
-            rpc_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_RPC_BASE_URL
+            rpc_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_RPC_BASE_URL  # pragma
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
@@ -231,8 +231,8 @@ class KuboCAS(ContentAddressedStore):
                 headers=self._default_headers,
                 auth=self._default_auth,
                 limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
-                http2=True,
-                follow_redirects=True,
+                # Uncomment when they finally support Robost HTTP/2 GOAWAY responses
+                # http2=True,
             )
             self._client_per_loop[loop] = client
             return client
