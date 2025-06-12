@@ -684,6 +684,7 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
         )
         assert store._total_chunks == 0
         assert store._num_shards == 0
+        assert store._root_obj is not None
         assert len(store._root_obj["chunks"]["shard_cids"]) == 0  # Line 163
         root_cid = await store.flush()
 

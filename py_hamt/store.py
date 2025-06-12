@@ -355,7 +355,6 @@ class KuboCAS(ContentAddressedStore):
     async def pin_cid(
         self,
         cid: CID,
-        name: Optional[str] = None,
         target_rpc: str = "http://127.0.0.1:5001",
     ) -> None:
         """
@@ -368,8 +367,6 @@ class KuboCAS(ContentAddressedStore):
             name (Optional[str]): An optional name for the pin.
         """
         params = {"arg": str(cid), "recursive": "false"}
-        if name:
-            params["name"] = name
         pin_add_url_base: str = f"{target_rpc}/api/v0/pin/add"
 
         async with self._sem:  # throttle RPC

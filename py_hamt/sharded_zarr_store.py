@@ -264,6 +264,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
             return None
 
     def _get_linear_chunk_index(self, chunk_coords: Tuple[int, ...]) -> int:
+        if self._chunks_per_dim is None:
+            raise ValueError("Chunks per dimension not set")
         linear_index = 0
         multiplier = 1
         # Convert N-D chunk coordinates to a flat 1-D index (row-major order)
@@ -323,6 +325,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
             if self._cid_len is None:  # Should be set
                 raise RuntimeError(
                     "Store not initialized: _cid_len is None for shard initialization."
+                )
+            if self._chunks_per_shard is None:
+                raise RuntimeError(
+                    "Store not initialized: _chunks_per_shard is None for shard initialization."
                 )
             # New shard or shard not yet written, initialize with zeros
             shard_size_bytes = self._chunks_per_shard * self._cid_len
@@ -624,6 +630,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise ValueError("Cannot delete from a read-only store.")
         if self._root_obj is None:
             raise RuntimeError("Store not initialized for deletion (root_obj is None).")
+        if self._cid_len is None:
+            raise RuntimeError("Store not initialized properly; _cid_len is missing.")
 
         chunk_coords = self._parse_chunk_key(key)
         if chunk_coords is None:  # Metadata
@@ -679,6 +687,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return True
 
     async def list(self) -> AsyncIterator[str]:
+        if self._root_obj is None:
+            raise RuntimeError(
+                "Root object not loaded. Call _load_root_from_cid() first."
+            )
         for key in self._root_obj.get("metadata", {}):
             yield key
 
@@ -763,7 +775,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
                     if all(b == 0 for b in cid_bytes):  # Skip null/empty CID slots
                         continue
-                    print(f"Processing chunk CID bytes: {cid_bytes}")
+                    print(f"Processing chunk CID bytes: {cid_bytes!r}")
 
                     chunk_cid_str = cid_bytes.decode("ascii").rstrip("\x00")
                     if chunk_cid_str:
