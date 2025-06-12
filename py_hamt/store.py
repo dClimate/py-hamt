@@ -40,11 +40,11 @@ class ContentAddressedStore(ABC):
         """Retrieve data."""
 
     # Optional abstract methods for pinning and unpinning CIDs
-    async def pin_cid(self, id: IPLDKind) -> None:
+    async def pin_cid(self, id: IPLDKind, target_rpc: str) -> None:
         """Pin a CID in the storage."""
         pass
 
-    async def unpin_cid(self, id: IPLDKind) -> None:
+    async def unpin_cid(self, id: IPLDKind, target_rpc: str) -> None:
         """Unpin a CID in the storage."""
         pass
 
