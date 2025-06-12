@@ -206,6 +206,25 @@ class KuboCAS(ContentAddressedStore):
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
         self._closed: bool = False
+        self._request_limit_per_client: int = 900
+        self._request_counter: int = 0
+
+    async def _cycle_client_if_needed(self) -> None:
+        """Checks the request counter and retires the client if the limit is exceeded."""
+        if not self._owns_client:
+            # If the user provided the client, we don't manage its lifecycle.
+            return
+
+        self._request_counter += 1
+        if self._request_counter > self._request_limit_per_client:
+            print(
+                f"\n--- [KuboCAS] Request limit of {self._request_limit_per_client} reached. "
+                "Retiring HTTP client and creating new one for subsequent requests. ---\n"
+            )
+            loop = asyncio.get_running_loop()
+            self._client_per_loop.pop(loop, None)  # graceful retirement.
+            # Reset counter for the new client that will be created.
+            self._request_counter = 0
 
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #
@@ -281,6 +300,7 @@ class KuboCAS(ContentAddressedStore):
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
         async with self._sem:  # throttle RPC
             # Create multipart form data
+            await self._cycle_client_if_needed()
             files = {"file": data}
 
             # Send the POST request
@@ -300,6 +320,7 @@ class KuboCAS(ContentAddressedStore):
         url: str = self.gateway_base_url + str(cid)
 
         async with self._sem:  # throttle gateway
+            await self._cycle_client_if_needed()
             client = self._loop_client()
             response = await client.get(url)
             response.raise_for_status()

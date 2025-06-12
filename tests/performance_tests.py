@@ -8,13 +8,9 @@ import asyncio
 import time
 
 import pytest
+import xarray as xr
 
 from py_hamt import HAMT, InMemoryCAS, KuboCAS
-import numpy as np
-import pandas as pd
-import xarray as xr
-from dag_cbor.ipld import IPLDKind
-from multiformats import CID
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
@@ -54,8 +50,8 @@ async def test_benchmark_hamt_store():
     print("🚀 STARTING BENCHMARK for ZarrHAMTStore")
     print("=" * 80)
 
-    rpc_base_url = f"https://ipfs-gateway.dclimate.net"
-    gateway_base_url = f"https://ipfs-gateway.dclimate.net"
+    rpc_base_url = "https://ipfs-gateway.dclimate.net"
+    gateway_base_url = "https://ipfs-gateway.dclimate.net"
     # headers = {
     #     "X-API-Key": "",
     # }
@@ -64,20 +60,21 @@ async def test_benchmark_hamt_store():
     async with KuboCAS(
         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url, headers=headers
     ) as kubo_cas:
-
         root_cid = "bafyr4ialorauxcpw77mgmnyoeptn4g4zkqdqhtsobff4v76rllvd3m6cqi"
         # root_node_id = CID.decode(root_cid)
 
         hamt = await HAMT.build(
             cas=kubo_cas, root_node_id=root_cid, values_are_bytes=True, read_only=True
         )
-        start = time.perf_counter()
+        # start = time.perf_counter()
         ipfs_ds: xr.Dataset
         zhs = ZarrHAMTStore(hamt, read_only=True)
         ipfs_ds = xr.open_zarr(store=zhs)
 
         # --- Read ---
-        hamt = HAMT(cas=kubo_cas, values_are_bytes=True, root_node_id=root_cid, read_only=True)
+        hamt = HAMT(
+            cas=kubo_cas, values_are_bytes=True, root_node_id=root_cid, read_only=True
+        )
 
         # Initialize the store
         zhs = ZarrHAMTStore(hamt, read_only=True)
@@ -94,7 +91,7 @@ async def test_benchmark_hamt_store():
         print(f"Fetched data size: {data_size / (1024 * 1024):.4f} MB")
         end_read = time.perf_counter()
 
-        print(f"\n--- [HAMT] Read Stats ---")
+        print("\n--- [HAMT] Read Stats ---")
         print(f"Total time to open and read: {end_read - start_read:.2f} seconds")
 
         if data_size > 0:
