@@ -222,8 +222,7 @@ class KuboCAS(ContentAddressedStore):
                 headers=self._default_headers,
                 auth=self._default_auth,
                 limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
-                # Uncomment when they finally support Robost HTTP/2 GOAWAY responses
-                # http2=True,
+                http2=True,
             )
             self._client_per_loop[loop] = client
             return client
