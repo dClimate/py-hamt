@@ -127,6 +127,38 @@ async def test_kubocas_public_gateway():
 
 
 @pytest.mark.asyncio
+async def test_trailing_slash_gateway():
+    """Test KuboCAS with a gateway URL that has a trailing slash"""
+
+    # Use a gateway URL with a trailing slash
+    cas = KuboCAS(
+        rpc_base_url="http://127.0.0.1:5001",
+        gateway_base_url="http://127.0.0.1:8080/",  # Note the trailing slash
+    )
+
+    try:
+        # Try to load the CID
+        cid = CID.decode(TEST_CID)
+        data = await cas.load(cid)
+
+        # Print info for debugging
+        print(f"Loaded {len(data)} bytes from gateway with trailing slash")
+        print(f"First 20 bytes: {data[:20].hex()}")
+
+        # Check if it looks like DAG-CBOR
+        first_byte = data[0] if data else 0
+        is_dag_cbor = first_byte & 0xE0 in (0x80, 0xA0)  # Simple check for arrays/maps
+        print(f"First byte: {hex(first_byte)}, Looks like DAG-CBOR: {is_dag_cbor}")
+
+        assert is_dag_cbor, (
+            "Data from gateway with trailing slash doesn't look like DAG-CBOR"
+        )
+
+    finally:
+        await cas.aclose()
+
+
+@pytest.mark.asyncio
 async def test_fix_kubocas_load():
     """Test a proposed fix for KuboCAS when loading from public gateways"""
 
