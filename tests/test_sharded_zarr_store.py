@@ -1,6 +1,3 @@
-import asyncio
-import math
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,8 +6,7 @@ from zarr.abc.store import RangeByteRequest
 import zarr.core.buffer
 import dag_cbor
 
-from py_hamt import HAMT, KuboCAS, ShardedZarrStore
-from py_hamt.zarr_hamt_store import ZarrHAMTStore
+from py_hamt import KuboCAS, ShardedZarrStore
 
 
 @pytest.fixture(scope="module")
@@ -22,7 +18,6 @@ def random_zarr_dataset():
     lons = np.linspace(-180, 180, 36)
 
     temp = np.random.randn(len(times), len(lats), len(lons))
-    precip = np.random.gamma(2, 0.5, size=(len(times), len(lats), len(lons)))
 
     ds = xr.Dataset(
         {
@@ -686,7 +681,6 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
         assert store._num_shards == 0
         assert store._root_obj is not None
         assert len(store._root_obj["chunks"]["shard_cids"]) == 0  # Line 163
-        root_cid = await store.flush()
 
         # Test invalid manifest version
         invalid_root_obj = {
