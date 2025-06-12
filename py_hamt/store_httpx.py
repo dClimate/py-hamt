@@ -141,6 +141,7 @@ class KuboCAS(ContentAddressedStore):
         *,
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
+        request_limit_per_client: int = 900,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
@@ -182,7 +183,7 @@ class KuboCAS(ContentAddressedStore):
         """The hash function to send to IPFS when storing bytes. Cannot be changed after initialization. The default blake3 follows the default hashing algorithm used by HAMT."""
 
         if rpc_base_url is None:
-            rpc_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_RPC_BASE_URL
+            rpc_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_RPC_BASE_URL  # pragma
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
@@ -206,7 +207,7 @@ class KuboCAS(ContentAddressedStore):
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
         self._closed: bool = False
-        self._request_limit_per_client: int = 900
+        self._request_limit_per_client: int = request_limit_per_client
         self._request_counter: int = 0
 
     async def _cycle_client_if_needed(self) -> None:
