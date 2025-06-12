@@ -8,8 +8,7 @@ import zarr
 import zarr.core.buffer
 from dag_cbor.ipld import IPLDKind
 
-from py_hamt import HAMT, KuboCAS
-from py_hamt.store import InMemoryCAS
+from py_hamt import HAMT, InMemoryCAS, KuboCAS
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
@@ -68,7 +67,8 @@ async def test_write_read(
     print(test_ds)
 
     async with KuboCAS(  # <-- own and auto-close session
-        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+        rpc_base_url=rpc_base_url,
+        gateway_base_url=gateway_base_url,
     ) as kubo_cas:
         hamt = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
         zhs = ZarrHAMTStore(hamt)

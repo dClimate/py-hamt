@@ -1,4 +1,4 @@
-import aiohttp
+import httpx
 import pytest
 
 # re-export helpers so existing imports keep working (optional)
@@ -7,10 +7,10 @@ from testing_utils import create_ipfs, ipld_strategy  # noqa: F401
 
 @pytest.fixture(scope="session")
 async def global_client_session():
-    """One aiohttp.ClientSession shared by the whole test run."""
-    async with aiohttp.ClientSession() as session:
-        yield session
-    # aiohttp's async context manager awaits session.close() for us
+    """One httpx.AsyncClient shared by the whole test run."""
+    async with httpx.AsyncClient() as client:
+        yield client
+    # httpx's async context manager awaits client.aclose() for us
 
 
 def pytest_addoption(parser):

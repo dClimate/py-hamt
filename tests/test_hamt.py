@@ -9,8 +9,8 @@ from hypothesis import strategies as st
 from multiformats import CID
 from testing_utils import key_value_list
 
+from py_hamt import InMemoryCAS
 from py_hamt.hamt import HAMT, Node
-from py_hamt.store import InMemoryCAS
 
 
 @pytest.mark.asyncio
