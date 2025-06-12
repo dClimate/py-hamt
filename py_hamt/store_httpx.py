@@ -309,6 +309,7 @@ class KuboCAS(ContentAddressedStore):
         cid = cast(CID, id)  # CID is definitely in the IPLDKind type
 
         headers = {}
+        # Necessary as ipfs public gateways return html
         headers["Accept"] = (
             "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
         )

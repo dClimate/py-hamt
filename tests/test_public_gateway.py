@@ -196,7 +196,7 @@ async def test_fix_kubocas_load():
 
     # Use the fixed implementation with a public gateway
     cas = FixedKuboCAS(
-        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="https://ipfs.io"
+        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="https://ipfs.io/ipfs/"
     )
 
     try:
