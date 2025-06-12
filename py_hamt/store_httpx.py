@@ -1,6 +1,6 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Literal, Optional, Tuple, Union, cast
+from typing import Any, Dict, Literal, Tuple, cast
 
 import httpx
 from dag_cbor.ipld import IPLDKind

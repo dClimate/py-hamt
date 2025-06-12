@@ -8,8 +8,7 @@ import zarr
 import zarr.core.buffer
 from dag_cbor.ipld import IPLDKind
 
-from py_hamt import HAMT, KuboCAS
-from py_hamt.store import InMemoryCAS
+from py_hamt import HAMT, InMemoryCAS, KuboCAS
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 

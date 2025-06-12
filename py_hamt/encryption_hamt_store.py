@@ -6,7 +6,6 @@ from Crypto.Cipher import ChaCha20_Poly1305
 from Crypto.Random import get_random_bytes
 
 from py_hamt.hamt import HAMT
-from py_hamt.store_httpx import ContentAddressedStore
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 

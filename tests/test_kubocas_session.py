@@ -4,7 +4,7 @@ from threading import Event, Thread
 
 import pytest
 
-from py_hamt.store import KuboCAS
+from py_hamt import KuboCAS
 
 
 async def _maybe_await(value):
@@ -15,61 +15,61 @@ async def _maybe_await(value):
 
 
 @pytest.mark.asyncio
-async def test_get_session_same_instance_same_loop():
+async def test_get_client_same_instance_same_loop():
     """Two successive calls in the same event loop must hand back the *same*
-    ClientSession instance and `aclose()` should close the session when the
+    AsyncClient instance and `aclose()` should close the client when the
     store owns it."""
     kubo = KuboCAS(
         rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080"
     )
 
-    sess1 = await _maybe_await(kubo._loop_session())
-    sess2 = await _maybe_await(kubo._loop_session())
+    client1 = await _maybe_await(kubo._loop_client())
+    client2 = await _maybe_await(kubo._loop_client())
 
-    assert sess1 is sess2  # no churn
+    assert client1 is client2  # no churn
 
     # the implementation is free to keep its internal mapping private.
     # We only guarantee behavioural semantics (same object, still open, closes via aclose).
-    assert not sess1.closed
+    assert not client1.is_closed
 
     await kubo.aclose()
-    assert sess1.closed
+    assert client1.is_closed
 
 
 @pytest.mark.asyncio
-async def test_get_session_respects_user_supplied_session(global_client_session):
-    """A pre‑created session passed to the constructor must always be reused
+async def test_get_client_respects_user_supplied_client(global_client_session):
+    """A pre‑created client passed to the constructor must always be reused
     and never closed by `aclose()`."""
     kubo = KuboCAS(
-        session=global_client_session,
+        client=global_client_session,
         rpc_base_url="http://127.0.0.1:5001",
         gateway_base_url="http://127.0.0.1:8080",
     )
 
-    sess = await _maybe_await(kubo._loop_session())
-    assert sess is global_client_session
+    client = await _maybe_await(kubo._loop_client())
+    assert client is global_client_session
 
-    await kubo.aclose()  # should *not* close the external session
-    assert not global_client_session.closed
+    await kubo.aclose()  # should *not* close the external client
+    assert not global_client_session.is_closed
 
 
-async def _session_in_new_loop(kubo: KuboCAS):
-    """Spawn a *separate* thread with its own event loop, obtain a session for
-    that loop and hand both the session and the thread‑local loop object
+async def _client_in_new_loop(kubo: KuboCAS):
+    """Spawn a *separate* thread with its own event loop, obtain a client for
+    that loop and hand both the client and the thread‑local loop object
     back to the caller."""
     ready = Event()
-    container: list = []  # will receive (session, loop)
+    container: list = []  # will receive (client, loop)
 
     def _worker():
         new_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(new_loop)
 
         async def _get():
-            return await _maybe_await(kubo._loop_session())
+            return await _maybe_await(kubo._loop_client())
 
         try:
-            session = new_loop.run_until_complete(_get())
-            container.append((session, new_loop))
+            client = new_loop.run_until_complete(_get())
+            container.append((client, new_loop))
         finally:
             ready.set()
 
@@ -80,37 +80,37 @@ async def _session_in_new_loop(kubo: KuboCAS):
 
 
 @pytest.mark.asyncio
-async def test_distinct_loops_get_distinct_sessions():
-    """Different event loops must receive distinct `ClientSession` objects and
-    both must be tracked in `_session_per_loop`."""
+async def test_distinct_loops_get_distinct_clients():
+    """Different event loops must receive distinct `AsyncClient` objects and
+    both must be tracked in `_client_per_loop`."""
     kubo = KuboCAS(
         rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080"
     )
 
-    primary_session = await _maybe_await(kubo._loop_session())
+    primary_client = await _maybe_await(kubo._loop_client())
 
-    secondary_session, secondary_loop = await _session_in_new_loop(kubo)
+    secondary_client, secondary_loop = await _client_in_new_loop(kubo)
 
-    assert primary_session is not secondary_session
-    assert len(kubo._session_per_loop) == 2
-    assert kubo._session_per_loop[asyncio.get_running_loop()] is primary_session
-    assert kubo._session_per_loop[secondary_loop] is secondary_session
+    assert primary_client is not secondary_client
+    assert len(kubo._client_per_loop) == 2
+    assert kubo._client_per_loop[asyncio.get_running_loop()] is primary_client
+    assert kubo._client_per_loop[secondary_loop] is secondary_client
 
     # Clean‑up
     await kubo.aclose()
-    assert secondary_session.closed
+    assert secondary_client.is_closed
 
 
 @pytest.mark.asyncio
-async def test_del_closes_session():
-    """`KuboCAS` should close sessions when the instance is garbage collected."""
+async def test_del_closes_client():
+    """`KuboCAS` should close clients when the instance is garbage collected."""
     kubo = KuboCAS(
         rpc_base_url="http://127.0.0.1:5001",
         gateway_base_url="http://127.0.0.1:8080",
     )
 
-    session = await _maybe_await(kubo._loop_session())
-    assert not session.closed
+    client = await _maybe_await(kubo._loop_client())
+    assert not client.is_closed
 
     # Drop the reference and force garbage collection
     del kubo
@@ -119,4 +119,4 @@ async def test_del_closes_session():
     gc.collect()
     await asyncio.sleep(0)
 
-    assert session.closed
+    assert client.is_closed

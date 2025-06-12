@@ -1,8 +1,7 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Literal, Optional, cast
+from typing import Any, Literal, cast
 
-import httpx
 from dag_cbor.ipld import IPLDKind
 from multiformats import CID, multihash
 from multiformats.multihash import Multihash

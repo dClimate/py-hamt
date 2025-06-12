@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 
-import aiohttp
+import httpx
 import xarray as xr
 from xarray import Dataset
 
@@ -12,7 +12,7 @@ print(f"Python version: {sys.version}")
 print(f"Python path: {os.path.dirname(sys.executable)}")
 
 
-print(f"aiohttp version: {aiohttp.__version__}")
+print(f"httpx version: {httpx.__version__}")
 
 
 async def main():

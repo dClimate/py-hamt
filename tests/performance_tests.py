@@ -9,8 +9,7 @@ import time
 
 import pytest
 
-from py_hamt import HAMT
-from py_hamt.store import InMemoryCAS
+from py_hamt import HAMT, InMemoryCAS
 
 
 @pytest.mark.asyncio

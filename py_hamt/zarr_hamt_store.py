@@ -6,7 +6,6 @@ import zarr.core.buffer
 from zarr.core.common import BytesLike
 
 from py_hamt.hamt import HAMT
-from py_hamt.store_httpx import ContentAddressedStore
 
 
 class ZarrHAMTStore(zarr.abc.store.Store):

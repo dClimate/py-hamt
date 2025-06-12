@@ -15,7 +15,7 @@ import dag_cbor
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
 
-from .store import ContentAddressedStore
+from .store_httpx import ContentAddressedStore
 
 
 def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
