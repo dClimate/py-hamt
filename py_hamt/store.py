@@ -129,12 +129,30 @@ class KuboCAS(ContentAddressedStore):
         if not self._owns_session:
             return
 
-        # Just ensure any session is marked as closed
-        # We don't create tasks in __del__ as they can be destroyed improperly
+        # Prevent dangling tasks by canceling cleanup tasks
         for sess in list(self._session_per_loop.values()):
             if not sess.closed:
-                # Mark as closed but don't create any tasks
+                # Mark as closed
                 sess._closed = True
+                # Cancel any potential cleanup tasks
+                if (
+                    hasattr(sess.connector, "_cleanup_closed_handle")
+                    and sess.connector._cleanup_closed_handle
+                ):
+                    try:
+                        sess.connector._cleanup_closed_handle.cancel()
+                        sess.connector._cleanup_closed_handle = None
+                    except Exception:
+                        pass
+                if (
+                    hasattr(sess.connector, "_cleanup_handle")
+                    and sess.connector._cleanup_handle
+                ):
+                    try:
+                        sess.connector._cleanup_handle.cancel()
+                        sess.connector._cleanup_handle = None
+                    except Exception:
+                        pass
 
         # Clear our references to the sessions
         self._session_per_loop.clear()
@@ -232,12 +250,12 @@ class KuboCAS(ContentAddressedStore):
         try:
             return self._session_per_loop[loop]
         except KeyError:
-            # Create a session with a connector that closes more quickly
+            # Create a session with a connector that maintains performance
             connector = aiohttp.TCPConnector(
                 limit=64,
                 limit_per_host=32,
-                # force_close=True,  # Force close connections
-                enable_cleanup_closed=True,  # Enable cleanup of closed connections
+                force_close=False,  # Keep connections open for better performance
+                enable_cleanup_closed=False,  # Disable automatic cleanup which can cause task destruction warnings
             )
 
             sess = aiohttp.ClientSession(
@@ -246,6 +264,10 @@ class KuboCAS(ContentAddressedStore):
                 headers=self._default_headers,
                 auth=self._default_auth,
             )
+
+            # Make sure _cleanup_closed_handle is None to prevent warnings
+            connector._cleanup_closed_handle = None
+
             self._session_per_loop[loop] = sess
             return sess
 
@@ -258,24 +280,13 @@ class KuboCAS(ContentAddressedStore):
             # User supplied the session; they are responsible for closing it.
             return
 
-        tasks = []
         for sess in list(self._session_per_loop.values()):
             if not sess.closed:
                 try:
-                    # Create a task for each session close operation
-                    task = asyncio.create_task(sess.close())
-                    tasks.append(task)
+                    await sess.close()
                 except Exception:
                     # Best-effort cleanup; ignore errors during shutdown
                     pass
-
-        # Wait for all session close tasks to complete
-        if tasks:
-            try:
-                await asyncio.gather(*tasks)
-            except Exception:
-                # Ignore any errors during close
-                pass
 
         self._session_per_loop.clear()
 
@@ -285,6 +296,16 @@ class KuboCAS(ContentAddressedStore):
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
+        # Close sessions with proper task handling to prevent "Task was destroyed but it is pending!" warnings
+        # First manually set _cleanup_closed_handle to None to prevent task destruction warnings
+        if self._owns_session:
+            for sess in list(self._session_per_loop.values()):
+                if not sess.closed and hasattr(
+                    sess.connector, "_cleanup_closed_handle"
+                ):
+                    sess.connector._cleanup_closed_handle = None
+
+        # Then close sessions properly
         await self.aclose()
 
     # --------------------------------------------------------------------- #
