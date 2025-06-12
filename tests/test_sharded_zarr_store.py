@@ -115,7 +115,6 @@ async def test_sharded_zarr_store_metadata(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-
     ordered_dims = list(test_ds.dims)
     array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
@@ -157,7 +156,6 @@ async def test_sharded_zarr_store_metadata(
         assert "lat/c/0" in keys_with_prefix
 
 
-
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_chunks(
     create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
@@ -167,7 +165,6 @@ async def test_sharded_zarr_store_chunks(
     """
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
-
 
     ordered_dims = list(test_ds.dims)
     array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
@@ -207,6 +204,7 @@ async def test_sharded_zarr_store_chunks(
             cas=kubo_cas, read_only=True, root_cid=await store_write.flush()
         )
         assert await store_read_after_delete.get(chunk_key, proto) is None
+
 
 @pytest.mark.asyncio
 async def test_chunk_and_delete_logic(
@@ -260,7 +258,7 @@ async def test_chunk_and_delete_logic(
         # Test deleting a non-existent key
         with pytest.raises(KeyError):
             await store_rw.delete("nonexistent/c/0/0/0")
-        
+
         # Test deleting an already deleted key
         with pytest.raises(KeyError):
             await store_rw.delete(chunk_key)
@@ -275,7 +273,6 @@ async def test_sharded_zarr_store_partial_reads(
     """
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
-
 
     ordered_dims = list(test_ds.dims)
     array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
@@ -308,6 +305,7 @@ async def test_sharded_zarr_store_partial_reads(
         partial_chunk = await store_read.get(chunk_key, proto, byte_range=byte_range)
         assert partial_chunk is not None
         assert partial_chunk.to_bytes() == full_chunk_bytes[10:50]
+
 
 @pytest.mark.asyncio
 async def test_partial_reads_and_errors(
@@ -351,28 +349,36 @@ async def test_partial_reads_and_errors(
 
         # Test invalid byte range
         with pytest.raises(ValueError):
-            await store_read.get(chunk_key, proto, byte_range=RangeByteRequest(start=50, end=10))
+            await store_read.get(
+                chunk_key, proto, byte_range=RangeByteRequest(start=50, end=10)
+            )
+
 
 @pytest.mark.asyncio
 async def test_zero_sized_array(create_ipfs: tuple[str, str]):
     """Test handling of arrays with a zero-length dimension."""
     rpc_base_url, gateway_base_url = create_ipfs
-    async with KuboCAS(rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url) as kubo_cas:
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
         store = await ShardedZarrStore.open(
             cas=kubo_cas,
             read_only=False,
             array_shape=(100, 0),
             chunk_shape=(10, 10),
-            chunks_per_shard=64
+            chunks_per_shard=64,
         )
         assert store._total_chunks == 0
         assert store._num_shards == 0
         root_cid = await store.flush()
-        
+
         # Read it back and verify
-        store_read = await ShardedZarrStore.open(cas=kubo_cas, read_only=True, root_cid=root_cid)
+        store_read = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=root_cid
+        )
         assert store_read._total_chunks == 0
         assert store_read._num_shards == 0
+
 
 @pytest.mark.asyncio
 async def test_store_eq_method(create_ipfs: tuple[str, str]):
@@ -381,9 +387,17 @@ async def test_store_eq_method(create_ipfs: tuple[str, str]):
     async with KuboCAS(
         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
     ) as kubo_cas:
-        store1 = await ShardedZarrStore.open(cas=kubo_cas, read_only=False, array_shape=(1,1), chunk_shape=(1,1), chunks_per_shard=1)
+        store1 = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=(1, 1),
+            chunk_shape=(1, 1),
+            chunks_per_shard=1,
+        )
         root_cid = await store1.flush()
-        store2 = await ShardedZarrStore.open(cas=kubo_cas, read_only=True, root_cid=root_cid)
+        store2 = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=root_cid
+        )
 
         assert store1 == store2
 
@@ -439,6 +453,7 @@ async def test_listing_and_metadata(
         assert "lon" in dir_keys
         assert "zarr.json" in dir_keys
 
+
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_init_errors(create_ipfs: tuple[str, str]):
     """
@@ -467,7 +482,9 @@ async def test_sharded_zarr_store_init_errors(create_ipfs: tuple[str, str]):
             )
 
         # Test invalid chunk_shape
-        with pytest.raises(ValueError, match="All chunk_shape dimensions must be positive"):
+        with pytest.raises(
+            ValueError, match="All chunk_shape dimensions must be positive"
+        ):
             await ShardedZarrStore.open(
                 cas=kubo_cas,
                 read_only=False,
@@ -477,7 +494,9 @@ async def test_sharded_zarr_store_init_errors(create_ipfs: tuple[str, str]):
             )
 
         # Test invalid array_shape
-        with pytest.raises(ValueError, match="All array_shape dimensions must be non-negative"):
+        with pytest.raises(
+            ValueError, match="All array_shape dimensions must be non-negative"
+        ):
             await ShardedZarrStore.open(
                 cas=kubo_cas,
                 read_only=False,
@@ -486,13 +505,18 @@ async def test_sharded_zarr_store_init_errors(create_ipfs: tuple[str, str]):
                 chunks_per_shard=10,
             )
 
+
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, str]):
     """Tests initialization with invalid shapes and manifest errors."""
     rpc_base_url, gateway_base_url = create_ipfs
-    async with KuboCAS(rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url) as kubo_cas:
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
         # Test negative chunk_shape dimension (line 136)
-        with pytest.raises(ValueError, match="All chunk_shape dimensions must be positive"):
+        with pytest.raises(
+            ValueError, match="All chunk_shape dimensions must be positive"
+        ):
             await ShardedZarrStore.open(
                 cas=kubo_cas,
                 read_only=False,
@@ -502,7 +526,9 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
             )
 
         # Test negative array_shape dimension (line 141)
-        with pytest.raises(ValueError, match="All array_shape dimensions must be non-negative"):
+        with pytest.raises(
+            ValueError, match="All array_shape dimensions must be non-negative"
+        ):
             await ShardedZarrStore.open(
                 cas=kubo_cas,
                 read_only=False,
@@ -536,31 +562,45 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
                 "shard_cids": [None] * 4,
             },
         }
-        invalid_root_cid = await kubo_cas.save(dag_cbor.encode(invalid_root_obj), codec="dag-cbor")
+        invalid_root_cid = await kubo_cas.save(
+            dag_cbor.encode(invalid_root_obj), codec="dag-cbor"
+        )
         with pytest.raises(ValueError, match="Incompatible manifest version"):
-            await ShardedZarrStore.open(cas=kubo_cas, read_only=True, root_cid=invalid_root_cid)
+            await ShardedZarrStore.open(
+                cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
+            )
 
         # Test inconsistent shard count (line 236)
         invalid_root_obj = {
             "manifest_version": "sharded_zarr_v1",
             "metadata": {},
             "chunks": {
-                "array_shape": [10, 10],  # 100 chunks, with 10 chunks per shard -> 10 shards
+                "array_shape": [
+                    10,
+                    10,
+                ],  # 100 chunks, with 10 chunks per shard -> 10 shards
                 "chunk_shape": [5, 5],
                 "cid_byte_length": 59,
                 "sharding_config": {"chunks_per_shard": 10},
                 "shard_cids": [None] * 5,  # Wrong number of shards
             },
         }
-        invalid_root_cid = await kubo_cas.save(dag_cbor.encode(invalid_root_obj), codec="dag-cbor")
+        invalid_root_cid = await kubo_cas.save(
+            dag_cbor.encode(invalid_root_obj), codec="dag-cbor"
+        )
         with pytest.raises(ValueError, match="Inconsistent number of shards"):
-            await ShardedZarrStore.open(cas=kubo_cas, read_only=True, root_cid=invalid_root_cid)
+            await ShardedZarrStore.open(
+                cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
+            )
+
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
     """Tests chunk key parsing edge cases."""
     rpc_base_url, gateway_base_url = create_ipfs
-    async with KuboCAS(rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url) as kubo_cas:
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
         store = await ShardedZarrStore.open(
             cas=kubo_cas,
             read_only=False,
@@ -583,7 +623,9 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert uninitialized_store._parse_chunk_key("temp/c/0/0") is None
 
         # Test get on uninitialized store
-        with pytest.raises(RuntimeError, match="Load the root object first before accessing data."):
+        with pytest.raises(
+            RuntimeError, match="Load the root object first before accessing data."
+        ):
             proto = zarr.core.buffer.default_buffer_prototype()
             await uninitialized_store.get("temp/c/0/0", proto)
 
@@ -594,17 +636,24 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert store._parse_chunk_key("temp/c/0/0/0") is None  # 3D key for 2D array
 
         # Test invalid coordinates
-        assert store._parse_chunk_key("temp/c/3/0") is None  # Out of bounds (3 >= 2 chunks)
+        assert (
+            store._parse_chunk_key("temp/c/3/0") is None
+        )  # Out of bounds (3 >= 2 chunks)
         assert store._parse_chunk_key("temp/c/0/invalid") is None  # Non-integer
         assert store._parse_chunk_key("temp/c/0/-1") is None  # Negative coordinate
+
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, str]):
     """Tests initialization with invalid shapes and manifest errors."""
     rpc_base_url, gateway_base_url = create_ipfs
-    async with KuboCAS(rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url) as kubo_cas:
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
         # Test negative chunk_shape dimension
-        with pytest.raises(ValueError, match="All chunk_shape dimensions must be positive"):
+        with pytest.raises(
+            ValueError, match="All chunk_shape dimensions must be positive"
+        ):
             await ShardedZarrStore.open(
                 cas=kubo_cas,
                 read_only=False,
@@ -614,7 +663,9 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
             )
 
         # Test negative array_shape dimension
-        with pytest.raises(ValueError, match="All array_shape dimensions must be non-negative"):
+        with pytest.raises(
+            ValueError, match="All array_shape dimensions must be non-negative"
+        ):
             await ShardedZarrStore.open(
                 cas=kubo_cas,
                 read_only=False,
@@ -648,22 +699,33 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
                 "shard_cids": [None] * 4,
             },
         }
-        invalid_root_cid = await kubo_cas.save(dag_cbor.encode(invalid_root_obj), codec="dag-cbor")
+        invalid_root_cid = await kubo_cas.save(
+            dag_cbor.encode(invalid_root_obj), codec="dag-cbor"
+        )
         with pytest.raises(ValueError, match="Incompatible manifest version"):
-            await ShardedZarrStore.open(cas=kubo_cas, read_only=True, root_cid=invalid_root_cid)
+            await ShardedZarrStore.open(
+                cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
+            )
 
         # Test inconsistent shard count
         invalid_root_obj = {
             "manifest_version": "sharded_zarr_v1",
             "metadata": {},
             "chunks": {
-                "array_shape": [10, 10],  # 100 chunks, with 10 chunks per shard -> 10 shards
+                "array_shape": [
+                    10,
+                    10,
+                ],  # 100 chunks, with 10 chunks per shard -> 10 shards
                 "chunk_shape": [5, 5],
                 "cid_byte_length": 59,
                 "sharding_config": {"chunks_per_shard": 10},
                 "shard_cids": [None] * 5,  # Wrong number of shards
             },
         }
-        invalid_root_cid = await kubo_cas.save(dag_cbor.encode(invalid_root_obj), codec="dag-cbor")
+        invalid_root_cid = await kubo_cas.save(
+            dag_cbor.encode(invalid_root_obj), codec="dag-cbor"
+        )
         with pytest.raises(ValueError, match="Inconsistent number of shards"):
-            await ShardedZarrStore.open(cas=kubo_cas, read_only=True, root_cid=invalid_root_cid)
+            await ShardedZarrStore.open(
+                cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
+            )

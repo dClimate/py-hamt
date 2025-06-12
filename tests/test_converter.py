@@ -11,7 +11,13 @@ import pytest
 import xarray as xr
 
 # Import store implementations
-from py_hamt import HAMT, KuboCAS, ShardedZarrStore, convert_hamt_to_sharded, sharded_converter_cli
+from py_hamt import (
+    HAMT,
+    KuboCAS,
+    ShardedZarrStore,
+    convert_hamt_to_sharded,
+    sharded_converter_cli,
+)
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
@@ -25,7 +31,7 @@ def converter_test_dataset():
     times = pd.date_range("2025-01-01", periods=20)
     lats = np.linspace(40, 50, 10)
     lons = np.linspace(-85, -75, 20)
-    
+
     # Generate a unique variable name for this test run
     unique_var_name = f"data_{str(uuid.uuid4())[:8]}"
 
@@ -95,12 +101,15 @@ async def test_converter_produces_identical_dataset(
         # STEP 3: Verification
         # --------------------------------------------------------------------
         print("\n--- STEP 3: Verifying data integrity ---")
-        
+
         # Open the original dataset from the HAMT store
         print("Reading data back from original HAMT store...")
 
         hamt_ro = await HAMT.build(
-            cas=kubo_cas, root_node_id=hamt_root_cid, values_are_bytes=True, read_only=True
+            cas=kubo_cas,
+            root_node_id=hamt_root_cid,
+            values_are_bytes=True,
+            read_only=True,
         )
         zhs_ro = ZarrHAMTStore(hamt_ro, read_only=True)
 
@@ -109,14 +118,14 @@ async def test_converter_produces_identical_dataset(
 
         end_read = time.perf_counter()
         print(f"Original HAMT store read in {end_read - start_read:.2f}s")
-        
+
         # Open the converted dataset from the new Sharded store
         print("Reading data back from new Sharded store...")
         dest_store_ro = await ShardedZarrStore.open(
             cas=kubo_cas, read_only=True, root_cid=sharded_root_cid
         )
         ds_from_sharded = xr.open_zarr(dest_store_ro)
-        
+
         # The ultimate test: are the two xarray.Dataset objects identical?
         # This checks coordinates, variables, data values, and attributes.
         print("Comparing the two datasets...")
@@ -127,15 +136,14 @@ async def test_converter_produces_identical_dataset(
             np.testing.assert_array_equal(
                 ds_from_hamt[var].values, ds_from_sharded[var].values
             )
-        
+
         print("\n✅ Verification successful! The datasets are identical.")
         print("=" * 80)
 
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_hamt_to_sharded_cli_success(
-    create_ipfs: tuple[str, str],
-    converter_test_dataset: xr.Dataset,
-    capsys
+    create_ipfs: tuple[str, str], converter_test_dataset: xr.Dataset, capsys
 ):
     """
     Tests the CLI for successful conversion of a HAMT store to a ShardedZarrStore.
@@ -157,9 +165,12 @@ async def test_hamt_to_sharded_cli_success(
         test_args = [
             "script.py",  # Dummy script name
             hamt_root_cid,
-            "--chunks-per-shard", "64",
-            "--rpc-url", rpc_base_url,
-            "--gateway-url", gateway_base_url
+            "--chunks-per-shard",
+            "64",
+            "--rpc-url",
+            rpc_base_url,
+            "--gateway-url",
+            gateway_base_url,
         ]
         with patch.object(sys, "argv", test_args):
             await sharded_converter_cli()
@@ -180,11 +191,10 @@ async def test_hamt_to_sharded_cli_success(
         ds_from_sharded = xr.open_zarr(dest_store_ro)
         xr.testing.assert_identical(test_ds, ds_from_sharded)
 
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_hamt_to_sharded_cli_default_args(
-    create_ipfs: tuple[str, str],
-    converter_test_dataset: xr.Dataset,
-    capsys
+    create_ipfs: tuple[str, str], converter_test_dataset: xr.Dataset, capsys
 ):
     """
     Tests the CLI with default argument values.
@@ -206,8 +216,10 @@ async def test_hamt_to_sharded_cli_default_args(
         test_args = [
             "script.py",  # Dummy script name
             hamt_root_cid,
-            "--rpc-url", rpc_base_url,
-            "--gateway-url", gateway_base_url
+            "--rpc-url",
+            rpc_base_url,
+            "--gateway-url",
+            gateway_base_url,
         ]
         with patch.object(sys, "argv", test_args):
             await sharded_converter_cli()
@@ -225,11 +237,9 @@ async def test_hamt_to_sharded_cli_default_args(
         ds_from_sharded = xr.open_zarr(dest_store_ro)
         xr.testing.assert_identical(test_ds, ds_from_sharded)
 
+
 @pytest.mark.asyncio(loop_scope="session")
-async def test_hamt_to_sharded_cli_invalid_cid(
-    create_ipfs: tuple[str, str],
-    capsys
-):
+async def test_hamt_to_sharded_cli_invalid_cid(create_ipfs: tuple[str, str], capsys):
     """
     Tests the CLI with an invalid hamt_cid.
     """
@@ -242,9 +252,12 @@ async def test_hamt_to_sharded_cli_invalid_cid(
         test_args = [
             "script.py",
             invalid_cid,
-            "--chunks-per-shard", "64",
-            "--rpc-url", rpc_base_url,
-            "--gateway-url", gateway_base_url
+            "--chunks-per-shard",
+            "64",
+            "--rpc-url",
+            rpc_base_url,
+            "--gateway-url",
+            gateway_base_url,
         ]
         with patch.object(sys, "argv", test_args):
             await sharded_converter_cli()

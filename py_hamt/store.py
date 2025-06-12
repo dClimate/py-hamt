@@ -165,6 +165,7 @@ class KuboCAS(ContentAddressedStore):
         *,
         headers: dict[str, str] | None = None,
         auth: aiohttp.BasicAuth | None = None,
+        pinOnAdd: bool = False,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
@@ -210,7 +211,11 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
-        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
+        pinString: str = "true" if pinOnAdd else "false"
+
+        self.rpc_url: str = (
+            f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin={pinString}"
+        )
         """@private"""
         self.gateway_base_url: str = f"{gateway_base_url}/ipfs/"
         """@private"""
@@ -334,3 +339,49 @@ class KuboCAS(ContentAddressedStore):
             async with self._loop_session().get(url, headers=headers or None) as resp:
                 resp.raise_for_status()
                 return await resp.read()
+
+    # --------------------------------------------------------------------- #
+    # pin_cid() – method to pin a CID                                       #
+    # --------------------------------------------------------------------- #
+    async def pin_cid(
+        self,
+        cid: CID,
+        name: Optional[str] = None,
+        target_rpc: str = "http://127.0.0.1:5001",
+    ) -> None:
+        """
+        Pins a CID to the local Kubo node via the RPC API.
+
+        This call is recursive by default, pinning all linked objects.
+
+        Args:
+            cid (CID): The Content ID to pin.
+            name (Optional[str]): An optional name for the pin.
+        """
+        params = {"arg": str(cid), "recursive": "false"}
+        if name:
+            params["name"] = name
+        pin_add_url_base: str = f"{target_rpc}/api/v0/pin/add"
+
+        async with self._sem:  # throttle RPC
+            async with self._loop_session().post(
+                pin_add_url_base, params=params
+            ) as resp:
+                resp.raise_for_status()
+                # A 200 OK is sufficient to indicate success.
+
+    async def unpin_cid(
+        self, cid: CID, target_rpc: str = "http://127.0.0.1:5001"
+    ) -> None:
+        """
+        Unpins a CID from the local Kubo node via the RPC API.
+
+        Args:
+            cid (CID): The Content ID to unpin.
+        """
+        params = {"arg": str(cid), "recursive": "false"}
+        unpin_url_base: str = f"{target_rpc}/api/v0/pin/rm"
+        async with self._sem:  # throttle RPC
+            async with self._loop_session().post(unpin_url_base, params=params) as resp:
+                resp.raise_for_status()
+                # A 200 OK is sufficient to indicate success.

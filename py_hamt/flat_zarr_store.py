@@ -165,7 +165,7 @@
 #         except (ValueError, IndexError):
 #             return None
 
-#     async def set_partial_values(   
+#     async def set_partial_values(
 #         self, key_start_values: Iterable[tuple[str, int, BytesLike]]
 #     ) -> None:
 #         """@private"""
@@ -316,7 +316,7 @@
 #     @property
 #     def supports_deletes(self) -> bool:
 #         """@private"""
-#         return not self.read_only 
+#         return not self.read_only
 
 #     async def delete(self, key: str) -> None:
 #         if self.read_only:

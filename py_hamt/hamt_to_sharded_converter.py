@@ -9,6 +9,7 @@ import xarray as xr
 from multiformats import CID
 from zarr.core.buffer import Buffer, BufferPrototype
 
+
 async def convert_hamt_to_sharded(
     cas: KuboCAS, hamt_root_cid: str, chunks_per_shard: int, cid_len: int = 59
 ) -> str:
@@ -42,9 +43,10 @@ async def convert_hamt_to_sharded(
     array_shape = array_shape_tuple
     chunk_shape = chunk_shape_tuple
 
-
     # 3. Create the destination ShardedZarrStore for writing
-    print(f"Initializing new ShardedZarrStore with {chunks_per_shard} chunks per shard...")
+    print(
+        f"Initializing new ShardedZarrStore with {chunks_per_shard} chunks per shard..."
+    )
     dest_store = await ShardedZarrStore.open(
         cas=cas,
         read_only=False,
@@ -67,8 +69,8 @@ async def convert_hamt_to_sharded(
 
         # Write the exact same key-value pair to the destination.
         await dest_store.set_pointer(key, cid_base32_str)
-        if count % 200 == 0: # pragma: no cover
-            print(f"Migrated {count} keys...") # pragma: no cover
+        if count % 200 == 0:  # pragma: no cover
+            print(f"Migrated {count} keys...")  # pragma: no cover
 
     print(f"Migration of {count} total keys complete.")
 
@@ -122,5 +124,6 @@ async def sharded_converter_cli():
         except Exception as e:
             print(f"\nAn error occurred: {e}")
 
+
 if __name__ == "__main__":
-    asyncio.run(sharded_converter_cli()) # pragma: no cover
+    asyncio.run(sharded_converter_cli())  # pragma: no cover

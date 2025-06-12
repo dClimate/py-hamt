@@ -56,8 +56,6 @@
 #     yield ds
 
 
-
-
 # # # ###
 # # # BENCHMARK FOR THE NEW FlatZarrStore
 # # # ###
@@ -224,7 +222,7 @@
 #             # Construct a minimal selection based on available dimensions
 #             selection = {dim: 0 for dim in ipfs_ds[first_var_name].dims}
 #             if selection:
-#                  _ = ipfs_ds[first_var_name].isel(**selection).values    
+#                  _ = ipfs_ds[first_var_name].isel(**selection).values
 #             else: # If no dimensions, try loading the whole variable (e.g. scalar)
 #                  _ = ipfs_ds[first_var_name].values
 #         end_read = time.perf_counter()

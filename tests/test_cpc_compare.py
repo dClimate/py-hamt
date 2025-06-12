@@ -12,7 +12,6 @@
 # from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
-
 # @pytest.mark.asyncio(loop_scope="session")
 # async def test_benchmark_sharded_store():
 #     """Benchmarks write and read performance for the new ShardedZarrStore.""" # Updated docstring
@@ -26,7 +25,7 @@
 #     headers = {
 #         "X-API-Key": "",
 #     }
- 
+
 #     async with KuboCAS(
 #         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url, headers=headers
 #     ) as kubo_cas:
@@ -55,7 +54,7 @@
 #             # Construct a minimal selection based on available dimensions
 #             selection = {dim: 0 for dim in ipfs_ds[first_var_name].dims}
 #             if selection:
-#                  _ = ipfs_ds[first_var_name].isel(**selection).values    
+#                  _ = ipfs_ds[first_var_name].isel(**selection).values
 #             else: # If no dimensions, try loading the whole variable (e.g. scalar)
 #                  _ = ipfs_ds[first_var_name].values
 #         end_read = time.perf_counter()
