@@ -223,6 +223,7 @@ class KuboCAS(ContentAddressedStore):
                 auth=self._default_auth,
                 limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
                 http2=True,
+                follow_redirects=True,
             )
             self._client_per_loop[loop] = client
             return client
@@ -297,10 +298,38 @@ class KuboCAS(ContentAddressedStore):
     async def load(self, id: IPLDKind) -> bytes:
         """@private"""
         cid = cast(CID, id)  # CID is definitely in the IPLDKind type
-        url: str = self.gateway_base_url + str(cid)
+
+        # Public gateways need special handling to return raw IPLD content
+        is_public_gateway = False
+        for domain in ["ipfs.io", "dweb.link", "cloudflare-ipfs.com"]:
+            if domain in self.gateway_base_url:
+                is_public_gateway = True
+                break
+
+        # Remove /ipfs/ from the gateway URL if present
+        base_url = self.gateway_base_url
+        if "/ipfs/" in base_url:
+            base_url = base_url.split("/ipfs/")[0]
+
+        # Standard gateway URL construction with proper path handling
+        if base_url.endswith("/"):
+            url = f"{base_url}ipfs/{cid}"
+        else:
+            url = f"{base_url}/ipfs/{cid}"
+
+        # Set appropriate headers based on gateway type
+        # For public gateways, we need specific Accept headers to get the raw content
+        headers = {}
+        if is_public_gateway:
+            # These headers tell the gateway to return the raw content instead of HTML
+            headers["Accept"] = (
+                "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
+            )
+            # Also add the dag-cbor format in the path for reliable content addressing
+            url = f"{url}?format=dag-cbor"
 
         async with self._sem:  # throttle gateway
             client = self._loop_client()
-            response = await client.get(url)
+            response = await client.get(url, headers=headers)
             response.raise_for_status()
             return response.content
