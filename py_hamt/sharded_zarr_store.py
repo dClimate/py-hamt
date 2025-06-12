@@ -83,12 +83,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if root_cid:
             await store._load_root_from_cid()
         elif not read_only:
-            if not all([array_shape, chunk_shape, chunks_per_shard is not None]):
+            if array_shape is None or chunk_shape is None:
                 raise ValueError(
-                    "array_shape, chunk_shape, and chunks_per_shard must be provided for a new store."
+                    "array_shape and chunk_shape must be provided for a new store."
                 )
+
             if not isinstance(chunks_per_shard, int) or chunks_per_shard <= 0:
                 raise ValueError("chunks_per_shard must be a positive integer.")
+
             store._initialize_new_root(
                 array_shape, chunk_shape, chunks_per_shard, cid_len
             )
@@ -408,7 +410,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         prototype: zarr.core.buffer.BufferPrototype,
         byte_range: Optional[zarr.abc.store.ByteRequest] = None,
     ) -> Optional[zarr.core.buffer.Buffer]:
-        if self._root_obj is None:
+        if self._root_obj is None or self._cid_len is None:
             raise RuntimeError("Load the root object first before accessing data.")
 
         chunk_coords = self._parse_chunk_key(key)
@@ -509,6 +511,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
         await self.set_pointer(key, chunk_data_cid_str)  # Store the CID in the index
 
     async def set_pointer(self, key: str, pointer: str) -> None:
+        if self._root_obj is None or self._cid_len is None:
+            raise RuntimeError("Load the root object first before accessing data.")
         # Ensure the CID (as ASCII bytes) fits in the allocated slot, padding with nulls
         chunk_data_cid_ascii_bytes = pointer.encode("ascii")
         if len(chunk_data_cid_ascii_bytes) > self._cid_len:
@@ -556,7 +560,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # then _dirty_root will be set by flush().
 
     async def exists(self, key: str) -> bool:
-        if self._root_obj is None:
+        if self._root_obj is None or self._cid_len is None:
             raise RuntimeError(
                 "Root object not loaded. Call _load_root_from_cid() first."
             )
