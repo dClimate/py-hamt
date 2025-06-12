@@ -39,6 +39,15 @@ class ContentAddressedStore(ABC):
     ) -> bytes:
         """Retrieve data."""
 
+    # Optional abstract methods for pinning and unpinning CIDs
+    async def pin_cid(self, id: IPLDKind) -> None:
+        """Pin a CID in the storage."""
+        pass
+
+    async def unpin_cid(self, id: IPLDKind) -> None:
+        """Unpin a CID in the storage."""
+        pass
+
 
 class InMemoryCAS(ContentAddressedStore):
     """Used mostly for faster testing, this is why this is not exported. It hashes all inputs and uses that as a key to an in-memory python dict, mimicking a content addressed storage system. The hash bytes are the ID that `save` returns and `load` takes in."""
