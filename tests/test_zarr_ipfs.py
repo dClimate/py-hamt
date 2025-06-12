@@ -69,7 +69,6 @@ async def test_write_read(
     async with KuboCAS(  # <-- own and auto-close session
         rpc_base_url=rpc_base_url,
         gateway_base_url=gateway_base_url,
-        request_limit_per_client=10,
     ) as kubo_cas:
         hamt = await HAMT.build(cas=kubo_cas, values_are_bytes=True)
         zhs = ZarrHAMTStore(hamt)

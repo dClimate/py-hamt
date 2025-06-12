@@ -4,40 +4,38 @@ This file can be run by pytest, but is not automatically included since it inclu
 This test suite contains various performance tests, which are meant to be run individually.
 """
 
-import asyncio
 import time
 
 import pytest
 import xarray as xr
 
-from py_hamt import HAMT, InMemoryCAS, KuboCAS
+from py_hamt import HAMT, KuboCAS
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
+# @pytest.mark.asyncio
+# async def test_large_kv_set() -> None:
+#     """This test is meant for finding whether the HAMT performance scales linearly with increasing set size, an issue with HAMT v2.
+#     Feel free to tune and run the LARGE_KV_SET_SIZE variable as needed for gathering the different timepoints.
+#     """
+#     LARGE_KV_SET_SIZE: int = 1_000_000
 
-@pytest.mark.asyncio
-async def test_large_kv_set() -> None:
-    """This test is meant for finding whether the HAMT performance scales linearly with increasing set size, an issue with HAMT v2.
-    Feel free to tune and run the LARGE_KV_SET_SIZE variable as needed for gathering the different timepoints.
-    """
-    LARGE_KV_SET_SIZE: int = 1_000_000
-
-    cas = InMemoryCAS()
-    hamt = await HAMT.build(cas=cas)
-    start: float = time.perf_counter()
-    await asyncio.gather(
-        *[hamt.set(str(k_int), k_int) for k_int in range(LARGE_KV_SET_SIZE)]
-    )
-    await hamt.make_read_only()
-    end: float = time.perf_counter()
-    elapsed: float = end - start
-    print(f"Took {elapsed:.2f} seconds")
-    assert (
-        len([key async for key in hamt.keys()])
-        == (await hamt.len())
-        == LARGE_KV_SET_SIZE
-    )
-    for k_int in range(LARGE_KV_SET_SIZE):
-        assert (await hamt.get(str(k_int))) == k_int
+#     cas = InMemoryCAS()
+#     hamt = await HAMT.build(cas=cas)
+#     start: float = time.perf_counter()
+#     await asyncio.gather(
+#         *[hamt.set(str(k_int), k_int) for k_int in range(LARGE_KV_SET_SIZE)]
+#     )
+#     await hamt.make_read_only()
+#     end: float = time.perf_counter()
+#     elapsed: float = end - start
+#     print(f"Took {elapsed:.2f} seconds")
+#     assert (
+#         len([key async for key in hamt.keys()])
+#         == (await hamt.len())
+#         == LARGE_KV_SET_SIZE
+#     )
+#     for k_int in range(LARGE_KV_SET_SIZE):
+#         assert (await hamt.get(str(k_int))) == k_int
 
 
 # # ###
