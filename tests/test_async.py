@@ -1,6 +1,7 @@
 # tests/test_async.py
 import asyncio
 import threading
+import unittest.mock
 
 import pytest
 
@@ -107,6 +108,15 @@ async def test_kubocas_no_running_loop_in_aclose():
     # We'll mock this by calling the method directly
     import unittest.mock
 
+    # Test the __del__ method with no running loop scenario
+    with unittest.mock.patch(
+        "asyncio.get_running_loop", side_effect=RuntimeError("No running loop")
+    ):
+        # This will trigger the exception path in __del__
+        # where it gets a RuntimeError and sets loop = None
+        cas.__del__()
+
+    # Now test the normal aclose path with no running loop
     with unittest.mock.patch(
         "asyncio.get_running_loop", side_effect=RuntimeError("No running loop")
     ):
@@ -208,6 +218,25 @@ async def test_aclose_handles_multiple_close_failures():
     sess1.aclose = original_close
     if not sess1.is_closed:
         await sess1.aclose()
+
+
+@pytest.mark.asyncio
+async def test_del_with_loop_error_handling():
+    """Test that __del__ handles exceptions during asyncio.run."""
+
+    kubo = KuboCAS()
+    client = kubo._loop_client()
+
+    # Test case where asyncio.run raises an exception
+    with unittest.mock.patch(
+        "asyncio.run", side_effect=Exception("Failed to run aclose")
+    ):
+        # This should not raise an exception
+        kubo.__del__()
+
+    # Cleanup
+    if not client.is_closed:
+        await client.aclose()
 
 
 @pytest.mark.asyncio
