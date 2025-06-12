@@ -117,3 +117,10 @@ memray flamegraph <memray-output-file>
    - Tests require either a local IPFS daemon or Docker
    - Use the `--ipfs` flag to enable IPFS integration tests
    - When Docker is available, tests will automatically launch a container
+
+
+   Add packages with
+   uv add
+
+   Check versions of packages with
+   uv pip show aiohttp

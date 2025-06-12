@@ -124,6 +124,21 @@ class KuboCAS(ContentAddressedStore):
     ...
     """
 
+    def __del__(self) -> None:
+        """Best-effort cleanup for internally-created sessions without creating tasks."""
+        if not self._owns_session:
+            return
+
+        # Just ensure any session is marked as closed
+        # We don't create tasks in __del__ as they can be destroyed improperly
+        for sess in list(self._session_per_loop.values()):
+            if not sess.closed:
+                # Mark as closed but don't create any tasks
+                sess._closed = True
+
+        # Clear our references to the sessions
+        self._session_per_loop.clear()
+
     KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL: str = "http://127.0.0.1:8080"
     KUBO_DEFAULT_LOCAL_RPC_BASE_URL: str = "http://127.0.0.1:5001"
 
@@ -221,7 +236,7 @@ class KuboCAS(ContentAddressedStore):
             connector = aiohttp.TCPConnector(
                 limit=64,
                 limit_per_host=32,
-                force_close=True,  # Force close connections
+                # force_close=True,  # Force close connections
                 enable_cleanup_closed=True,  # Enable cleanup of closed connections
             )
 
@@ -243,13 +258,24 @@ class KuboCAS(ContentAddressedStore):
             # User supplied the session; they are responsible for closing it.
             return
 
+        tasks = []
         for sess in list(self._session_per_loop.values()):
             if not sess.closed:
                 try:
-                    await sess.close()
+                    # Create a task for each session close operation
+                    task = asyncio.create_task(sess.close())
+                    tasks.append(task)
                 except Exception:
                     # Best-effort cleanup; ignore errors during shutdown
                     pass
+
+        # Wait for all session close tasks to complete
+        if tasks:
+            try:
+                await asyncio.gather(*tasks)
+            except Exception:
+                # Ignore any errors during close
+                pass
 
         self._session_per_loop.clear()
 
