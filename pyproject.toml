@@ -5,7 +5,7 @@ description = "HAMT implementation for a content-addressed storage system."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.27.0",
+    "httpx[http2]>=0.27.0",
     "dag-cbor>=0.3.3",
     "msgspec>=0.18.6",
     "multiformats[full]>=0.3.1.post4",

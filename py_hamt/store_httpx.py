@@ -221,6 +221,8 @@ class KuboCAS(ContentAddressedStore):
                 timeout=60.0,
                 headers=self._default_headers,
                 auth=self._default_auth,
+                limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+                http2=True,
             )
             self._client_per_loop[loop] = client
             return client
