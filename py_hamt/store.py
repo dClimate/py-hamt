@@ -207,6 +207,7 @@ class KuboCAS(ContentAddressedStore):
         self._default_auth = auth
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
+        self._closed: bool = False
 
     # --------------------------------------------------------------------- #
     # helper: get or create the session bound to the current running loop   #
@@ -217,13 +218,13 @@ class KuboCAS(ContentAddressedStore):
         try:
             return self._session_per_loop[loop]
         except KeyError:
-            # Create a connector that keeps connections alive for reuse.
-            # Cleaning up closed connections ensures resources are eventually
-            # released even if the user forgets to explicitly close the session.
+            # Create a connector that keeps connections alive for performance
+            # but configure it to avoid the "Task was destroyed but it is pending" warning
             connector = aiohttp.TCPConnector(
                 limit=64,
                 limit_per_host=32,
-                enable_cleanup_closed=True,
+                force_close=False,  # Keep connections open for better performance
+                enable_cleanup_closed=False,  # Disable automatic cleanup which can cause task destruction warnings
             )
 
             sess = aiohttp.ClientSession(
@@ -232,6 +233,10 @@ class KuboCAS(ContentAddressedStore):
                 headers=self._default_headers,
                 auth=self._default_auth,
             )
+
+            # Prevent task warnings by setting cleanup handle to None
+            if hasattr(connector, "_cleanup_closed_handle"):
+                connector._cleanup_closed_handle = None
             self._session_per_loop[loop] = sess
             return sess
 
@@ -247,12 +252,20 @@ class KuboCAS(ContentAddressedStore):
         for sess in list(self._session_per_loop.values()):
             if not sess.closed:
                 try:
+                    # First ensure cleanup tasks won't be created
+                    if hasattr(sess.connector, "_cleanup_closed_handle"):
+                        sess.connector._cleanup_closed_handle = None
+                    if hasattr(sess.connector, "_closing"):
+                        sess.connector._closing = True
+
+                    # Then close the session
                     await sess.close()
                 except Exception:
                     # Best-effort cleanup; ignore errors during shutdown
                     pass
 
         self._session_per_loop.clear()
+        self._closed = True
 
     # At this point, _session_per_loop should be empty or only contain
     # sessions from loops we haven't seen (which shouldn't happen in practice)
@@ -264,8 +277,18 @@ class KuboCAS(ContentAddressedStore):
 
     def __del__(self) -> None:
         """Best-effort close for internally-created sessions."""
-        if not self._owns_session:
+        if not self._owns_session or self._closed:
             return
+
+        # Cancel cleanup tasks to prevent "Task was destroyed but it is pending" warnings
+        for sess in list(self._session_per_loop.values()):
+            if not sess.closed and hasattr(sess.connector, "_cleanup_closed_handle"):
+                try:
+                    sess.connector._cleanup_closed_handle = None
+                except Exception:
+                    pass
+
+        # Attempt proper cleanup if possible
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -275,6 +298,10 @@ class KuboCAS(ContentAddressedStore):
             if loop is None or not loop.is_running():
                 asyncio.run(self.aclose())
             else:
+                # Set connector._closing to True to prevent new _wait_for_close tasks
+                for sess in list(self._session_per_loop.values()):
+                    if not sess.closed and hasattr(sess.connector, "_closing"):
+                        sess.connector._closing = True
                 loop.create_task(self.aclose())
         except Exception:
             # Suppress all errors during interpreter shutdown or loop teardown

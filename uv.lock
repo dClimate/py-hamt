@@ -1666,7 +1666,7 @@ wheels = [
 
 [[package]]
 name = "py-hamt"
-version = "3.0.0"
+version = "3.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
