@@ -186,9 +186,18 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
+        if "/ipfs/" in gateway_base_url:
+            gateway_base_url = gateway_base_url.split("/ipfs/")[0]
+
+        # Standard gateway URL construction with proper path handling
+        if gateway_base_url.endswith("/"):
+            gateway_base_url = f"{gateway_base_url}ipfs/"
+        else:
+            gateway_base_url = f"{gateway_base_url}/ipfs/"
+
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
         """@private"""
-        self.gateway_base_url: str = f"{gateway_base_url}/ipfs/"
+        self.gateway_base_url: str = gateway_base_url
         """@private"""
 
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
@@ -299,34 +308,11 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
         cid = cast(CID, id)  # CID is definitely in the IPLDKind type
 
-        # Public gateways need special handling to return raw IPLD content
-        is_public_gateway = False
-        for domain in ["ipfs.io", "dweb.link", "cloudflare-ipfs.com"]:
-            if domain in self.gateway_base_url:
-                is_public_gateway = True
-                break
-
-        # Remove /ipfs/ from the gateway URL if present
-        base_url = self.gateway_base_url
-        if "/ipfs/" in base_url:
-            base_url = base_url.split("/ipfs/")[0]
-
-        # Standard gateway URL construction with proper path handling
-        if base_url.endswith("/"):
-            url = f"{base_url}ipfs/{cid}"
-        else:
-            url = f"{base_url}/ipfs/{cid}"
-
-        # Set appropriate headers based on gateway type
-        # For public gateways, we need specific Accept headers to get the raw content
         headers = {}
-        if is_public_gateway:
-            # These headers tell the gateway to return the raw content instead of HTML
-            headers["Accept"] = (
-                "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
-            )
-            # Also add the dag-cbor format in the path for reliable content addressing
-            url = f"{url}?format=dag-cbor"
+        headers["Accept"] = (
+            "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
+        )
+        url = f"{self.gateway_base_url + str(cid)}?format=dag-cbor"
 
         async with self._sem:  # throttle gateway
             client = self._loop_client()
