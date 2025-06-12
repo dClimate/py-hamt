@@ -1,13 +1,12 @@
 import argparse
 import asyncio
-import json
 import time
-from typing import Dict, Any
-from py_hamt import HAMT, KuboCAS, ShardedZarrStore
-from py_hamt.zarr_hamt_store import ZarrHAMTStore
+
 import xarray as xr
 from multiformats import CID
-from zarr.core.buffer import Buffer, BufferPrototype
+
+from py_hamt import HAMT, KuboCAS, ShardedZarrStore
+from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
 async def convert_hamt_to_sharded(

@@ -1,12 +1,13 @@
 import asyncio
 import math
 from collections.abc import AsyncIterator, Iterable
-from typing import Optional, cast, Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import dag_cbor
 import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
+
 from .store import ContentAddressedStore
 
 
@@ -828,7 +829,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                             await self.cas.unpin_cid(
                                 chunk_cid_str, target_rpc=target_rpc
                             )
-                        except Exception as e:
+                        except Exception:
                             # ignore
                             continue
                 print(
@@ -842,7 +843,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             # After unpinning all chunks within, unpin the shard itself
             try:
                 await self.cas.unpin_cid(str(shard_cid), target_rpc=target_rpc)
-            except Exception as e:
+            except Exception:
                 print(f"Warning: Could not unpin shard {str(shard_cid)}")
             print(f"Unpinned shard {shard_cid} from {target_rpc}.")
 
@@ -852,7 +853,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 try:
                     await self.cas.unpin_cid(cid, target_rpc=target_rpc)
                     print(f"Unpinned metadata CID {cid} from {target_rpc}...")
-                except Exception as e:
+                except Exception:
                     print(
                         f"Warning: Could not unpin metadata CID {cid}. Likely already unpinned."
                     )
@@ -862,7 +863,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             try:
                 await self.cas.unpin_cid(self._root_cid, target_rpc=target_rpc)
                 print(f"Unpinned root CID {self._root_cid} from {target_rpc}...")
-            except Exception as e:
+            except Exception:
                 print(
                     f"Warning: Could not unpin root CID {self._root_cid}. Likely already unpinned."
                 )

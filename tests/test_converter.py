@@ -1,9 +1,7 @@
-import asyncio
+import sys
 import time
 import uuid
-import sys
 from unittest.mock import patch
-import aiohttp
 
 import numpy as np
 import pandas as pd
@@ -15,6 +13,8 @@ from py_hamt import (
     HAMT,
     KuboCAS,
     ShardedZarrStore,
+)
+from py_hamt.hamt_to_sharded_converter import (
     convert_hamt_to_sharded,
     sharded_converter_cli,
 )
@@ -179,7 +179,7 @@ async def test_hamt_to_sharded_cli_success(
         captured = capsys.readouterr()
         assert "Starting Conversion from HAMT Root" in captured.out
         assert "Conversion Complete!" in captured.out
-        assert f"New ShardedZarrStore Root CID" in captured.out
+        assert "New ShardedZarrStore Root CID" in captured.out
 
         # Step 4: Verify the converted dataset
         # Extract the new root CID from output (assuming it's the last line)
@@ -246,23 +246,20 @@ async def test_hamt_to_sharded_cli_invalid_cid(create_ipfs: tuple[str, str], cap
     rpc_base_url, gateway_base_url = create_ipfs
     invalid_cid = "invalid_cid"
 
-    async with KuboCAS(
-        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
-    ) as kubo_cas:
-        test_args = [
-            "script.py",
-            invalid_cid,
-            "--chunks-per-shard",
-            "64",
-            "--rpc-url",
-            rpc_base_url,
-            "--gateway-url",
-            gateway_base_url,
-        ]
-        with patch.object(sys, "argv", test_args):
-            await sharded_converter_cli()
+    test_args = [
+        "script.py",
+        invalid_cid,
+        "--chunks-per-shard",
+        "64",
+        "--rpc-url",
+        rpc_base_url,
+        "--gateway-url",
+        gateway_base_url,
+    ]
+    with patch.object(sys, "argv", test_args):
+        await sharded_converter_cli()
 
-        # Verify error handling
-        captured = capsys.readouterr()
-        assert "An error occurred" in captured.out
-        assert f"{invalid_cid}" in captured.out
+    # Verify error handling
+    captured = capsys.readouterr()
+    assert "An error occurred" in captured.out
+    assert f"{invalid_cid}" in captured.out
