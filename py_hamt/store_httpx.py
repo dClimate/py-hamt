@@ -308,19 +308,9 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
         cid = cast(CID, id)  # CID is definitely in the IPLDKind type
         url: str = f"{self.gateway_base_url + str(cid)}"
-        headers = {}
-        # Necessary as ipfs public gateways return html
-        if (
-            "dclimate" not in self.gateway_base_url
-            and "127.0.0" not in self.gateway_base_url
-        ):
-            headers["Accept"] = (
-                "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
-            )
-            url = f"{url}?format=dag-cbor"
 
         async with self._sem:  # throttle gateway
             client = self._loop_client()
-            response = await client.get(url, headers=headers)
+            response = await client.get(url)
             response.raise_for_status()
             return response.content
