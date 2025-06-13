@@ -186,9 +186,18 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
+        if "/ipfs/" in gateway_base_url:
+            gateway_base_url = gateway_base_url.split("/ipfs/")[0]
+
+        # Standard gateway URL construction with proper path handling
+        if gateway_base_url.endswith("/"):
+            gateway_base_url = f"{gateway_base_url}ipfs/"
+        else:
+            gateway_base_url = f"{gateway_base_url}/ipfs/"
+
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin=false"
         """@private"""
-        self.gateway_base_url: str = f"{gateway_base_url}/ipfs/"
+        self.gateway_base_url: str = gateway_base_url
         """@private"""
 
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
@@ -298,7 +307,7 @@ class KuboCAS(ContentAddressedStore):
     async def load(self, id: IPLDKind) -> bytes:
         """@private"""
         cid = cast(CID, id)  # CID is definitely in the IPLDKind type
-        url: str = self.gateway_base_url + str(cid)
+        url: str = f"{self.gateway_base_url + str(cid)}"
 
         async with self._sem:  # throttle gateway
             client = self._loop_client()
