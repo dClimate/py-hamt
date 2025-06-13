@@ -310,7 +310,10 @@ class KuboCAS(ContentAddressedStore):
         url: str = f"{self.gateway_base_url + str(cid)}"
         headers = {}
         # Necessary as ipfs public gateways return html
-        if "dclimate" not in self.gateway_base_url:
+        if (
+            "dclimate" not in self.gateway_base_url
+            and "127.0.0" not in self.gateway_base_url
+        ):
             headers["Accept"] = (
                 "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
             )
