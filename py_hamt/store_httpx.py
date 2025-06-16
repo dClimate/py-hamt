@@ -2,7 +2,6 @@ import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Literal, Optional, cast
 
-import aiohttp
 import httpx
 from dag_cbor.ipld import IPLDKind
 from multiformats import CID, multihash
@@ -174,7 +173,7 @@ class KuboCAS(ContentAddressedStore):
         concurrency: int = 32,
         *,
         headers: dict[str, str] | None = None,
-        auth: aiohttp.BasicAuth | None = None,
+        auth: Tuple[str, str] | None = None,
         pinOnAdd: bool = False,
     ):
         """
