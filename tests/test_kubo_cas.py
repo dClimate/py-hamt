@@ -1,14 +1,13 @@
 from typing import Literal, cast
 
-import aiohttp
 import dag_cbor
+import httpx
 import pytest
 from dag_cbor import IPLDKind
 from hypothesis import given, settings
 from testing_utils import ipld_strategy  # noqa
 
-from py_hamt import KuboCAS
-from py_hamt.store import InMemoryCAS
+from py_hamt import InMemoryCAS, KuboCAS
 
 
 # Just to cover this one case that isn't covered within test_hamt
@@ -59,7 +58,7 @@ async def test_kubo_urls_explicit(create_ipfs, global_client_session, data: IPLD
     async with KuboCAS(
         rpc_base_url=rpc_url,
         gateway_base_url=gateway_url,
-        session=global_client_session,
+        client=global_client_session,
     ) as kubo_cas:
         encoded_data = dag_cbor.encode(data)
         for codec in ["raw", "dag-cbor"]:
@@ -92,7 +91,7 @@ async def test_kubo_default_urls(global_client_session, data: IPLDKind):
         pytest.skip("No IPFS daemon running on default ports (127.0.0.1:5001)")
 
     # Your original test code continues here
-    async with KuboCAS(session=global_client_session) as kubo_cas_default:
+    async with KuboCAS(client=global_client_session) as kubo_cas_default:
         encoded_data = dag_cbor.encode(data)
         for codec in ["raw", "dag-cbor"]:
             codec_typed = cast(Literal["raw", "dag-cbor"], codec)
@@ -107,7 +106,7 @@ async def test_kubo_default_urls(global_client_session, data: IPLDKind):
                 )
 
     async with KuboCAS(
-        rpc_base_url=None, gateway_base_url=None, session=global_client_session
+        rpc_base_url=None, gateway_base_url=None, client=global_client_session
     ) as kubo_cas_none_urls:
         encoded_data = dag_cbor.encode(data)
         for codec in ["raw", "dag-cbor"]:
@@ -129,12 +128,12 @@ async def test_kubo_default_urls(global_client_session, data: IPLDKind):
 async def test_kubo_cas(create_ipfs, data: IPLDKind):  # noqa
     rpc_base_url, gateway_base_url = create_ipfs
 
-    # Provide our own async Session, for complete code coverage
-    async with aiohttp.ClientSession() as session:
+    # Provide our own async Client, for complete code coverage
+    async with httpx.AsyncClient() as client:
         async with KuboCAS(
             rpc_base_url=rpc_base_url,
             gateway_base_url=gateway_base_url,
-            session=session,
+            client=client,
         ) as kubo_cas:
             # Use proper literal types for codec
             codec_raw: Literal["raw"] = "raw"

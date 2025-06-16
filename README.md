@@ -15,9 +15,8 @@ py-hamt provides efficient storage and retrieval of large sets of key-value mapp
 dClimate primarily created this for storing large [zarrs](https://zarr.dev/) on IPFS. To see this in action, see our [data ETLs](https://github.com/dClimate/etl-scripts).
 
 # Installation and Usage
-To install, since we do not publish this package to PyPI, add this library to your project directly from git.
 ```sh
-pip install 'git+https://github.com/dClimate/py-hamt'
+pip install py-hamt
 ```
 
 For usage information, take a look at our [API documentation](https://dclimate.github.io/py-hamt/py_hamt.html), major items have example code.
