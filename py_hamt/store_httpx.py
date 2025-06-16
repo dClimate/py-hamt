@@ -1,7 +1,8 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Literal, Optional, Tuple, cast
+from typing import Any, Dict, Literal, Optional, cast
 
+import aiohttp
 import httpx
 from dag_cbor.ipld import IPLDKind
 from multiformats import CID, multihash
@@ -343,7 +344,7 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
         cid = cast(CID, id)
         url: str = self.gateway_base_url + str(cid)
-        headers: dict[str, str] = {}
+        headers: Dict[str, str] = {}
 
         # Construct the Range header if required
         if offset is not None:
@@ -387,9 +388,7 @@ class KuboCAS(ContentAddressedStore):
 
         async with self._sem:  # throttle RPC
             client = self._loop_client()
-            response = await client.post(
-                pin_add_url_base, params=params
-            )
+            response = await client.post(pin_add_url_base, params=params)
             response.raise_for_status()
 
             # async with self._loop_session().post(
@@ -411,9 +410,7 @@ class KuboCAS(ContentAddressedStore):
         unpin_url_base: str = f"{target_rpc}/api/v0/pin/rm"
         async with self._sem:  # throttle RPC
             client = self._loop_client()
-            response = await client.post(
-                unpin_url_base, params=params
-            )
+            response = await client.post(unpin_url_base, params=params)
             response.raise_for_status()
             # async with self._loop_session().post(unpin_url_base, params=params) as resp:
             #     resp.raise_for_status()

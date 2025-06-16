@@ -8,7 +8,7 @@ import zarr.abc.store
 import zarr.core.buffer
 from zarr.core.common import BytesLike
 
-from .store import ContentAddressedStore
+from .store_httpx import ContentAddressedStore
 
 
 class ShardedZarrStore(zarr.abc.store.Store):
