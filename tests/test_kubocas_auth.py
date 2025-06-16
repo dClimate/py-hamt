@@ -1,10 +1,10 @@
 # tests/test_kubocas_auth.py
 import inspect
 
-import aiohttp
+import httpx
 import pytest
 
-from py_hamt.store import KuboCAS
+from py_hamt import KuboCAS
 
 
 async def _maybe_await(x):
@@ -12,64 +12,64 @@ async def _maybe_await(x):
 
 
 @pytest.mark.asyncio
-async def test_user_supplied_session_headers():
-    sess = aiohttp.ClientSession(headers={"Authorization": "Bearer x"})
-    cas = KuboCAS(session=sess)
-    assert (await _maybe_await(cas._loop_session())).headers[
+async def test_user_supplied_client_headers():
+    client = httpx.AsyncClient(headers={"Authorization": "Bearer x"})
+    cas = KuboCAS(client=client)
+    assert (await _maybe_await(cas._loop_client())).headers[
         "Authorization"
     ] == "Bearer x"
-    await cas.aclose()  # must NOT close external session
-    assert not sess.closed
-    await sess.close()
+    await cas.aclose()  # must NOT close external client
+    assert not client.is_closed
+    await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_internal_session_headers() -> None:
+async def test_internal_client_headers() -> None:
     cas = KuboCAS(headers={"X-Custom": "yes"})
-    sess: aiohttp.ClientSession = await _maybe_await(cas._loop_session())
-    assert sess.headers["X-Custom"] == "yes"
+    client: httpx.AsyncClient = await _maybe_await(cas._loop_client())
+    assert client.headers["X-Custom"] == "yes"
     await cas.aclose()
-    assert sess.closed
+    assert client.is_closed
 
 
 @pytest.mark.asyncio
-async def test_user_supplied_session_auth() -> None:
+async def test_user_supplied_client_auth() -> None:
     """
-    If the user *provides* an aiohttp.ClientSession that already carries
-    authentication, KuboCAS must reuse that session unchanged and must
+    If the user *provides* an httpx.AsyncClient that already carries
+    authentication, KuboCAS must reuse that client unchanged and must
     **not** close it when `aclose()` is called.
     """
-    basic = aiohttp.BasicAuth("alice", "secret")
-    external_session = aiohttp.ClientSession(auth=basic)
+    auth = ("alice", "secret")
+    external_client = httpx.AsyncClient(auth=auth)
 
-    cas = KuboCAS(session=external_session)
-    sess = await _maybe_await(cas._loop_session())
+    cas = KuboCAS(client=external_client)
+    client = await _maybe_await(cas._loop_client())
 
-    # The session KuboCAS returns is *exactly* the one we passed in,
-    # and therefore must keep the same BasicAuth object.
-    assert sess is external_session
-    assert sess.auth == basic
+    # The client KuboCAS returns is *exactly* the one we passed in,
+    # and therefore must keep the same auth settings.
+    assert client is external_client
+    assert isinstance(client._auth, httpx.BasicAuth)
 
-    # Calling aclose() must leave the externally-owned session open
+    # Calling aclose() must leave the externally-owned client open
     await cas.aclose()
-    assert not external_session.closed
-    await external_session.close()
+    assert not external_client.is_closed
+    await external_client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_internal_session_auth() -> None:
+async def test_internal_client_auth() -> None:
     """
-    When the caller passes `auth=` to the constructor (but no session),
-    KuboCAS must create a ClientSession that carries that auth object,
+    When the caller passes `auth=` to the constructor (but no client),
+    KuboCAS must create an AsyncClient that carries that auth setting,
     and should close it on `aclose()`.
     """
-    basic = aiohttp.BasicAuth("bob", "pa55w0rd")
-    cas = KuboCAS(auth=basic)
+    auth = ("bob", "pa55w0rd")
+    cas = KuboCAS(auth=auth)
 
-    sess = await _maybe_await(cas._loop_session())
-    assert isinstance(sess, aiohttp.ClientSession)
-    assert sess.auth == basic
+    client = await _maybe_await(cas._loop_client())
+    assert isinstance(client, httpx.AsyncClient)
+    assert isinstance(client._auth, httpx.BasicAuth)
 
-    # aclose() should shut down the internally-owned session
+    # aclose() should shut down the internally-owned client
     await cas.aclose()
-    assert sess.closed
+    assert client.is_closed
