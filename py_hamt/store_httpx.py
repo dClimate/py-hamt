@@ -220,7 +220,6 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
-        
         if "/ipfs/" in gateway_base_url:
             gateway_base_url = gateway_base_url.split("/ipfs/")[0]
 
@@ -231,8 +230,10 @@ class KuboCAS(ContentAddressedStore):
             gateway_base_url = f"{gateway_base_url}/ipfs/"
 
         pinString: str = "true" if pinOnAdd else "false"
-        
-        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin={pinString}"
+
+        self.rpc_url: str = (
+            f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin={pinString}"
+        )
         """@private"""
         self.gateway_base_url: str = gateway_base_url
         """@private"""
