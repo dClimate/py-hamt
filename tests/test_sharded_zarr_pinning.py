@@ -1,6 +1,6 @@
 import asyncio
 
-import aiohttp
+import httpx
 import numpy as np
 import pandas as pd
 import pytest
@@ -14,11 +14,11 @@ async def get_pinned_cids(rpc_base_url: str) -> set[str]:
     """Queries the Kubo RPC API and returns a set of all pinned CIDs."""
     url = f"{rpc_base_url}/api/v0/pin/ls"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, params={"type": "all"}) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                return set(data.get("Keys", {}).keys())
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, params={"type": "all"})
+            resp.raise_for_status()  # Raises an exception for 4xx/5xx status codes
+            data = resp.json()
+            return set(data.get("Keys", {}).keys())
     except Exception as e:
         pytest.fail(f"Failed to query pinned CIDs from Kubo RPC API: {e}")
         return set()
