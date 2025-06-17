@@ -220,13 +220,21 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
-        pinString: str = "true" if pinOnAdd else "false"
+        
+        if "/ipfs/" in gateway_base_url:
+            gateway_base_url = gateway_base_url.split("/ipfs/")[0]
 
-        self.rpc_url: str = (
-            f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin={pinString}"
-        )
+        # Standard gateway URL construction with proper path handling
+        if gateway_base_url.endswith("/"):
+            gateway_base_url = f"{gateway_base_url}ipfs/"
+        else:
+            gateway_base_url = f"{gateway_base_url}/ipfs/"
+
+        pinString: str = "true" if pinOnAdd else "false"
+        
+        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin={pinString}"
         """@private"""
-        self.gateway_base_url: str = f"{gateway_base_url}/ipfs/"
+        self.gateway_base_url: str = gateway_base_url
         """@private"""
 
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
@@ -342,7 +350,7 @@ class KuboCAS(ContentAddressedStore):
     ) -> bytes:
         """@private"""
         cid = cast(CID, id)
-        url: str = self.gateway_base_url + str(cid)
+        url: str = f"{self.gateway_base_url + str(cid)}"
         headers: Dict[str, str] = {}
 
         # Construct the Range header if required
