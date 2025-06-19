@@ -2,6 +2,9 @@ import asyncio
 import math
 from collections.abc import AsyncIterator, Iterable
 from typing import Dict, List, Optional, Set, Tuple
+import json
+import itertools
+
 
 import dag_cbor
 import zarr.abc.store
@@ -65,6 +68,27 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         self._dirty_root = False  # Indicates if the root object itself (metadata or shard_cids list) changed
 
+
+    def _update_geometry(self):
+        """Calculates derived geometric properties from the base shapes."""
+        if self._array_shape is None or self._chunk_shape is None or self._chunks_per_shard is None:
+            raise RuntimeError("Base shape information is not set.")
+
+        if not all(cs > 0 for cs in self._chunk_shape):
+            raise ValueError("All chunk_shape dimensions must be positive.")
+        if not all(s >= 0 for s in self._array_shape):
+            raise ValueError("All array_shape dimensions must be non-negative.")
+
+        self._chunks_per_dim = tuple(
+            math.ceil(a / c) if c > 0 else 0 for a, c in zip(self._array_shape, self._chunk_shape)
+        )
+        self._total_chunks = math.prod(self._chunks_per_dim)
+
+        if self._total_chunks == 0:
+            self._num_shards = 0
+        else:
+            self._num_shards = math.ceil(self._total_chunks / self._chunks_per_shard)
+
     @classmethod
     async def open(
         cls,
@@ -108,25 +132,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
     ):
         self._array_shape = array_shape
         self._chunk_shape = chunk_shape
-        self._cid_len = cid_len
         self._chunks_per_shard = chunks_per_shard
+        self._cid_len = cid_len
 
-        if not all(cs > 0 for cs in chunk_shape):
-            raise ValueError("All chunk_shape dimensions must be positive.")
-        if not all(
-            asarray_s >= 0 for asarray_s in array_shape
-        ):  # array_shape dims can be 0
-            raise ValueError("All array_shape dimensions must be non-negative.")
-
-        self._chunks_per_dim = tuple(
-            math.ceil(a / c) if c > 0 else 0 for a, c in zip(array_shape, chunk_shape)
-        )
-        self._total_chunks = math.prod(self._chunks_per_dim)
-
-        if self._total_chunks == 0:
-            self._num_shards = 0
-        else:
-            self._num_shards = math.ceil(self._total_chunks / self._chunks_per_shard)
+        self._update_geometry()
 
         self._root_obj = {
             "manifest_version": "sharded_zarr_v1",
@@ -157,24 +166,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._array_shape = tuple(chunk_info["array_shape"])
         self._chunk_shape = tuple(chunk_info["chunk_shape"])
         self._cid_len = chunk_info["cid_byte_length"]
-        sharding_cfg = chunk_info.get(
-            "sharding_config", {}
-        )  # Handle older formats if any planned
-        self._chunks_per_shard = sharding_cfg["chunks_per_shard"]
+        self._chunks_per_shard = chunk_info["sharding_config"]["chunks_per_shard"]
 
-        if not all(cs > 0 for cs in self._chunk_shape):
-            raise ValueError("Loaded chunk_shape dimensions must be positive.")
-
-        self._chunks_per_dim = tuple(
-            math.ceil(a / c) if c > 0 else 0
-            for a, c in zip(self._array_shape, self._chunk_shape)
-        )
-        self._total_chunks = math.prod(self._chunks_per_dim)
-
-        expected_num_shards = 0
-        if self._total_chunks > 0:
-            expected_num_shards = math.ceil(self._total_chunks / self._chunks_per_shard)
-        self._num_shards = expected_num_shards
+        self._update_geometry()
 
         if len(chunk_info["shard_cids"]) != self._num_shards:
             raise ValueError(
@@ -234,6 +228,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # that this store instance is expected to handle via sharding.
         # Now, proceed with the original parsing logic using self._array_shape and
         # self._chunks_per_dim, which should be configured for this main data variable.
+
+        # print(
+        #     f"Parsing chunk key: {key} for array: {actual_array_name} with shape: {self._array_shape} and chunks_per_dim: {self._chunks_per_dim}")
 
         if not self._array_shape or not self._chunks_per_dim:
             # This ShardedZarrStore instance is not properly initialized
@@ -373,6 +370,23 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if self._root_obj is None:  # Should be initialized for a writable store
             raise RuntimeError("Store not initialized for writing: _root_obj is None.")
 
+        # Update the array_shape and chunk_shape in the root object based on current state in the zarr.json
+        # Fetch the current array_shape and chunk_shape from root_ob
+        # TODO:
+        # zarr_json_cid = self._root_obj.get("metadata", {}).get("zarr.json", {})
+        # if zarr_json_cid:
+        #     zarr_json_bytes = await self.cas.load(zarr_json_cid)
+        #     zarr_json = json.loads(zarr_json_bytes.decode("utf-8"))
+        #     consolidated_metadata = zarr_json.get("consolidated_metadata", {})
+            
+        #     print("ZArr jSON bytes", zarr_json)
+
+        # else:
+        #     raise ValueError("Zarr JSON metadata CID not found.")
+        # print(self._array_shape, self._chunk_shape)
+        # self._root_obj["chunks"]["array_shape"] = list(self._array_shape)
+        # self._root_obj["chunks"]["chunk_shape"] = list(self._chunk_shape)
+
         # Save all dirty shards first, as their CIDs might need to go into the root object
         if self._dirty_shards:
             for shard_idx in sorted(list(self._dirty_shards)):
@@ -419,6 +433,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
     ) -> Optional[zarr.core.buffer.Buffer]:
         if self._root_obj is None or self._cid_len is None:
             raise RuntimeError("Load the root object first before accessing data.")
+        # print('Getting key', key)
 
         chunk_coords = self._parse_chunk_key(key)
         # Metadata request (e.g., ".json")
@@ -508,6 +523,24 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise RuntimeError(
                 "Store not initialized for writing (root_obj is None). Call open() first."
             )
+        # print('Setting key', key)
+        # Find the data variable and update its chunk data
+        if key.endswith("zarr.json") and not key.startswith("time/") and not key.startswith(("lat/", "latitude/")) and not key.startswith(("lon/", "longitude/")) and not len(key) == 9:
+            # extract the metadata from the value
+            # and store it in the root_obj["metadata"] dict
+            converted_value = value.to_bytes().decode("utf-8")
+            # Read the json
+            metadata_json = json.loads(converted_value)
+            new_array_shape = metadata_json.get("shape")
+            if not new_array_shape:
+                raise ValueError("Shape not found in metadata.")
+
+            if tuple(new_array_shape) != self._array_shape:
+                print(f"Detected shape change from {self._array_shape} to {tuple(new_array_shape)}. Resizing shard index...")
+                # Use your existing resize_store method to handle all the recalculations
+                # and extend the list of shard CIDs.
+                await self.resize_store(new_shape=tuple(new_array_shape))  
+
 
         raw_chunk_data_bytes = value.to_bytes()
         # Save the actual chunk data to CAS first, to get its CID
@@ -531,8 +564,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
         )
 
         chunk_coords = self._parse_chunk_key(key)
+        # print(f"Setting for key '{key}': {chunk_coords}")
 
-        if chunk_coords is None:  # Metadata key (e.g., ".zarray")
+        if chunk_coords is None:  # Metadata key (e.g., ".json")
             # For metadata, the 'value' is the metadata content itself, not a CID to it.
             # So, we store the metadata content, get its CID, and put *that* CID in root_obj.
             # This means the `value_cid_str` for metadata should be from `raw_chunk_data_bytes`.
@@ -633,6 +667,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise RuntimeError("Store not initialized for deletion (root_obj is None).")
         if self._cid_len is None:
             raise RuntimeError("Store not initialized properly; _cid_len is missing.")
+        # print(f"Deleting key: {key}")
 
         chunk_coords = self._parse_chunk_key(key)
         if chunk_coords is None:  # Metadata
@@ -670,9 +705,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 break
 
         if is_already_zero:
-            raise KeyError(
-                f"Chunk key '{key}' not found or already effectively deleted (CID slot is zeroed)."
-            )
+            self._dirty_shards.add(shard_idx)
 
         # Zero out the CID entry in the shard cache
         for i in range(self._cid_len):
@@ -692,13 +725,140 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise RuntimeError(
                 "Root object not loaded. Call _load_root_from_cid() first."
             )
-        for key in self._root_obj.get("metadata", {}):
+        for key in list(self._root_obj.get("metadata", {})):
             yield key
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
         async for key in self.list():
             if key.startswith(prefix):
                 yield key
+
+    async def graft_store(self, store_to_graft_cid: str, chunk_offset: Tuple[int, ...]):
+        """
+        Performs a high-performance, metadata-only append by "grafting" the
+        chunk CIDs from another store into this store at a given offset.
+
+        Args:
+            store_to_graft_cid: The root CID of the Zarr store whose chunks will be copied.
+            chunk_offset: A tuple defining the starting chunk coordinates in the target store.
+                          e.g., (3, 0, 0) to start at the 4th time chunk.
+        """
+        if self.read_only:
+            raise ValueError("Cannot graft onto a read-only store.")
+        if self._root_obj is None:
+            raise RuntimeError("Main store must be initialized before grafting.")
+
+        print(f"Grafting store {store_to_graft_cid[:10]}... at chunk offset {chunk_offset}")
+
+        # 1. Open the store we want to copy chunks from (read-only)
+        store_to_graft = await ShardedZarrStore.open(cas=self.cas, read_only=True, root_cid=store_to_graft_cid)
+        if store_to_graft._root_obj is None:
+             raise ValueError("Store to graft could not be loaded.")
+        if store_to_graft._chunks_per_dim is None or self._cid_len is None:
+            raise ValueError("Store to graft is not properly configured.")
+        
+        source_shard_cache: Dict[int, bytes] = {}
+
+        source_chunk_grid = store_to_graft._chunks_per_dim
+        for local_coords in itertools.product(*[range(s) for s in source_chunk_grid]):
+            
+            # 3. Get the pointer (CID) for each chunk from the source store
+            linear_local_index = store_to_graft._get_linear_chunk_index(local_coords)
+            local_shard_idx, index_in_local_shard = store_to_graft._get_shard_info(linear_local_index)
+
+            if local_shard_idx not in source_shard_cache:
+                source_shard_cid = store_to_graft._root_obj["chunks"]["shard_cids"][local_shard_idx]
+                if not source_shard_cid:
+                    source_shard_cache[local_shard_idx] = b'' # Mark as loaded but empty
+                    continue
+                source_shard_cache[local_shard_idx] = await self.cas.load(source_shard_cid)
+            
+            source_shard_data = source_shard_cache[local_shard_idx]
+
+            if not source_shard_data:
+                continue # This chunk was empty (all fill value)
+
+            # Extract the pointer bytes from the in-memory shard data
+            offset_in_source_shard = index_in_local_shard * store_to_graft._cid_len
+            pointer_bytes = source_shard_data[offset_in_source_shard : offset_in_source_shard + store_to_graft._cid_len]
+            
+            if all(b == 0 for b in pointer_bytes):
+                continue # Skip empty CID slots
+
+            # Calculate global coordinates and write to the main store's index
+            global_coords = tuple(c_local + c_offset for c_local, c_offset in zip(local_coords, chunk_offset))
+            linear_global_index = self._get_linear_chunk_index(global_coords)
+            global_shard_idx, index_in_global_shard = self._get_shard_info(linear_global_index)
+            
+            target_shard_cache = await self._load_or_initialize_shard_cache(global_shard_idx)
+            offset_in_global_shard = index_in_global_shard * self._cid_len
+            
+            target_shard_cache[offset_in_global_shard : offset_in_global_shard + self._cid_len] = pointer_bytes
+            self._dirty_shards.add(global_shard_idx)
+
+        print(f"✓ Grafting complete for store {store_to_graft_cid[:10]}...")
+
+
+
+    async def resize_store(self, new_shape: Tuple[int, ...]):
+        """
+        Resizes the store's main shard index to accommodate a new overall array shape.
+        This is a metadata-only operation on the store's root object.
+        """
+        if self.read_only:
+            raise ValueError("Cannot resize a read-only store.")
+        if self._root_obj is None or self._chunk_shape is None or self._chunks_per_shard is None:
+            raise RuntimeError("Store is not properly initialized for resizing.")
+        if len(new_shape) != len(self._array_shape):
+            raise ValueError("New shape must have the same number of dimensions as the old shape.")
+
+        self._array_shape = tuple(new_shape)
+        self._chunks_per_dim = tuple(
+            math.ceil(a / c) if c > 0 else 0
+            for a, c in zip(self._array_shape, self._chunk_shape)
+        )
+        self._total_chunks = math.prod(self._chunks_per_dim)
+        old_num_shards = self._num_shards if self._num_shards is not None else 0
+        self._num_shards = math.ceil(self._total_chunks / self._chunks_per_shard) if self._total_chunks > 0 else 0
+        self._root_obj["chunks"]["array_shape"] = list(self._array_shape)
+        if self._num_shards > old_num_shards:
+            self._root_obj["chunks"]["shard_cids"].extend([None] * (self._num_shards - old_num_shards))
+        elif self._num_shards < old_num_shards:
+            self._root_obj["chunks"]["shard_cids"] = self._root_obj["chunks"]["shard_cids"][:self._num_shards]
+
+        self._dirty_root = True
+        print(f"Store's internal shard index resized. New main array shape: {self._array_shape}")
+
+
+    async def resize_variable(self, variable_name: str, new_shape: Tuple[int, ...]):
+        """
+        Resizes the Zarr metadata for a specific variable (e.g., '.json' file).
+        This does NOT change the store's main shard index.
+        """
+        if self.read_only:
+            raise ValueError("Cannot resize a read-only store.")
+        if self._root_obj is None:
+            raise RuntimeError("Store is not properly initialized for resizing.")
+
+        # Zarr v2 uses .json, not zarr.json
+        zarr_metadata_key = f"{variable_name}/zarr.json"
+        
+        old_zarr_metadata_cid = self._root_obj["metadata"].get(zarr_metadata_key)
+        if not old_zarr_metadata_cid:
+            raise KeyError(f"Cannot find metadata for key '{zarr_metadata_key}' to resize.")
+
+        old_zarr_metadata_bytes = await self.cas.load(old_zarr_metadata_cid)
+        zarr_metadata_json = json.loads(old_zarr_metadata_bytes)
+        
+        zarr_metadata_json["shape"] = list(new_shape)
+        
+        new_zarr_metadata_bytes = json.dumps(zarr_metadata_json, indent=2).encode('utf-8')
+        # Metadata is a raw blob of bytes
+        new_zarr_metadata_cid = await self.cas.save(new_zarr_metadata_bytes, codec='raw')
+        
+        self._root_obj["metadata"][zarr_metadata_key] = str(new_zarr_metadata_cid)
+        self._dirty_root = True
+        print(f"Resized metadata for variable '{variable_name}'. New shape: {new_shape}")
 
     async def list_dir(self, prefix: str) -> AsyncIterator[str]:
         # This simplified version only works for the root directory (prefix == "") of metadata.
@@ -711,7 +871,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         seen: Set[str] = set()
         if prefix == "":
             async for key in self.list():  # Iterates metadata keys
-                # e.g., if key is "group1/.zgroup" or "array1/.zarray", first_component is "group1" or "array1"
+                # e.g., if key is "group1/.zgroup" or "array1/.json", first_component is "group1" or "array1"
                 # if key is ".zgroup", first_component is ".zgroup"
                 first_component = key.split("/", 1)[0]
                 if first_component not in seen:
@@ -730,6 +890,24 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 if child not in seen:
                     seen.add(child)
                     yield child
+
+    async def _iterate_chunk_cids(self, shard_cid) -> AsyncIterator[str]:
+        """An async generator that yields all non-empty chunk CIDs in the store."""
+        if self._root_obj is None or self._cid_len is None:
+            raise RuntimeError(
+                "Root object not loaded. Call _load_root_from_cid() first."
+            )
+        if not shard_cid:
+            return
+
+        try:
+            shard_data = await self.cas.load(shard_cid)
+            for i in range(0, len(shard_data), self._cid_len):
+                cid_bytes = shard_data[i : i + self._cid_len]
+                if not all(b == 0 for b in cid_bytes):
+                    yield cid_bytes.decode("ascii").rstrip("\x00")
+        except Exception as e:
+            logging.warning(f"Could not process shard {shard_cid} for iteration: {e}")
 
     async def pin_entire_dataset(
         self, target_rpc: str = "http://127.0.0.1:5001"
@@ -763,35 +941,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 continue
 
             # Pin the shard itself
-            print(f"Pinning shard {shard_cid} to {target_rpc}...")
             await self.cas.pin_cid(shard_cid, target_rpc=target_rpc)
-
-            try:
-                # Load shard data to find and pin the chunk CIDs within
-                shard_data = await self.cas.load(shard_cid)
-
-                chunks_pinned = 0
-                for i in range(0, len(shard_data), self._cid_len):
-                    cid_bytes = shard_data[i : i + self._cid_len]
-
-                    if all(b == 0 for b in cid_bytes):  # Skip null/empty CID slots
-                        continue
-                    print(f"Processing chunk CID bytes: {cid_bytes!r}")
-
-                    chunk_cid_str = cid_bytes.decode("ascii").rstrip("\x00")
-                    if chunk_cid_str:
-                        await self.cas.pin_cid(chunk_cid_str, target_rpc=target_rpc)
-                        chunks_pinned += 1
-                print(f"Pinned {chunks_pinned} chunk CIDs in shard {shard_cid}.")
-                print(
-                    f"Total shards processed: {index + 1}/{len(self._root_obj['chunks']['shard_cids'])}"
-                )
-            # Print progress based on amount of shards processed
-            # Catch any exceptions during shard loading or pinning
-            except Exception as e:
-                print(
-                    f"Warning: Could not load or process shard {shard_cid} for pinning: {e}"
-                )
+            chunks_pinned = 0
+            async for chunk_cid in self._iterate_chunk_cids(shard_cid):
+                if chunk_cid:
+                    chunks_pinned += 1
+                    await self.cas.pin_cid(chunk_cid, target_rpc=target_rpc)
 
     async def unpin_entire_dataset(
         self, target_rpc: str = "http://127.0.0.1:5001"
@@ -814,33 +969,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
         for shard_cid in self._root_obj["chunks"]["shard_cids"]:
             if not shard_cid:
                 continue
-
-            try:
-                shard_data = await self.cas.load(shard_cid)
-                # Iterate through the packed CIDs in the shard data
-                for i in range(0, len(shard_data), self._cid_len):
-                    cid_bytes = shard_data[i : i + self._cid_len]
-                    if all(b == 0 for b in cid_bytes):
+            print(f"Unpinning shard {shard_cid} from {target_rpc}...")
+            chunks_pinned = 0
+            async for chunk_cid in self._iterate_chunk_cids(shard_cid):
+                if chunk_cid:
+                    chunks_pinned += 1
+                    try:
+                        await self.cas.unpin_cid(chunk_cid, target_rpc=target_rpc)
+                    except Exception:
+                        print(f"Warning: Could not unpin chunk CID {chunk_cid}. Likely already unpinned.")
                         continue
-
-                    chunk_cid_str = cid_bytes.decode("ascii").rstrip("\x00")
-                    if chunk_cid_str:
-                        try:
-                            await self.cas.unpin_cid(
-                                chunk_cid_str, target_rpc=target_rpc
-                            )
-                        except Exception:
-                            # ignore
-                            continue
-                print(
-                    f"Unpinned all chunk CIDs in shard {shard_cid} from {target_rpc}."
-                )
-            except Exception as e:
-                # Log error but continue to attempt to unpin the shard itself
-                print(
-                    f"Warning: Could not load or process chunks in shard {str(shard_cid)} for unpinning: {e}"
-                )
-            # After unpinning all chunks within, unpin the shard itself
             try:
                 await self.cas.unpin_cid(str(shard_cid), target_rpc=target_rpc)
             except Exception:

@@ -17,5 +17,3 @@ __all__ = [
     "convert_hamt_to_sharded",
     "sharded_converter_cli",
 ]
-
-print("Running py-hamt from source!")
