@@ -433,7 +433,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
     ) -> Optional[zarr.core.buffer.Buffer]:
         if self._root_obj is None or self._cid_len is None:
             raise RuntimeError("Load the root object first before accessing data.")
-        # print('Getting key', key)
+        print('Getting key', key)
 
         chunk_coords = self._parse_chunk_key(key)
         # Metadata request (e.g., ".json")

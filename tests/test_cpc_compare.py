@@ -1,73 +1,86 @@
-# import time
+import time
 
-# import numpy as np
-# import pandas as pd
-# import pytest
-# import xarray as xr
-# from dag_cbor.ipld import IPLDKind
-# from multiformats import CID
+import numpy as np
+import pandas as pd
+import pytest
+import xarray as xr
+from dag_cbor.ipld import IPLDKind
+from multiformats import CID
 
-# # Import both store implementations
-# from py_hamt import HAMT, KuboCAS, FlatZarrStore, ShardedZarrStore
-# from py_hamt.zarr_hamt_store import ZarrHAMTStore
-
-
-# @pytest.mark.asyncio(loop_scope="session")
-# async def test_benchmark_sharded_store():
-#     """Benchmarks write and read performance for the new ShardedZarrStore.""" # Updated docstring
-#     print("\n\n" + "=" * 80)
-#     print("🚀 STARTING BENCHMARK for ShardedZarrStore") # Updated print
-#     print("=" * 80)
+# Import both store implementations
+from py_hamt import HAMT, KuboCAS, ShardedZarrStore
+from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
-#     rpc_base_url = f"https://ipfs-gateway.dclimate.net"
-#     gateway_base_url = f"https://ipfs-gateway.dclimate.net"
-#     headers = {
-#         "X-API-Key": "",
-#     }
+@pytest.mark.asyncio(loop_scope="session")
+async def test_benchmark_sharded_store():
+    """Benchmarks write and read performance for the new ShardedZarrStore.""" # Updated docstring
+    print("\n\n" + "=" * 80)
+    print("🚀 STARTING BENCHMARK for ShardedZarrStore") # Updated print
+    print("=" * 80)
 
-#     async with KuboCAS(
-#         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url, headers=headers
-#     ) as kubo_cas:
-#         # --- Write ---
-#         root_cid = "bafyr4ifjgdfafxfqtdkirmdyzlziswzo5gsxbrivqjzu35ukiixnu2omvm"
-#         print(f"\n--- [ShardedZarr] STARTING READ ---") # Updated print
-#         # --- Read ---
-#         # When opening for read, chunks_per_shard is read from the store's metadata
-#         store_read = await ShardedZarrStore.open( # Use ShardedZarrStore
-#             cas=kubo_cas, read_only=True, root_cid=root_cid
-#         )
-#         print(f"Opened ShardedZarrStore for reading with root CID: {root_cid}")
 
-#         start_read = time.perf_counter()
-#         ipfs_ds = xr.open_zarr(store=store_read)
-#         # Force a read of some data to ensure it's loaded (e.g., first time slice of 'temp' variable)
-#         if "precip" in ipfs_ds.variables and "time" in ipfs_ds.coords:
-#             # _ = ipfs_ds.temp.isel(time=0).values
-#             data_fetched = ipfs_ds.precip.values
+    rpc_base_url = f"https://ipfs-gateway.dclimate.net"
+    gateway_base_url = f"https://ipfs-gateway.dclimate.net"
+    headers = {
+        "X-API-Key": "",
+    }
 
-#             # Calculate the size of the fetched data
-#             data_size = data_fetched.nbytes if data_fetched is not None else 0
-#             print(f"Fetched data size: {data_size / (1024 * 1024):.4f} MB")
-#         elif len(ipfs_ds.data_vars) > 0 : # Fallback: try to read from the first data variable
-#             first_var_name = list(ipfs_ds.data_vars.keys())[0]
-#             # Construct a minimal selection based on available dimensions
-#             selection = {dim: 0 for dim in ipfs_ds[first_var_name].dims}
-#             if selection:
-#                  _ = ipfs_ds[first_var_name].isel(**selection).values
-#             else: # If no dimensions, try loading the whole variable (e.g. scalar)
-#                  _ = ipfs_ds[first_var_name].values
-#         end_read = time.perf_counter()
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url, headers=headers
+    ) as kubo_cas:
+        # --- Write ---
+        root_cid = "bafyr4ienfetuujjqeqhrjvtr6dpcfh2bdowxrofsgl6dz5oknqauhxicie"
+        print(f"\n--- [ShardedZarr] STARTING READ ---") # Updated print
+        # --- Read ---
+        start = time.perf_counter()
+        # When opening for read, chunks_per_shard is read from the store's metadata
+        store_read = await ShardedZarrStore.open( # Use ShardedZarrStore
+            cas=kubo_cas, read_only=True, root_cid=root_cid
+        )
+        stop = time.perf_counter()
+        print(f"Total time to open ShardedZarrStore: {stop - start:.2f} seconds")
+        print(f"Opened ShardedZarrStore for reading with root CID: {root_cid}")
 
-#         print(f"\n--- [ShardedZarr] Read Stats ---") # Updated print
-#         print(f"Total time to open and read some data: {end_read - start_read:.2f} seconds")
-#         print("=" * 80)
-#         # Speed in MB/s
-#         if data_size > 0:
-#             speed = data_size / (end_read - start_read) / (1024 * 1024)
-#             print(f"Read speed: {speed:.2f} MB/s")
-#         else:
-#             print("No data fetched, cannot calculate speed.")
+        start_read = time.perf_counter()
+        ipfs_ds = xr.open_zarr(store=store_read)
+        start_read = time.perf_counter()
+        print(ipfs_ds)
+        stop_read = time.perf_counter()
+        print(f"Total time to read dataset: {stop_read - start_read:.2f} seconds")
+        # start_read = time.perf_counter()
+        # print(ipfs_ds.variables, ipfs_ds.coords)  # Print available variables and coordinates for debugging
+        # stop_read = time.perf_counter()
+        # print(f"Total time to read dataset variables and coordinates: {stop_read - start_read:.2f} seconds")
+        start_read = time.perf_counter()
+        # Force a read of some data to ensure it's loaded (e.g., first time slice of 'temp' variable)
+        if "2m_temperature" in ipfs_ds.variables and "time" in ipfs_ds.coords:
+            print("Fetching '2m_temperature' data...")
+            data_fetched = ipfs_ds["2m_temperature"].isel(time=0).values
+            # data_fetched = ipfs_ds["2m_temperature"].values
+
+            # Calculate the size of the fetched data
+            data_size = data_fetched.nbytes if data_fetched is not None else 0
+            print(f"Fetched data size: {data_size / (1024 * 1024):.4f} MB")
+        elif len(ipfs_ds.data_vars) > 0 : # Fallback: try to read from the first data variable
+            first_var_name = list(ipfs_ds.data_vars.keys())[0]
+            # Construct a minimal selection based on available dimensions
+            selection = {dim: 0 for dim in ipfs_ds[first_var_name].dims}
+            if selection:
+                 _ = ipfs_ds[first_var_name].isel(**selection).values
+            else: # If no dimensions, try loading the whole variable (e.g. scalar)
+                 _ = ipfs_ds[first_var_name].values
+        end_read = time.perf_counter()
+
+        print(f"\n--- [ShardedZarr] Read Stats ---") # Updated print
+        print(f"Total time to open and read some data: {end_read - start_read:.2f} seconds")
+        print("=" * 80)
+        # Speed in MB/s
+        if data_size > 0:
+            speed = data_size / (end_read - start_read) / (1024 * 1024)
+            print(f"Read speed: {speed:.2f} MB/s")
+        else:
+            print("No data fetched, cannot calculate speed.")
 
 # # ###
 # # BENCHMARK FOR THE ORIGINAL ZarrHAMTStore
