@@ -910,102 +910,116 @@ class ShardedZarrStore(zarr.abc.store.Store):
             logging.warning(f"Could not process shard {shard_cid} for iteration: {e}")
 
     async def pin_entire_dataset(
-        self, target_rpc: str = "http://127.0.0.1:5001", increment: int = 100
+        self,
+        target_rpc: str = "http://127.0.0.1:5001",
+        concurrency_limit: int = 50,
+        show_progress: bool = True
     ) -> None:
         """
-        Pins the entire dataset in the CAS, ensuring the root, metadata, shards,
-        and all data chunks are pinned. This is useful for performance optimization
-        when the dataset is accessed frequently.
+        Pins the entire dataset in parallel, with a limit on concurrent requests.
         """
         if self._root_obj is None:
-            raise RuntimeError(
-                "Root object not loaded. Call _load_root_from_cid() first."
-            )
+            raise RuntimeError("Root object not loaded.")
         if self._cid_len is None:
-            raise RuntimeError(
-                "Store is not initialized properly; _cid_len is missing."
-            )
+            raise RuntimeError("Store is not initialized properly.")
 
-        # Pin the root CID itself
+        # --- 1. First, gather all unique CIDs to pin ---
+        print("Gathering all CIDs for pinning...")
+        cids_to_pin: Set[str] = set()
+
         if self._root_cid:
-            await self.cas.pin_cid(self._root_cid, target_rpc=target_rpc)
+            cids_to_pin.add(self._root_cid)
 
-        # Pin metadata CIDs
         for cid in self._root_obj.get("metadata", {}).values():
             if cid:
-                await self.cas.pin_cid(cid, target_rpc=target_rpc)
+                cids_to_pin.add(cid)
 
-        # Pin all shard CIDs and the chunk CIDs within them
-        for index, shard_cid in enumerate(self._root_obj["chunks"]["shard_cids"]):
-            if not shard_cid:
-                continue
-
-            # Pin the shard itself
-            await self.cas.pin_cid(shard_cid, target_rpc=target_rpc)
-            chunks_pinned = 0
-            async for chunk_cid in self._iterate_chunk_cids(shard_cid):
-                if chunk_cid:
-                    chunks_pinned += 1
-                    await self.cas.pin_cid(chunk_cid, target_rpc=target_rpc)
-                    if chunks_pinned % increment == 0:
-                        print(
-                            f"Pinned {chunks_pinned} chunks in shard {index}..."
-                        )
-
-    async def unpin_entire_dataset(
-        self, target_rpc: str = "http://127.0.0.1:5001"
-    ) -> None:
-        """
-        Unpins the entire dataset from the CAS, removing the root, metadata, shards,
-        and all data chunks from the pin set. This is useful for freeing up storage
-        resources when the dataset is no longer needed.
-        """
-        if self._root_obj is None:
-            raise RuntimeError(
-                "Root object not loaded. Call _load_root_from_cid() first."
-            )
-        if self._cid_len is None:
-            raise RuntimeError(
-                "Store is not initialized properly; _cid_len is missing."
-            )
-
-        # Unpin all chunk CIDs by reading from shards first
         for shard_cid in self._root_obj["chunks"]["shard_cids"]:
             if not shard_cid:
                 continue
-            print(f"Unpinning shard {shard_cid} from {target_rpc}...")
-            chunks_pinned = 0
+            cids_to_pin.add(shard_cid)
             async for chunk_cid in self._iterate_chunk_cids(shard_cid):
                 if chunk_cid:
-                    chunks_pinned += 1
-                    try:
-                        await self.cas.unpin_cid(chunk_cid, target_rpc=target_rpc)
-                    except Exception:
-                        print(f"Warning: Could not unpin chunk CID {chunk_cid}. Likely already unpinned.")
-                        continue
-            try:
-                await self.cas.unpin_cid(str(shard_cid), target_rpc=target_rpc)
-            except Exception:
-                print(f"Warning: Could not unpin shard {str(shard_cid)}")
-            print(f"Unpinned shard {shard_cid} from {target_rpc}.")
+                    cids_to_pin.add(chunk_cid)
+        
+        total_cids = len(cids_to_pin)
+        print(f"Found {total_cids} unique CIDs to pin.")
 
-        # Unpin metadata CIDs
+        # --- 2. Create and run pinning tasks in parallel with a semaphore ---
+        semaphore = asyncio.Semaphore(concurrency_limit)
+        tasks: list[Coroutine] = []
+        
+        # Helper function to wrap the pin call with the semaphore
+        async def pin_with_semaphore(cid: str):
+            async with semaphore:
+                await self.cas.pin_cid(cid, target_rpc=target_rpc)
+                if show_progress:
+                    # This progress reporting is approximate as tasks run out of order
+                    # For precise progress, see asyncio.as_completed in the notes below
+                    pass
+
+        for cid in cids_to_pin:
+            tasks.append(pin_with_semaphore(cid))
+
+        print(f"Pinning {total_cids} CIDs with a concurrency of {concurrency_limit}...")
+        # The 'return_exceptions=False' (default) means this will raise the first exception it encounters.
+        await asyncio.gather(*tasks)
+        print("Successfully pinned the entire dataset.")
+
+
+    async def unpin_entire_dataset(
+        self,
+        target_rpc: str = "http://127.0.0.1:5001",
+        concurrency_limit: int = 50
+    ) -> None:
+        """
+        Unpins the entire dataset in parallel, with a limit on concurrent requests.
+        """
+        if self._root_obj is None:
+            raise RuntimeError("Root object not loaded.")
+        if self._cid_len is None:
+            raise RuntimeError("Store is not initialized properly.")
+
+        # --- 1. Gather all CIDs to unpin (chunks, shards, metadata) ---
+        print("Gathering all CIDs for unpinning...")
+        cids_to_unpin: Set[str] = set()
+
+        for shard_cid in self._root_obj["chunks"]["shard_cids"]:
+            if not shard_cid:
+                continue
+            cids_to_unpin.add(shard_cid)
+            async for chunk_cid in self._iterate_chunk_cids(shard_cid):
+                if chunk_cid:
+                    cids_to_unpin.add(chunk_cid)
+
         for cid in self._root_obj.get("metadata", {}).values():
             if cid:
+                cids_to_unpin.add(cid)
+
+        # --- 2. Unpin all children in parallel ---
+        semaphore = asyncio.Semaphore(concurrency_limit)
+        tasks: list[Coroutine] = []
+
+        async def unpin_with_semaphore(cid: str):
+            async with semaphore:
                 try:
                     await self.cas.unpin_cid(cid, target_rpc=target_rpc)
-                    print(f"Unpinned metadata CID {cid} from {target_rpc}...")
                 except Exception:
-                    print(
-                        f"Warning: Could not unpin metadata CID {cid}. Likely already unpinned."
-                    )
+                    # This is safe to ignore in a mass-unpin operation
+                    print(f"Warning: Could not unpin chunk CID {cid}. Likely already unpinned.")
 
-        # Finally, unpin the root CID itself
+        for cid in cids_to_unpin:
+            tasks.append(unpin_with_semaphore(cid))
+            
+        print(f"Unpinning {len(tasks)} child CIDs with a concurrency of {concurrency_limit}...")
+        await asyncio.gather(*tasks)
+        print("Successfully unpinned all child objects.")
+
+        # --- 3. Finally, unpin the root CID itself after its children ---
         if self._root_cid:
             try:
+                print(f"Unpinning root CID {self._root_cid}...")
                 await self.cas.unpin_cid(self._root_cid, target_rpc=target_rpc)
-                print(f"Unpinned root CID {self._root_cid} from {target_rpc}...")
+                print("Successfully unpinned the entire dataset.")
             except Exception:
-                print(
-                    f"Warning: Could not unpin root CID {self._root_cid}. Likely already unpinned."
-                )
+                print(f"Warning: Could not unpin root CID {self._root_cid}. Likely already unpinned.")

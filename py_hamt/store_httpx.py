@@ -175,6 +175,7 @@ class KuboCAS(ContentAddressedStore):
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
         pinOnAdd: bool = False,
+        chunker: str | None = None,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
@@ -231,9 +232,12 @@ class KuboCAS(ContentAddressedStore):
 
         pinString: str = "true" if pinOnAdd else "false"
 
-        self.rpc_url: str = (
-            f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin={pinString}"
-        )
+        rpc_url = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&pin={pinString}"
+        if chunker:
+            rpc_url += f"&chunker={chunker}"
+
+        self.rpc_url = rpc_url
+        
         """@private"""
         self.gateway_base_url: str = gateway_base_url
         """@private"""
@@ -391,7 +395,7 @@ class KuboCAS(ContentAddressedStore):
             cid (CID): The Content ID to pin.
             name (Optional[str]): An optional name for the pin.
         """
-        params = {"arg": str(cid), "recursive": "false"}
+        params = {"arg": str(cid), "recursive": "true"}
         pin_add_url_base: str = f"{target_rpc}/api/v0/pin/add"
 
         async with self._sem:  # throttle RPC
@@ -414,7 +418,7 @@ class KuboCAS(ContentAddressedStore):
         Args:
             cid (CID): The Content ID to unpin.
         """
-        params = {"arg": str(cid), "recursive": "false"}
+        params = {"arg": str(cid), "recursive": "true"}
         unpin_url_base: str = f"{target_rpc}/api/v0/pin/rm"
         async with self._sem:  # throttle RPC
             client = self._loop_client()
