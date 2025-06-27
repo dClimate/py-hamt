@@ -910,7 +910,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             logging.warning(f"Could not process shard {shard_cid} for iteration: {e}")
 
     async def pin_entire_dataset(
-        self, target_rpc: str = "http://127.0.0.1:5001"
+        self, target_rpc: str = "http://127.0.0.1:5001", increment: int = 100
     ) -> None:
         """
         Pins the entire dataset in the CAS, ensuring the root, metadata, shards,
@@ -947,6 +947,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 if chunk_cid:
                     chunks_pinned += 1
                     await self.cas.pin_cid(chunk_cid, target_rpc=target_rpc)
+                    if chunks_pinned % increment == 0:
+                        print(
+                            f"Pinned {chunks_pinned} chunks in shard {index}..."
+                        )
 
     async def unpin_entire_dataset(
         self, target_rpc: str = "http://127.0.0.1:5001"
