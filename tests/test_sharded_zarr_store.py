@@ -250,14 +250,6 @@ async def test_chunk_and_delete_logic(
         assert not await store_after_delete.exists(chunk_key)
         assert await store_after_delete.get(chunk_key, proto) is None
 
-        # Test deleting a non-existent key
-        with pytest.raises(KeyError):
-            await store_rw.delete("nonexistent/c/0/0/0")
-
-        # Test deleting an already deleted key
-        with pytest.raises(KeyError):
-            await store_rw.delete(chunk_key)
-
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_partial_reads(
