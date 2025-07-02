@@ -10,7 +10,7 @@ from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 
 async def convert_hamt_to_sharded(
-    cas: KuboCAS, hamt_root_cid: str, chunks_per_shard: int, cid_len: int = 59
+    cas: KuboCAS, hamt_root_cid: str, chunks_per_shard: int
 ) -> str:
     """
     Converts a Zarr dataset from a HAMT-based store to a ShardedZarrStore.
@@ -52,7 +52,6 @@ async def convert_hamt_to_sharded(
         array_shape=array_shape,
         chunk_shape=chunk_shape,
         chunks_per_shard=chunks_per_shard,
-        cid_len=cid_len,
     )
 
     print("Destination store initialized.")
