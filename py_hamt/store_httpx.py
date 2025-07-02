@@ -141,6 +141,7 @@ class KuboCAS(ContentAddressedStore):
         *,
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
+        chunker: str | None = None,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
@@ -199,6 +200,9 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
         self.gateway_base_url: str = gateway_base_url
         """@private"""
+
+        if chunker:
+            self.rpc_url += f"&chunker={chunker}"
 
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 
