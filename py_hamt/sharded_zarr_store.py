@@ -385,7 +385,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # CHANGED: Logic is simplified to not use byte offsets. It relies on the full-shard cache.
         if self._root_obj is None:
             raise RuntimeError("Load the root object first before accessing data.")
-        print('Getting key', key)
+        # print('Getting key', key)
 
         chunk_coords = self._parse_chunk_key(key)
         # Metadata request
