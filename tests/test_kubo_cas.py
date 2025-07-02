@@ -143,3 +143,23 @@ async def test_kubo_cas(create_ipfs, data: IPLDKind):  # noqa
                 cid = await kubo_cas.save(dag_cbor.encode(data), codec=codec_typed)
                 result = dag_cbor.decode(await kubo_cas.load(cid))
                 assert data == result
+
+
+def test_chunker_valid_patterns():
+    valid = ["size-1", "size-1024", "rabin", "rabin-16-32-64"]
+    for chunker in valid:
+        cas = KuboCAS(
+            chunker=chunker,
+            rpc_base_url="http://127.0.0.1:5001",
+            gateway_base_url="http://127.0.0.1:8080",
+        )
+        assert f"chunker={chunker}" in cas.rpc_url
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["", "size-0", "size--1", "rabin-1-2", "foo", "rabin-1-2-0"],
+)
+def test_chunker_invalid_patterns(invalid):
+    with pytest.raises(ValueError, match="Invalid chunker specification"):
+        KuboCAS(chunker=invalid)

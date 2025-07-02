@@ -1,4 +1,5 @@
 import asyncio
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Literal, Tuple, cast
 
@@ -120,6 +121,9 @@ class KuboCAS(ContentAddressedStore):
       for the internally-created client.
     - **rpc_base_url / gateway_base_url** (str | None): override daemon
       endpoints (defaults match the local daemon ports).
+    - **chunker** (str): chunking algorithm specification for Kubo's `add`
+      RPC. Accepted formats are `"size-<positive int>"`, `"rabin"`, or
+      `"rabin-<min>-<avg>-<max>"`.
 
     ...
     """
@@ -179,6 +183,11 @@ class KuboCAS(ContentAddressedStore):
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
 
+        chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
+        if re.fullmatch(chunker_pattern, chunker) is None:
+            raise ValueError("Invalid chunker specification")
+        self.chunker: str = chunker
+
         self.hasher: str = hasher
         """The hash function to send to IPFS when storing bytes. Cannot be changed after initialization. The default blake3 follows the default hashing algorithm used by HAMT."""
 
@@ -196,7 +205,7 @@ class KuboCAS(ContentAddressedStore):
         else:
             gateway_base_url = f"{gateway_base_url}/ipfs/"
 
-        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={chunker}&pin=false"
+        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin=false"
         """@private"""
         self.gateway_base_url: str = gateway_base_url
         """@private"""
