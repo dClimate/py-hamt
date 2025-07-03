@@ -627,7 +627,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
             self._root_obj["chunks"]["shard_cids"] = self._root_obj["chunks"]["shard_cids"][:self._num_shards]
 
         self._dirty_root = True
-        print(f"Store's internal shard index resized. New main array shape: {self._array_shape}")
 
 
     async def resize_variable(self, variable_name: str, new_shape: Tuple[int, ...]):

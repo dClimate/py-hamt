@@ -93,7 +93,7 @@ async def sharded_converter_cli():
     parser.add_argument(
         "--chunks-per-shard",
         type=int,
-        default=1024,
+        default=6250,
         help="Number of chunk CIDs to store per shard in the new store.",
     )
     parser.add_argument(
