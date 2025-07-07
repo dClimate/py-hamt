@@ -98,7 +98,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
         array_shape: Optional[Tuple[int, ...]] = None,
         chunk_shape: Optional[Tuple[int, ...]] = None,
         chunks_per_shard: Optional[int] = None,
-        # REMOVED: cid_len is no longer needed.
     ) -> "ShardedZarrStore":
         """
         Asynchronously opens an existing ShardedZarrStore or initializes a new one.
