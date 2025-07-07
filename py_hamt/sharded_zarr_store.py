@@ -6,6 +6,7 @@ import json
 import itertools
 import logging 
 
+from collections import defaultdict
 import dag_cbor
 from multiformats.cid import CID
 import zarr.abc.store
@@ -49,6 +50,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # It starts in the "set" state, allowing all operations to proceed.
         self._resize_complete = asyncio.Event()
         self._resize_complete.set()
+
+        self._shard_locks = defaultdict(asyncio.Lock)
 
         self._shard_data_cache: Dict[
             int, list[Optional[CID]]
@@ -443,11 +446,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         await self._resize_complete.wait()
 
-        print("Setting key:", key, "with", self._array_shape)
-
         if key.endswith("zarr.json") and not key.startswith("time/") and not key.startswith(("lat/", "latitude/")) and not key.startswith(("lon/", "longitude/")) and not len(key) == 9:
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
-            print("setting metadata for key:", key, "with value:", metadata_json)
             new_array_shape = metadata_json.get("shape")
             if not new_array_shape:
                 raise ValueError("Shape not found in metadata.")
@@ -488,11 +488,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
         linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
         shard_idx, index_in_shard = self._get_shard_info(linear_chunk_index)
 
-        target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
-        
-        if target_shard_list[index_in_shard] != pointer_cid_obj:
-            target_shard_list[index_in_shard] = pointer_cid_obj
-            self._dirty_shards.add(shard_idx)
+        shard_lock = self._shard_locks[shard_idx]
+        async with shard_lock:
+            target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
+            
+            if target_shard_list[index_in_shard] != pointer_cid_obj:
+                target_shard_list[index_in_shard] = pointer_cid_obj
+                self._dirty_shards.add(shard_idx)
 
     # ... (Keep exists method, but simplify it) ...
     async def exists(self, key: str) -> bool:

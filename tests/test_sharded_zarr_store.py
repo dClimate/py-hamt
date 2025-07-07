@@ -41,8 +41,8 @@ async def test_sharded_zarr_store_write_read(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-    ordered_dims = list(test_ds.dims)
-    array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
 
     async with KuboCAS(
@@ -66,6 +66,78 @@ async def test_sharded_zarr_store_write_read(
         )
         ds_read = xr.open_zarr(store=store_read)
         xr.testing.assert_identical(test_ds, ds_read)
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_append(
+    create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
+):
+    """
+    Tests appending data to an existing Zarr dataset in the ShardedZarrStore,
+    which specifically exercises the store resizing logic.
+    """
+    rpc_base_url, gateway_base_url = create_ipfs
+    initial_ds = random_zarr_dataset
+
+    # The main data variable we are sharding
+    main_variable = "temp"
+    
+    ordered_dims = list(initial_ds.sizes)
+    array_shape_tuple = tuple(initial_ds.sizes[dim] for dim in ordered_dims)
+    chunk_shape_tuple = tuple(initial_ds.chunks[dim][0] for dim in ordered_dims)
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # 1. --- Write Initial Dataset ---
+        store_write = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=array_shape_tuple,
+            chunk_shape=chunk_shape_tuple,
+            chunks_per_shard=10,
+        )
+        initial_ds.to_zarr(store=store_write, mode="w")
+        initial_cid = await store_write.flush()
+        assert initial_cid is not None
+
+        # 2. --- Prepare Data to Append ---
+        # Create a new dataset with 50 more time steps
+        append_times = pd.date_range(initial_ds.time[-1].values + pd.Timedelta(days=1), periods=50)
+        append_temp = np.random.randn(len(append_times), len(initial_ds.lat), len(initial_ds.lon))
+        
+        append_ds = xr.Dataset(
+            {
+                "temp": (["time", "lat", "lon"], append_temp),
+            },
+            coords={"time": append_times, "lat": initial_ds.lat, "lon": initial_ds.lon},
+        ).chunk({"time": 20, "lat": 18, "lon": 36})
+
+        # 3. --- Perform Append Operation ---
+        store_append = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            root_cid=initial_cid,
+        )
+        append_ds.to_zarr(store=store_append, mode="a", append_dim="time")
+        final_cid = await store_append.flush()
+        print(f"Data written to ShardedZarrStore with root CID: {final_cid}")
+        assert final_cid is not None
+        assert final_cid != initial_cid
+
+        # 4. --- Verify the Final Dataset ---
+        store_read = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=True,
+            root_cid=final_cid,
+        )
+        final_ds_read = xr.open_zarr(store=store_read)
+
+        # The expected result is the concatenation of the two datasets
+        expected_final_ds = xr.concat([initial_ds, append_ds], dim="time")
+
+        # Verify that the data read from the store is identical to the expected result
+        xr.testing.assert_identical(expected_final_ds, final_ds_read)
+        print("\n✅ Append test successful! Data verified.")
 
 
 @pytest.mark.asyncio
@@ -110,8 +182,8 @@ async def test_sharded_zarr_store_metadata(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-    ordered_dims = list(test_ds.dims)
-    array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
 
     async with KuboCAS(
@@ -161,8 +233,8 @@ async def test_sharded_zarr_store_chunks(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-    ordered_dims = list(test_ds.dims)
-    array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
 
     async with KuboCAS(
@@ -209,8 +281,8 @@ async def test_chunk_and_delete_logic(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-    ordered_dims = list(test_ds.dims)
-    array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
 
     async with KuboCAS(
@@ -261,8 +333,8 @@ async def test_sharded_zarr_store_partial_reads(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-    ordered_dims = list(test_ds.dims)
-    array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
 
     async with KuboCAS(
@@ -302,8 +374,8 @@ async def test_partial_reads_and_errors(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-    ordered_dims = list(test_ds.dims)
-    array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
 
     async with KuboCAS(
@@ -399,8 +471,8 @@ async def test_listing_and_metadata(
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
 
-    ordered_dims = list(test_ds.dims)
-    array_shape_tuple = tuple(test_ds.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
 
     async with KuboCAS(
