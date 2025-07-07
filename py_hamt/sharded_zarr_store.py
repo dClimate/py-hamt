@@ -447,6 +447,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         if key.endswith("zarr.json") and not key.startswith("time/") and not key.startswith(("lat/", "latitude/")) and not key.startswith(("lon/", "longitude/")) and not len(key) == 9:
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
+            print("setting metadata for key:", key, "with value:", metadata_json)
             new_array_shape = metadata_json.get("shape")
             if not new_array_shape:
                 raise ValueError("Shape not found in metadata.")
