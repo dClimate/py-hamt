@@ -443,7 +443,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         await self._resize_complete.wait()
 
-        print("Setting key:", key, "with", self.array_shape)
+        print("Setting key:", key, "with", self._array_shape)
 
         if key.endswith("zarr.json") and not key.startswith("time/") and not key.startswith(("lat/", "latitude/")) and not key.startswith(("lon/", "longitude/")) and not len(key) == 9:
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
