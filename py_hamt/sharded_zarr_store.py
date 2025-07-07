@@ -43,7 +43,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._root_cid = root_cid
         self._root_obj: Optional[dict] = None
 
-        # CHANGED: The cache now stores a list of CID objects or None, not a bytearray.
+        self._resize_lock = asyncio.Lock()
+        
+        # An event to signal when a resize is in-progress.
+        # It starts in the "set" state, allowing all operations to proceed.
+        self._resize_complete = asyncio.Event()
+        self._resize_complete.set()
+
         self._shard_data_cache: Dict[
             int, list[Optional[CID]]
         ] = {}
@@ -52,8 +58,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
             int, asyncio.Task
         ] = {}
 
-        # REMOVED: _cid_len is no longer needed with structured DAG-CBOR shards.
-        # self._cid_len: Optional[int] = None
         self._array_shape: Optional[Tuple[int, ...]] = None
         self._chunk_shape: Optional[Tuple[int, ...]] = None
         self._chunks_per_dim: Optional[Tuple[int, ...]] = None
@@ -436,14 +440,32 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise ValueError("Cannot write to a read-only store.")
         if self._root_obj is None:
             raise RuntimeError("Store not initialized for writing. Call open() first.")
-        
-        if key.endswith("zarr.json") and not key.startswith("time/") and not key.startswith(("lat/", "latitude/")) and not key.startswith(("lon/", "longitude/")) and not len(key) == 9:
+
+        await self._resize_complete.wait()
+
+        is_main_metadata = (
+            key.endswith("zarr.json") and
+            not any(key.startswith(prefix) for prefix in ["time/", "lat/", "lon/", "latitude/", "longitude/"]) and
+            len(key.split('/')) == 1 # Ensures it's the root zarr.json
+        )
+
+        if is_main_metadata:
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
             new_array_shape = metadata_json.get("shape")
             if not new_array_shape:
                 raise ValueError("Shape not found in metadata.")
             if tuple(new_array_shape) != self._array_shape:
-                await self.resize_store(new_shape=tuple(new_array_shape))  
+                async with self._resize_lock:
+                    # Double-check after acquiring the lock, in case another task
+                    # just finished this exact resize while we were waiting.
+                    if tuple(new_array_shape) != self._array_shape:
+                        # Block all other tasks until resize is complete.
+                        self._resize_complete.clear()
+                        try:
+                            await self.resize_store(new_shape=tuple(new_array_shape)) 
+                        finally:
+                            # All waiting tasks will now un-pause and proceed safely.
+                            self._resize_complete.set()
 
         raw_data_bytes = value.to_bytes()
         # Save the data to CAS first to get its CID.
@@ -573,7 +595,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
         store_to_graft = await ShardedZarrStore.open(cas=self.cas, read_only=True, root_cid=store_to_graft_cid)
         if store_to_graft._root_obj is None or store_to_graft._chunks_per_dim is None:
              raise ValueError("Store to graft could not be loaded or is not configured.")
-
         source_chunk_grid = store_to_graft._chunks_per_dim
         for local_coords in itertools.product(*[range(s) for s in source_chunk_grid]):
             linear_local_index = store_to_graft._get_linear_chunk_index(local_coords)
