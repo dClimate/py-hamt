@@ -413,7 +413,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
             return None
 
         # This will load the full shard into cache if it's not already there.
-        target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
+        shard_lock = self._shard_locks[shard_idx]
+        async with shard_lock:
+            target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
 
         # Get the CID object (or None) from the cached list.
         chunk_cid_obj = target_shard_list[index_in_shard]
@@ -557,11 +559,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if not (0 <= shard_idx < self._num_shards if self._num_shards is not None else 0):
             raise KeyError(f"Chunk key '{key}' is out of bounds.")
 
-        target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
         
-        if target_shard_list[index_in_shard] is not None:
-            target_shard_list[index_in_shard] = None
-            self._dirty_shards.add(shard_idx)
+        shard_lock = self._shard_locks[shard_idx]
+        async with shard_lock:
+            target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
+            
+            if target_shard_list[index_in_shard] is not None:
+                target_shard_list[index_in_shard] = None
+                self._dirty_shards.add(shard_idx)
 
     # ... (Keep listing methods as they are, they operate on metadata) ...
     @property
@@ -611,11 +616,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
             linear_global_index = self._get_linear_chunk_index(global_coords)
             global_shard_idx, index_in_global_shard = self._get_shard_info(linear_global_index)
             
-            target_shard_list = await self._load_or_initialize_shard_cache(global_shard_idx)
-            
-            if target_shard_list[index_in_global_shard] != pointer_cid_obj:
-                target_shard_list[index_in_global_shard] = pointer_cid_obj
-                self._dirty_shards.add(global_shard_idx)
+            shard_lock = self._shard_locks[global_shard_idx]
+            async with shard_lock:
+                target_shard_list = await self._load_or_initialize_shard_cache(global_shard_idx)
+                
+                if target_shard_list[index_in_global_shard] != pointer_cid_obj:
+                    target_shard_list[index_in_global_shard] = pointer_cid_obj
+                    self._dirty_shards.add(global_shard_idx)
 
         print(f"✓ Grafting complete for store {store_to_graft_cid[:10]}...")
 
