@@ -443,13 +443,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         await self._resize_complete.wait()
 
-        is_main_metadata = (
-            key.endswith("zarr.json") and
-            not any(key.startswith(prefix) for prefix in ["time/", "lat/", "lon/", "latitude/", "longitude/"]) and
-            len(key.split('/')) == 1 # Ensures it's the root zarr.json
-        )
-
-        if is_main_metadata:
+        if key.endswith("zarr.json") and not key.startswith("time/") and not key.startswith(("lat/", "latitude/")) and not key.startswith(("lon/", "longitude/")) and not len(key) == 9:
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
             new_array_shape = metadata_json.get("shape")
             if not new_array_shape:
