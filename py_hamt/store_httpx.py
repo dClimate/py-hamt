@@ -237,7 +237,7 @@ class KuboCAS(ContentAddressedStore):
             rpc_url += f"&chunker={chunker}"
 
         self.rpc_url = rpc_url
-        
+
         """@private"""
         self.gateway_base_url: str = gateway_base_url
         """@private"""

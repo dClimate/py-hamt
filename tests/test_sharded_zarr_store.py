@@ -67,6 +67,7 @@ async def test_sharded_zarr_store_write_read(
         ds_read = xr.open_zarr(store=store_read)
         xr.testing.assert_identical(test_ds, ds_read)
 
+
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_append(
     create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
@@ -78,9 +79,6 @@ async def test_sharded_zarr_store_append(
     rpc_base_url, gateway_base_url = create_ipfs
     initial_ds = random_zarr_dataset
 
-    # The main data variable we are sharding
-    main_variable = "temp"
-    
     ordered_dims = list(initial_ds.sizes)
     array_shape_tuple = tuple(initial_ds.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(initial_ds.chunks[dim][0] for dim in ordered_dims)
@@ -102,9 +100,13 @@ async def test_sharded_zarr_store_append(
 
         # 2. --- Prepare Data to Append ---
         # Create a new dataset with 50 more time steps
-        append_times = pd.date_range(initial_ds.time[-1].values + pd.Timedelta(days=1), periods=50)
-        append_temp = np.random.randn(len(append_times), len(initial_ds.lat), len(initial_ds.lon))
-        
+        append_times = pd.date_range(
+            initial_ds.time[-1].values + pd.Timedelta(days=1), periods=50
+        )
+        append_temp = np.random.randn(
+            len(append_times), len(initial_ds.lat), len(initial_ds.lon)
+        )
+
         append_ds = xr.Dataset(
             {
                 "temp": (["time", "lat", "lon"], append_temp),
