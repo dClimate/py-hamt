@@ -217,6 +217,13 @@ class KuboCAS(ContentAddressedStore):
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
 
+        self._owns_client: bool = False
+        self._closed: bool = True
+        self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+        self._default_headers = headers
+        self._default_auth = auth
+
+        # Now, perform validation that might raise an exception
         chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
         if re.fullmatch(chunker_pattern, chunker) is None:
             raise ValueError("Invalid chunker specification")
@@ -245,21 +252,15 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url: str = gateway_base_url
         """@private"""
 
-        self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
-
         if client is not None:
             # user supplied → bind it to *their* current loop
             self._client_per_loop[asyncio.get_running_loop()] = client
-            self._owns_client: bool = False
+            self._owns_client = False
         else:
             self._owns_client = True  # we'll create clients lazily
 
-        # store for later use by _loop_client()
-        self._default_headers = headers
-        self._default_auth = auth
-
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-        self._closed: bool = False
+        self._closed = False
 
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #

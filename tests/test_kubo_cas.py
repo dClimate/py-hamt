@@ -162,5 +162,5 @@ async def test_chunker_valid_patterns():
 )
 async def test_chunker_invalid_patterns(invalid):
     with pytest.raises(ValueError, match="Invalid chunker specification"):
-        async with KuboCAS(chunker=invalid) as cas:
+        async with KuboCAS(chunker=invalid):
             pass
