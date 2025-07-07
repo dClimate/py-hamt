@@ -36,8 +36,8 @@ async def convert_hamt_to_sharded(
     print("Reading metadata from source store...")
 
     # Read the stores metadata to get array shape and chunk shape
-    ordered_dims = list(source_dataset.dims)
-    array_shape_tuple = tuple(source_dataset.dims[dim] for dim in ordered_dims)
+    ordered_dims = list(source_dataset.sizes)
+    array_shape_tuple = tuple(source_dataset.sizes[dim] for dim in ordered_dims)
     chunk_shape_tuple = tuple(source_dataset.chunks[dim][0] for dim in ordered_dims)
     array_shape = array_shape_tuple
     chunk_shape = chunk_shape_tuple
