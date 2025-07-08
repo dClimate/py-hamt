@@ -790,3 +790,126 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
             await ShardedZarrStore.open(
                 cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
             )
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_lazy_concat(
+    create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
+):
+    """
+    Tests lazy concatenation of two xarray datasets stored in separate ShardedZarrStores,
+    ensuring the combined dataset can be queried as a single dataset with data fetched
+    correctly from the respective stores.
+    """
+    rpc_base_url, gateway_base_url = create_ipfs
+    base_ds = random_zarr_dataset
+
+    # 1. --- Prepare Two Datasets with Distinct Time Ranges ---
+    # First dataset: August 1, 2024 to September 30, 2024 (61 days)
+    aug_sep_times = pd.date_range("2024-08-01", "2024-09-30", freq="D")
+    aug_sep_temp = np.random.randn(len(aug_sep_times), len(base_ds.lat), len(base_ds.lon))
+    ds1 = xr.Dataset(
+        {
+            "temp": (["time", "lat", "lon"], aug_sep_temp),
+        },
+        coords={"time": aug_sep_times, "lat": base_ds.lat, "lon": base_ds.lon},
+    ).chunk({"time": 20, "lat": 18, "lon": 36})
+
+    # Second dataset: October 1, 2024 to November 30, 2024 (61 days)
+    oct_nov_times = pd.date_range("2024-10-01", "2024-11-30", freq="D")
+    oct_nov_temp = np.random.randn(len(oct_nov_times), len(base_ds.lat), len(base_ds.lon))
+    ds2 = xr.Dataset(
+        {
+            "temp": (["time", "lat", "lon"], oct_nov_temp),
+        },
+        coords={"time": oct_nov_times, "lat": base_ds.lat, "lon": base_ds.lon},
+    ).chunk({"time": 20, "lat": 18, "lon": 36})
+
+    # Expected concatenated dataset for verification
+    expected_combined_ds = xr.concat([ds1, ds2], dim="time")
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # 2. --- Write First Dataset to ShardedZarrStore ---
+        ordered_dims = list(ds1.sizes)
+        array_shape_tuple = tuple(ds1.sizes[dim] for dim in ordered_dims)
+        chunk_shape_tuple = tuple(ds1.chunks[dim][0] for dim in ordered_dims)
+
+        store1_write = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=array_shape_tuple,
+            chunk_shape=chunk_shape_tuple,
+            chunks_per_shard=64,
+        )
+        ds1.to_zarr(store=store1_write, mode="w")
+        root_cid1 = await store1_write.flush()
+        assert root_cid1 is not None
+
+        # 3. --- Write Second Dataset to ShardedZarrStore ---
+        array_shape_tuple = tuple(ds2.sizes[dim] for dim in ordered_dims)
+        store2_write = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=array_shape_tuple,
+            chunk_shape=chunk_shape_tuple,
+            chunks_per_shard=64,
+        )
+        ds2.to_zarr(store=store2_write, mode="w")
+        root_cid2 = await store2_write.flush()
+        assert root_cid2 is not None
+
+        # 4. --- Read and Lazily Concatenate Datasets ---
+        store1_read = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=root_cid1
+        )
+        store2_read = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=root_cid2
+        )
+
+        ds1_read = xr.open_zarr(store=store1_read, chunks="auto")
+        ds2_read = xr.open_zarr(store=store2_read, chunks="auto")
+
+        # Verify that datasets are lazy (Dask-backed)
+        assert ds1_read.temp.chunks is not None
+        assert ds2_read.temp.chunks is not None
+
+        # Lazily concatenate along time dimension
+        combined_ds = xr.concat([ds1_read, ds2_read], dim="time")
+
+        # Verify that the combined dataset is still lazy
+        assert combined_ds.temp.chunks is not None
+
+        # 5. --- Query Across Both Datasets ---
+        # Select a time slice that spans both datasets (e.g., Sep 15 to Oct 15)
+        query_slice = combined_ds.sel(time=slice("2024-09-15", "2024-10-15"))
+
+        # Verify that the query is still lazy
+        assert query_slice.temp.chunks is not None
+
+        # Compute the result to trigger data loading
+        query_result = query_slice.compute()
+
+        # 6. --- Verify Results ---
+        # Compare with the expected concatenated dataset
+        expected_query_result = expected_combined_ds.sel(
+            time=slice("2024-09-15", "2024-10-15")
+        )
+        xr.testing.assert_identical(query_result, expected_query_result)
+
+        # Verify specific values at a point to ensure data integrity
+        sample_time = pd.Timestamp("2024-09-30")  # From ds1
+        sample_result = query_result.sel(time=sample_time, method="nearest").temp.values
+        expected_sample = expected_combined_ds.sel(
+            time=sample_time, method="nearest"
+        ).temp.values
+        np.testing.assert_array_equal(sample_result, expected_sample)
+
+        sample_time = pd.Timestamp("2024-10-01")  # From ds2
+        sample_result = query_result.sel(time=sample_time, method="nearest").temp.values
+        expected_sample = expected_combined_ds.sel(
+            time=sample_time, method="nearest"
+        ).temp.values
+        np.testing.assert_array_equal(sample_result, expected_sample)
+
+        print("\n✅ Lazy concatenation test successful! Data verified.")
