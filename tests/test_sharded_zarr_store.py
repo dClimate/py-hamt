@@ -913,3 +913,110 @@ async def test_sharded_zarr_store_lazy_concat(
         np.testing.assert_array_equal(sample_result, expected_sample)
 
         print("\n✅ Lazy concatenation test successful! Data verified.")
+
+# @pytest.mark.asyncio
+# async def test_sharded_zarr_store_lazy_concat_with_cids(
+#     create_ipfs: tuple[str, str]
+# ):
+#     """
+#     Tests lazy concatenation of two xarray datasets stored in separate ShardedZarrStores
+#     using provided CIDs for finalized and non-finalized data, ensuring the non-finalized
+#     dataset is sliced after the finalization date (inclusive) and the combined dataset
+#     can be queried as a single dataset with data fetched correctly from the respective stores.
+#     """
+#     rpc_base_url, gateway_base_url = create_ipfs
+
+#     # Provided CIDs
+#     finalized_cid = "bafyr4icrox4pxashkfmbyztn7jhp6zjlpj3bufg5ggsjux74zr7ocnqdpu"
+#     non_finalized_cid = "bafyr4ibj3bfl5oo7bf6gagzr2g33jlnf23mq2xo632mbl6ytfry7jbuepy"
+#     async with KuboCAS(
+#         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+#     ) as kubo_cas:
+#         # 1. --- Open Finalized Dataset ---
+#         store_finalized = await ShardedZarrStore.open(
+#             cas=kubo_cas, read_only=True, root_cid=finalized_cid
+#         )
+#         ds_finalized = xr.open_zarr(store=store_finalized, chunks="auto")
+
+#         # Verify that the dataset is lazy (Dask-backed)
+#         assert ds_finalized['2m_temperature'].chunks is not None
+
+#         # Determine the finalization date (last date in finalized dataset)
+#         finalization_date = np.datetime64(ds_finalized.time.max().values)
+#         # Convert to Python datetime for clarity
+#         finalization_date_dt = pd.Timestamp(finalization_date).to_pydatetime()
+
+#         # 2. --- Open Non-Finalized Dataset and Slice After Finalization Date ---
+#         store_non_finalized = await ShardedZarrStore.open(
+#             cas=kubo_cas, read_only=True, root_cid=non_finalized_cid
+#         )
+#         ds_non_finalized = xr.open_zarr(store=store_non_finalized, chunks="auto")
+
+#         # Verify that the dataset is lazy
+#         assert ds_non_finalized['2m_temperature'].chunks is not None
+
+#         # Slice non-finalized dataset to start *after* the finalization date
+#         # (finalization_date is inclusive for finalized data, so start at +1 hour)
+#         start_time = finalization_date + np.timedelta64(1, 'h')
+#         ds_non_finalized_sliced = ds_non_finalized.sel(time=slice(start_time, None))
+
+#         # Verify that the sliced dataset starts after the finalization date
+#         if ds_non_finalized_sliced.time.size > 0:
+#             assert ds_non_finalized_sliced.time.min() > finalization_date
+#         else:
+#             # Handle case where non-finalized dataset is empty after slicing
+#             print("Warning: Non-finalized dataset is empty after slicing.")
+
+#         # 3. --- Lazily Concatenate Datasets ---
+#         combined_ds = xr.concat([ds_finalized, ds_non_finalized_sliced], dim="time")
+
+#         # Verify that the combined dataset is still lazy
+#         assert combined_ds['2m_temperature'].chunks is not None
+
+#         # 4. --- Query Across Both Datasets ---
+#         # Select a time slice that spans both datasets
+#         # Use a range that includes the boundary (e.g., finalization date and after)
+#         query_start = finalization_date - np.timedelta64(1, 'D')  # 1 day before
+#         query_end = finalization_date + np.timedelta64(1, 'D')    # 1 day after
+#         query_slice = combined_ds.sel(time=slice(query_start, query_end), latitude=0, longitude=0)
+#         # Make sure the query slice aligned with the query_start and query_end
+        
+#         assert query_slice.time.min() >= query_start
+#         assert query_slice.time.max() <= query_end
+
+#         # Verify that the query is still lazy
+#         assert query_slice['2m_temperature'].chunks is not None
+
+#         # Compute the result to trigger data loading
+#         query_result = query_slice.compute()
+
+#         # 5. --- Verify Results ---
+#         # Verify data integrity at specific points
+#         # Check the last finalized time (from finalized dataset)
+#         sample_time_finalized = finalization_date
+#         if sample_time_finalized in query_result.time.values:
+#             sample_result = query_result.sel(time=sample_time_finalized, method="nearest")['2m_temperature'].values
+#             expected_sample = ds_finalized.sel(time=sample_time_finalized, latitude=0, longitude=0, method="nearest")['2m_temperature'].values
+#             np.testing.assert_array_equal(sample_result, expected_sample)
+
+#         # Check the first non-finalized time (from non-finalized dataset, if available)
+#         if ds_non_finalized_sliced.time.size > 0:
+#             sample_time_non_finalized = ds_non_finalized_sliced.time.min().values
+#             if sample_time_non_finalized in query_result.time.values:
+#                 sample_result = query_result.sel(time=sample_time_non_finalized, method="nearest")['2m_temperature'].values
+#                 expected_sample = ds_non_finalized_sliced.sel(
+#                     time=sample_time_non_finalized, latitude=0, longitude=0, method="nearest"
+#                 )['2m_temperature'].values
+#                 np.testing.assert_array_equal(sample_result, expected_sample)
+
+#         # 6. --- Additional Validation ---
+#         # Verify that the concatenated dataset has no overlapping times
+#         time_values = combined_ds.time.values
+#         assert np.all(np.diff(time_values) > np.timedelta64(0, 'ns')), "Overlapping or unsorted time values detected"
+
+#         # Verify that the query result covers the expected time range
+#         if query_result.time.size > 0:
+#             assert query_result.time.min() >= query_start
+#             assert query_result.time.max() <= query_end
+
+#         print("\n✅ Lazy concatenation with CIDs test successful! Data verified.")
