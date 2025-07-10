@@ -40,14 +40,24 @@ class ContentAddressedStore(ABC):
     ) -> bytes:
         """Retrieve data."""
 
-    # Optional abstract methods for pinning and unpinning CIDs
+
     async def pin_cid(self, id: IPLDKind, target_rpc: str) -> None:
         """Pin a CID in the storage."""
-        pass
+        pass # pragma: no cover
+    
 
     async def unpin_cid(self, id: IPLDKind, target_rpc: str) -> None:
         """Unpin a CID in the storage."""
-        pass
+        pass # pragma: no cover
+
+
+    async def pin_update(self, old_id: IPLDKind, new_id: IPLDKind, target_rpc: str) -> None:
+        """Update the pinned CID in the storage."""
+        pass # pragma: no cover
+    
+    async def pin_ls(self, target_rpc: str) -> Dict[str, Any]:
+        """List all pinned CIDs in the storage."""
+        pass # pragma: no cover
 
 
 class InMemoryCAS(ContentAddressedStore):
@@ -407,12 +417,6 @@ class KuboCAS(ContentAddressedStore):
             response = await client.post(pin_add_url_base, params=params)
             response.raise_for_status()
 
-            # async with self._loop_session().post(
-            #     pin_add_url_base, params=params
-            # ) as resp:
-            #     resp.raise_for_status()
-            #     # A 200 OK is sufficient to indicate success.
-
     async def unpin_cid(
         self, cid: CID, target_rpc: str = "http://127.0.0.1:5001"
     ) -> None:
@@ -428,6 +432,43 @@ class KuboCAS(ContentAddressedStore):
             client = self._loop_client()
             response = await client.post(unpin_url_base, params=params)
             response.raise_for_status()
-            # async with self._loop_session().post(unpin_url_base, params=params) as resp:
-            #     resp.raise_for_status()
-            #     # A 200 OK is sufficient to indicate success.
+    
+    async def pin_update(
+        self,
+        old_id: IPLDKind,
+        new_id: IPLDKind,
+        target_rpc: str = "http://127.0.0.1:5001"
+    ) -> None:
+        """
+        Updates the pinned CID in the storage.
+
+        Args:
+            old_id (IPLDKind): The old Content ID to replace.
+            new_id (IPLDKind): The new Content ID to pin.
+        """
+        params = {"arg": [str(old_id), str(new_id)]}
+        pin_update_url_base: str = f"{target_rpc}/api/v0/pin/update"
+        async with self._sem:  # throttle RPC
+            client = self._loop_client()
+            response = await client.post(pin_update_url_base, params=params)
+            response.raise_for_status()
+
+    async def pin_ls(
+        self, target_rpc: str = "http://127.0.0.1:5001"
+    ) -> list[CID]:
+        """
+        Lists all pinned CIDs on the local Kubo node via the RPC API.
+
+        Args:
+            target_rpc (str): The RPC URL of the Kubo node.
+
+        Returns:
+            List[CID]: A list of pinned CIDs.
+        """
+        pin_ls_url_base: str = f"{target_rpc}/api/v0/pin/ls"
+        async with self._sem:  # throttle RPC
+            client = self._loop_client()
+            response = await client.post(pin_ls_url_base)
+            response.raise_for_status()
+            pins = response.json().get("Keys", [])
+            return pins
