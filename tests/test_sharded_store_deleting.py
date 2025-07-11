@@ -31,6 +31,7 @@ def random_zarr_dataset():
     ds = ds.chunk({"time": 20, "lat": 18, "lon": 36})
     yield ds
 
+
 @pytest.mark.asyncio
 async def test_delete_chunk_success(create_ipfs: tuple[str, str]):
     """Tests successful deletion of a chunk from the store."""
@@ -72,6 +73,7 @@ async def test_delete_chunk_success(create_ipfs: tuple[str, str]):
         assert not await store_read.exists(chunk_key)
         assert await store_read.get(chunk_key, proto) is None
 
+
 @pytest.mark.asyncio
 async def test_delete_metadata_success(create_ipfs: tuple[str, str]):
     """Tests successful deletion of a metadata key."""
@@ -110,6 +112,7 @@ async def test_delete_metadata_success(create_ipfs: tuple[str, str]):
         assert not await store_read.exists(metadata_key)
         assert await store_read.get(metadata_key, proto) is None
 
+
 @pytest.mark.asyncio
 async def test_delete_nonexistent_key(create_ipfs: tuple[str, str]):
     """Tests deletion of a nonexistent metadata key."""
@@ -145,7 +148,10 @@ async def test_delete_nonexistent_key(create_ipfs: tuple[str, str]):
         # Try to delete nonexistent chunk key (within bounds but not set)
         await store.delete("temp/c/0/0")  # Should not raise, as it sets to None
         assert not await store.exists("temp/c/0/0")
-        assert store._dirty_shards  # Shard is marked dirty even if chunk was already None
+        assert (
+            store._dirty_shards
+        )  # Shard is marked dirty even if chunk was already None
+
 
 @pytest.mark.asyncio
 async def test_delete_read_only_store(create_ipfs: tuple[str, str]):
@@ -166,7 +172,9 @@ async def test_delete_read_only_store(create_ipfs: tuple[str, str]):
         proto = zarr.core.buffer.default_buffer_prototype()
         await store_write.set(chunk_key, proto.buffer.from_bytes(b"test_data"))
         metadata_key = "temp/zarr.json"
-        await store_write.set(metadata_key, proto.buffer.from_bytes(b'{"shape": [20, 20]}'))
+        await store_write.set(
+            metadata_key, proto.buffer.from_bytes(b'{"shape": [20, 20]}')
+        )
         root_cid = await store_write.flush()
 
         # Open as read-only
@@ -175,12 +183,17 @@ async def test_delete_read_only_store(create_ipfs: tuple[str, str]):
         )
 
         # Try to delete chunk
-        with pytest.raises(PermissionError, match="Cannot delete from a read-only store"):
+        with pytest.raises(
+            PermissionError, match="Cannot delete from a read-only store"
+        ):
             await store_read_only.delete(chunk_key)
 
         # Try to delete metadata
-        with pytest.raises(PermissionError, match="Cannot delete from a read-only store"):
+        with pytest.raises(
+            PermissionError, match="Cannot delete from a read-only store"
+        ):
             await store_read_only.delete(metadata_key)
+
 
 @pytest.mark.asyncio
 async def test_delete_concurrency(create_ipfs: tuple[str, str]):
@@ -230,8 +243,11 @@ async def test_delete_concurrency(create_ipfs: tuple[str, str]):
             assert not await store_read.exists(key)
             assert await store_read.get(key, proto) is None
 
+
 @pytest.mark.asyncio
-async def test_delete_with_dataset(create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset):
+async def test_delete_with_dataset(
+    create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
+):
     """Tests deletion of chunks and metadata in a store with a full dataset."""
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
@@ -282,6 +298,7 @@ async def test_delete_with_dataset(create_ipfs: tuple[str, str], random_zarr_dat
         other_chunk_key = "temp/c/1/0/0"
         assert await store_read.exists(other_chunk_key)
 
+
 @pytest.mark.asyncio
 async def test_supports_writes_property(create_ipfs: tuple[str, str]):
     """Tests the supports_writes property."""
@@ -305,6 +322,7 @@ async def test_supports_writes_property(create_ipfs: tuple[str, str]):
             cas=kubo_cas, read_only=True, root_cid=root_cid
         )
         assert store_read_only.supports_writes is False
+
 
 @pytest.mark.asyncio
 async def test_supports_partial_writes_property(create_ipfs: tuple[str, str]):

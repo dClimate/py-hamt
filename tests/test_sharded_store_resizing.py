@@ -106,6 +106,7 @@ async def test_resize_store_success(create_ipfs: tuple[str, str]):
         assert store_read._array_shape == smaller_shape
         assert store_read._num_shards == 1
 
+
 @pytest.mark.asyncio
 async def test_resize_store_zero_sized_array(create_ipfs: tuple[str, str]):
     """Tests resizing to/from a zero-sized array."""
@@ -151,6 +152,7 @@ async def test_resize_store_zero_sized_array(create_ipfs: tuple[str, str]):
         assert store_read._array_shape == zero_shape
         assert store_read._num_shards == 0
 
+
 @pytest.mark.asyncio
 async def test_resize_store_invalid_cases(create_ipfs: tuple[str, str]):
     """Tests error handling in resize_store."""
@@ -184,15 +186,18 @@ async def test_resize_store_invalid_cases(create_ipfs: tuple[str, str]):
             await store.resize_store(new_shape=(30, 30, 30))
 
         # Test uninitialized store (simulate by setting attributes to None)
-        store._chunk_shape = None
-        store._chunks_per_shard = None
+        store._chunk_shape = None  # type: ignore
+        store._chunks_per_shard = None  # type: ignore
         with pytest.raises(
             RuntimeError, match="Store is not properly initialized for resizing"
         ):
             await store.resize_store(new_shape=(30, 30))
 
+
 @pytest.mark.asyncio
-async def test_resize_variable_success(create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset):
+async def test_resize_variable_success(
+    create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
+):
     """Tests successful resizing of a variable's metadata."""
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
@@ -246,8 +251,11 @@ async def test_resize_variable_success(create_ipfs: tuple[str, str], random_zarr
         read_metadata = json.loads(read_metadata_bytes)
         assert read_metadata["shape"] == list(new_shape)
 
+
 @pytest.mark.asyncio
-async def test_resize_variable_invalid_cases(create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset):
+async def test_resize_variable_invalid_cases(
+    create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
+):
     """Tests error handling in resize_variable."""
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
@@ -293,7 +301,13 @@ async def test_resize_variable_invalid_cases(create_ipfs: tuple[str, str], rando
         invalid_cid = await kubo_cas.save(invalid_metadata, codec="raw")
         store._root_obj["metadata"]["invalid/zarr.json"] = invalid_cid
         with pytest.raises(ValueError, match="Shape not found in metadata"):
-            await store.set("invalid/zarr.json", zarr.core.buffer.default_buffer_prototype().buffer.from_bytes(invalid_metadata))
+            await store.set(
+                "invalid/zarr.json",
+                zarr.core.buffer.default_buffer_prototype().buffer.from_bytes(
+                    invalid_metadata
+                ),
+            )
+
 
 @pytest.mark.asyncio
 async def test_resize_store_with_data_preservation(create_ipfs: tuple[str, str]):
@@ -324,6 +338,7 @@ async def test_resize_store_with_data_preservation(create_ipfs: tuple[str, str])
         )
         assert await store_read.exists(chunk_key)
         read_chunk = await store_read.get(chunk_key, proto)
+        assert read_chunk is not None
         assert read_chunk.to_bytes() == chunk_data
 
         # Resize store
@@ -340,9 +355,11 @@ async def test_resize_store_with_data_preservation(create_ipfs: tuple[str, str])
         )
         assert await store_read.exists(chunk_key)
         read_chunk = await store_read.get(chunk_key, proto)
+        assert read_chunk is not None
         assert read_chunk.to_bytes() == chunk_data
         assert store_read._array_shape == new_shape
         assert store_read._num_shards == 3  # ceil((3*3)/4) = 3
+
 
 @pytest.mark.asyncio
 async def test_resize_store_in_set_method(create_ipfs: tuple[str, str]):
@@ -381,7 +398,9 @@ async def test_resize_store_in_set_method(create_ipfs: tuple[str, str]):
             cas=kubo_cas, read_only=True, root_cid=root_cid
         )
         metadata_buffer = await store_read.get("temp/zarr.json", proto)
+        assert metadata_buffer is not None
         assert json.loads(metadata_buffer.to_bytes())["shape"] == new_shape
+
 
 @pytest.mark.asyncio
 async def test_resize_concurrency(create_ipfs: tuple[str, str]):

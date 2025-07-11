@@ -31,6 +31,7 @@ def random_zarr_dataset():
     ds = ds.chunk({"time": 20, "lat": 18, "lon": 36})
     yield ds
 
+
 @pytest.mark.asyncio
 async def test_graft_store_success(create_ipfs: tuple[str, str]):
     """Tests successful grafting of a source store onto a target store."""
@@ -95,11 +96,15 @@ async def test_graft_store_success(create_ipfs: tuple[str, str]):
         )
         assert await target_store_read.exists(grafted_chunk_key)
         read_data = await target_store_read.get(grafted_chunk_key, proto)
+        assert read_data is not None
         assert read_data.to_bytes() == chunk_data
         assert target_store_read._array_shape == target_shape
 
+
 @pytest.mark.asyncio
-async def test_graft_store_with_dataset(create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset):
+async def test_graft_store_with_dataset(
+    create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
+):
     """Tests grafting a store containing a full dataset."""
     rpc_base_url, gateway_base_url = create_ipfs
     test_ds = random_zarr_dataset
@@ -122,7 +127,11 @@ async def test_graft_store_with_dataset(create_ipfs: tuple[str, str], random_zar
         source_root_cid = await source_store.flush()
 
         # Initialize target store with larger shape
-        target_shape = (array_shape_tuple[0] + 20, array_shape_tuple[1], array_shape_tuple[2])
+        target_shape = (
+            array_shape_tuple[0] + 20,
+            array_shape_tuple[1],
+            array_shape_tuple[2],
+        )
         target_store = await ShardedZarrStore.open(
             cas=kubo_cas,
             read_only=False,
@@ -156,7 +165,9 @@ async def test_graft_store_with_dataset(create_ipfs: tuple[str, str], random_zar
         )
         assert await target_store_read.exists(target_chunk_key)
         read_data = await target_store_read.get(target_chunk_key, proto)
+        assert read_data is not None
         assert read_data.to_bytes() == source_data.to_bytes()
+
 
 @pytest.mark.asyncio
 async def test_graft_store_empty_source(create_ipfs: tuple[str, str]):
@@ -198,6 +209,7 @@ async def test_graft_store_empty_source(create_ipfs: tuple[str, str]):
         )
         assert not await target_store_read.exists("temp/c/1/1")
 
+
 @pytest.mark.asyncio
 async def test_graft_store_invalid_cases(create_ipfs: tuple[str, str]):
     """Tests error handling in graft_store."""
@@ -220,7 +232,9 @@ async def test_graft_store_invalid_cases(create_ipfs: tuple[str, str]):
             read_only=True,
             root_cid=await target_store.flush(),
         )
-        with pytest.raises(PermissionError, match="Cannot graft onto a read-only store"):
+        with pytest.raises(
+            PermissionError, match="Cannot graft onto a read-only store"
+        ):
             await target_store_read_only.graft_store("some_cid", chunk_offset=(0, 0))
 
         # Test invalid source CID
@@ -263,7 +277,10 @@ async def test_graft_store_invalid_cases(create_ipfs: tuple[str, str]):
         await source_store.set("temp/c/0/0", proto.buffer.from_bytes(b"data"))
         source_root_cid = await source_store.flush()
         with pytest.raises(ValueError, match="Shard index 10 out of bounds."):
-            await target_store.graft_store(source_root_cid, chunk_offset=(10, 0))  # Out of bounds for target (4x4 chunks)
+            await target_store.graft_store(
+                source_root_cid, chunk_offset=(10, 0)
+            )  # Out of bounds for target (4x4 chunks)
+
 
 @pytest.mark.asyncio
 async def test_graft_store_concurrency(create_ipfs: tuple[str, str]):
@@ -322,6 +339,8 @@ async def test_graft_store_concurrency(create_ipfs: tuple[str, str]):
         assert await target_store.exists("temp/c/2/2")
         data1 = await target_store.get("temp/c/1/1", proto)
         data2 = await target_store.get("temp/c/2/2", proto)
+        assert data1 is not None
+        assert data2 is not None
         assert data1.to_bytes() in [b"data1", b"data2"]
         assert data2.to_bytes() in [b"data1", b"data2"]
         assert data1.to_bytes() != data2.to_bytes()  # Ensure distinct data
@@ -333,6 +352,7 @@ async def test_graft_store_concurrency(create_ipfs: tuple[str, str]):
         )
         assert await target_store_read.exists("temp/c/1/1")
         assert await target_store_read.exists("temp/c/2/2")
+
 
 @pytest.mark.asyncio
 async def test_graft_store_overlapping_chunks(create_ipfs: tuple[str, str]):
@@ -372,13 +392,17 @@ async def test_graft_store_overlapping_chunks(create_ipfs: tuple[str, str]):
 
         # Verify that existing data was not overwritten
         read_data = await target_store.get(target_chunk_key, proto)
+        assert read_data is not None
         assert read_data.to_bytes() == existing_data
-        assert target_store._dirty_shards  # Shard is marked dirty due to attempted write
+        assert (
+            target_store._dirty_shards
+        )  # Shard is marked dirty due to attempted write
 
         # Verify other grafted chunks
         grafted_chunk_key = "temp/c/1/0"  # Corresponds to source (0,0) at offset (1,0)
         assert await target_store.exists(grafted_chunk_key)
         read_data = await target_store.get(grafted_chunk_key, proto)
+        assert read_data is not None
         assert read_data.to_bytes() == source_data
 
         # Flush and verify
@@ -386,5 +410,10 @@ async def test_graft_store_overlapping_chunks(create_ipfs: tuple[str, str]):
         target_store_read = await ShardedZarrStore.open(
             cas=kubo_cas, read_only=True, root_cid=target_root_cid
         )
-        assert (await target_store_read.get(target_chunk_key, proto)).to_bytes() == existing_data
-        assert (await target_store_read.get(grafted_chunk_key, proto)).to_bytes() == source_data
+        targeted_target_chunk = await target_store_read.get(target_chunk_key, proto)
+        assert targeted_target_chunk is not None
+        assert targeted_target_chunk.to_bytes() == existing_data
+
+        grafted_chunk_data = await target_store_read.get(grafted_chunk_key, proto)
+        assert grafted_chunk_data is not None
+        assert grafted_chunk_data.to_bytes() == source_data

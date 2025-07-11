@@ -1,4 +1,3 @@
-
 import dag_cbor
 import pytest
 import zarr.abc.store
@@ -51,10 +50,14 @@ async def test_sharded_zarr_store_init_exceptions(create_ipfs: tuple[str, str]):
             ValueError,
             match="array_shape and chunk_shape must be provided for a new store.",
         ):
-            await ShardedZarrStore.open(cas=kubo_cas, read_only=False, chunk_shape=(10, 10))
+            await ShardedZarrStore.open(
+                cas=kubo_cas, read_only=False, chunk_shape=(10, 10)
+            )
 
         # Test ValueError for non-positive chunks_per_shard
-        with pytest.raises(ValueError, match="chunks_per_shard must be a positive integer."):
+        with pytest.raises(
+            ValueError, match="chunks_per_shard must be a positive integer."
+        ):
             await ShardedZarrStore.open(
                 cas=kubo_cas,
                 read_only=False,
@@ -64,7 +67,9 @@ async def test_sharded_zarr_store_init_exceptions(create_ipfs: tuple[str, str]):
             )
 
         # Test ValueError when root_cid is not provided for a read-only store
-        with pytest.raises(ValueError, match="root_cid must be provided for a read-only store."):
+        with pytest.raises(
+            ValueError, match="root_cid must be provided for a read-only store."
+        ):
             await ShardedZarrStore.open(cas=kubo_cas, read_only=True)
 
 
@@ -107,7 +112,11 @@ async def test_sharded_zarr_store_load_root_exceptions(create_ipfs: tuple[str, s
                 "array_shape": [10],
                 "chunk_shape": [5],
                 "sharding_config": {"chunks_per_shard": 1},
-                "shard_cids": [None, None, None],  # Should be 2 shards, but array shape dictates 2 total chunks
+                "shard_cids": [
+                    None,
+                    None,
+                    None,
+                ],  # Should be 2 shards, but array shape dictates 2 total chunks
             },
         }
         inconsistent_shards_cid = await kubo_cas.save(
@@ -147,7 +156,7 @@ async def test_sharded_zarr_store_shard_handling_exceptions(
             await store._load_or_initialize_shard_cache(0)
 
         # bad __eq__ method
-        assert store != { "not a ShardedZarrStore": "test" }
+        assert store != {"not a ShardedZarrStore": "test"}
 
 
 @pytest.mark.asyncio
@@ -187,7 +196,9 @@ async def test_sharded_zarr_store_get_set_exceptions(create_ipfs: tuple[str, str
             match="Byte range start .* cannot be greater than end .*",
         ):
             await store.get(
-                "/c/0", proto, byte_range=zarr.abc.store.RangeByteRequest(start=10, end=5)
+                "/c/0",
+                proto,
+                byte_range=zarr.abc.store.RangeByteRequest(start=10, end=5),
             )
 
         # Test NotImplementedError for set_partial_values
@@ -196,7 +207,9 @@ async def test_sharded_zarr_store_get_set_exceptions(create_ipfs: tuple[str, str
 
         # Test ValueError when shape is not found in metadata during set
         with pytest.raises(ValueError, match="Shape not found in metadata."):
-            await store.set("test/zarr.json", proto.buffer.from_bytes(b'{"not": "a shape"}'))
+            await store.set(
+                "test/zarr.json", proto.buffer.from_bytes(b'{"not": "a shape"}')
+            )
 
 
 @pytest.mark.asyncio
@@ -234,7 +247,6 @@ async def test_sharded_zarr_store_other_exceptions(create_ipfs: tuple[str, str])
             match="Cannot find metadata for key 'nonexistent/zarr.json' to resize.",
         ):
             await store.resize_variable("nonexistent", new_shape=(20,))
-    
 
         # Test RuntimeError when listing a store with no root object
         # with pytest.raises(RuntimeError, match="Root object not loaded."):
