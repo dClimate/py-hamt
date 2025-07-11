@@ -40,24 +40,23 @@ class ContentAddressedStore(ABC):
     ) -> bytes:
         """Retrieve data."""
 
-
     async def pin_cid(self, id: IPLDKind, target_rpc: str) -> None:
         """Pin a CID in the storage."""
-        pass # pragma: no cover
-    
+        pass  # pragma: no cover
 
     async def unpin_cid(self, id: IPLDKind, target_rpc: str) -> None:
         """Unpin a CID in the storage."""
-        pass # pragma: no cover
+        pass  # pragma: no cover
 
-
-    async def pin_update(self, old_id: IPLDKind, new_id: IPLDKind, target_rpc: str) -> None:
+    async def pin_update(
+        self, old_id: IPLDKind, new_id: IPLDKind, target_rpc: str
+    ) -> None:
         """Update the pinned CID in the storage."""
-        pass # pragma: no cover
-    
-    async def pin_ls(self, target_rpc: str) -> Dict[str, Any]:
+        pass  # pragma: no cover
+
+    async def pin_ls(self, target_rpc: str) -> list[Dict[str, Any]]:
         """List all pinned CIDs in the storage."""
-        pass # pragma: no cover
+        return []  # pragma: no cover
 
 
 class InMemoryCAS(ContentAddressedStore):
@@ -432,12 +431,12 @@ class KuboCAS(ContentAddressedStore):
             client = self._loop_client()
             response = await client.post(unpin_url_base, params=params)
             response.raise_for_status()
-    
+
     async def pin_update(
         self,
         old_id: IPLDKind,
         new_id: IPLDKind,
-        target_rpc: str = "http://127.0.0.1:5001"
+        target_rpc: str = "http://127.0.0.1:5001",
     ) -> None:
         """
         Updates the pinned CID in the storage.
@@ -455,7 +454,7 @@ class KuboCAS(ContentAddressedStore):
 
     async def pin_ls(
         self, target_rpc: str = "http://127.0.0.1:5001"
-    ) -> list[CID]:
+    ) -> list[Dict[str, Any]]:
         """
         Lists all pinned CIDs on the local Kubo node via the RPC API.
 

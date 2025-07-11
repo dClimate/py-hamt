@@ -1,11 +1,7 @@
-import pytest
-import httpx
-from dag_cbor import IPLDKind
 import dag_cbor
-from hypothesis import given, settings
-from multiformats import CID, multihash
+import pytest
+
 from py_hamt import KuboCAS
-from testing_utils import ipld_strategy
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -50,11 +46,17 @@ async def test_pinning(create_ipfs, global_client_session):
 
         # Verify the old CID is no longer pinned and the new CID is pinned
         listed_pins_after_update = await kubo_cas.pin_ls(target_rpc=rpc_url)
-        assert str(cid) not in listed_pins_after_update, f"Old CID {cid} was not unpinned after update"
-        assert str(new_cid) in listed_pins_after_update, f"New CID {new_cid} was not pinned after update"   
+        assert str(cid) not in listed_pins_after_update, (
+            f"Old CID {cid} was not unpinned after update"
+        )
+        assert str(new_cid) in listed_pins_after_update, (
+            f"New CID {new_cid} was not pinned after update"
+        )
 
         # unpin the new CID
         await kubo_cas.unpin_cid(new_cid, target_rpc=rpc_url)
         # Verify the new CID is no longer pinned
         listed_pins_after_unpin_update = await kubo_cas.pin_ls(target_rpc=rpc_url)
-        assert str(new_cid) not in listed_pins_after_unpin_update, f"New CID {new_cid} was not unpinned after update"
+        assert str(new_cid) not in listed_pins_after_unpin_update, (
+            f"New CID {new_cid} was not unpinned after update"
+        )

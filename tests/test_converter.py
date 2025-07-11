@@ -38,13 +38,13 @@ def converter_test_dataset():
     data = np.random.randn(len(times), len(lats), len(lons))
 
     ds = xr.Dataset(
-        {unique_var_name: (["time", "lat", "lon"], data)},
-        coords={"time": times, "lat": lats, "lon": lons},
+        {unique_var_name: (["time", "latitude", "longitude"], data)},
+        coords={"time": times, "latitude": lats, "longitude": lons},
         attrs={"description": "Test dataset for converter verification."},
     )
 
     # Define chunking for the store
-    ds = ds.chunk({"time": 10, "lat": 10, "lon": 10})
+    ds = ds.chunk({"time": 10, "latitude": 10, "longitude": 10})
     yield ds
 
 

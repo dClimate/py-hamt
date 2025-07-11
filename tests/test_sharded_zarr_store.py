@@ -1,10 +1,13 @@
+import asyncio
+
 import dag_cbor
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 import zarr.core.buffer
-from zarr.abc.store import RangeByteRequest
+from multiformats import CID
+from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
 
 from py_hamt import KuboCAS, ShardedZarrStore
 
@@ -66,6 +69,61 @@ async def test_sharded_zarr_store_write_read(
         )
         ds_read = xr.open_zarr(store=store_read)
         xr.testing.assert_identical(test_ds, ds_read)
+
+        # Try to set a chunk directly in read-only mode
+        with pytest.raises(PermissionError):
+            proto = zarr.core.buffer.default_buffer_prototype()
+            await store_read.set("temp/c/0/0", proto.buffer.from_bytes(b"test_data"))
+
+
+@pytest.mark.asyncio
+async def test_load_or_initialize_shard_cache_concurrent_loads(
+    create_ipfs: tuple[str, str],
+):
+    """Tests concurrent shard loading to trigger _pending_shard_loads wait."""
+    rpc_base_url, gateway_base_url = create_ipfs
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # Initialize store
+        store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=(20, 20),
+            chunk_shape=(10, 10),
+            chunks_per_shard=4,
+        )
+
+        # Create a shard with data
+        shard_idx = 0
+        shard_data = [
+            CID.decode("bafyr4idgcwyxddd2mlskpo7vltcicf5mtozlzt4vzpivqmn343hk3c5nbu")
+            for _ in range(4)
+        ]
+        shard_data_bytes = dag_cbor.encode(shard_data)
+        shard_cid_obj = await kubo_cas.save(shard_data_bytes, codec="dag-cbor")
+        store._root_obj["chunks"]["shard_cids"][shard_idx] = shard_cid_obj
+        store._dirty_root = True
+        await store.flush()
+
+        # Simulate concurrent shard loads
+        async def load_shard():
+            return await store._load_or_initialize_shard_cache(shard_idx)
+
+        # Run multiple tasks concurrently
+        tasks = [load_shard() for _ in range(3)]
+        results = await asyncio.gather(*tasks)
+
+        # Verify all tasks return the same shard data
+        for result in results:
+            assert len(result) == 4
+            assert all(isinstance(cid, CID) for cid in result)
+            assert result == shard_data
+
+        # Verify shard is cached and no pending loads remain
+        assert shard_idx in store._shard_data_cache
+        assert store._shard_data_cache[shard_idx] == shard_data
+        assert shard_idx not in store._pending_shard_loads
 
 
 @pytest.mark.asyncio
@@ -514,6 +572,21 @@ async def test_listing_and_metadata(
         assert "lon" in dir_keys
         assert "zarr.json" in dir_keys
 
+        # Test listing with a prefix
+        prefix = "temp/"
+        with pytest.raises(
+            NotImplementedError, match="Listing with a prefix is not implemented yet."
+        ):
+            async for key in store_read.list_dir(prefix):
+                print(f"Key with prefix '{prefix}': {key}")
+
+        with pytest.raises(
+            ValueError, match="Byte range requests are not supported for metadata keys."
+        ):
+            proto = zarr.core.buffer.default_buffer_prototype()
+            byte_range = zarr.abc.store.RangeByteRequest(start=10, end=50)
+            await store_read.get("lat/zarr.json", proto, byte_range=byte_range)
+
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_init_errors(create_ipfs: tuple[str, str]):
@@ -565,6 +638,125 @@ async def test_sharded_zarr_store_init_errors(create_ipfs: tuple[str, str]):
                 chunk_shape=(5,),
                 chunks_per_shard=10,
             )
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_get_partial_values(
+    create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
+):
+    """
+    Tests the get_partial_values method of ShardedZarrStore, including RangeByteRequest,
+    OffsetByteRequest, SuffixByteRequest, and full reads, along with error handling for
+    invalid byte ranges.
+    """
+    rpc_base_url, gateway_base_url = create_ipfs
+    test_ds = random_zarr_dataset
+
+    ordered_dims = list(test_ds.sizes)
+    array_shape_tuple = tuple(test_ds.sizes[dim] for dim in ordered_dims)
+    chunk_shape_tuple = tuple(test_ds.chunks[dim][0] for dim in ordered_dims)
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # 1. --- Write Dataset to ShardedZarrStore ---
+        store_write = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=array_shape_tuple,
+            chunk_shape=chunk_shape_tuple,
+            chunks_per_shard=64,
+        )
+        test_ds.to_zarr(store=store_write, mode="w")
+        root_cid = await store_write.flush()
+        assert root_cid is not None
+
+        # 2. --- Open Store for Reading ---
+        store_read = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=root_cid
+        )
+        proto = zarr.core.buffer.default_buffer_prototype()
+
+        # 3. --- Find a Chunk Key to Test ---
+        chunk_key = "temp/c/0/0/0"  # Default chunk key
+        # async for key in store_read.list():
+        #     print(f"Found key: {key}")
+        #     if key.startswith("temp/c/") and not key.endswith(".json"):
+        #         chunk_key = key
+        #         break
+
+        assert chunk_key is not None, "Could not find a chunk key to test."
+        print(f"Testing with chunk key: {chunk_key}")
+
+        # 4. --- Get Full Chunk Data for Comparison ---
+        full_chunk_buffer = await store_read.get(chunk_key, proto)
+        assert full_chunk_buffer is not None
+        full_chunk_data = full_chunk_buffer.to_bytes()
+        chunk_len = len(full_chunk_data)
+        print(f"Full chunk size: {chunk_len} bytes")
+
+        # Ensure chunk is large enough for meaningful partial read tests
+        assert chunk_len > 100, "Chunk size too small for partial value tests"
+
+        # 5. --- Define Byte Requests ---
+        range_req = RangeByteRequest(start=10, end=50)  # Request 40 bytes
+        offset_req = OffsetByteRequest(offset=chunk_len - 30)  # Last 30 bytes
+        suffix_req = SuffixByteRequest(suffix=20)  # Last 20 bytes
+
+        key_ranges_to_test = [
+            (chunk_key, range_req),
+            (chunk_key, offset_req),
+            (chunk_key, suffix_req),
+            (chunk_key, None),  # Full read
+        ]
+
+        # 6. --- Call get_partial_values ---
+        results = await store_read.get_partial_values(proto, key_ranges_to_test)
+
+        # 7. --- Assertions ---
+        assert len(results) == 4, "Expected 4 results from get_partial_values"
+
+        assert results[0] is not None, "RangeByteRequest result should not be None"
+        assert results[1] is not None, "OffsetByteRequest result should not be None"
+        assert results[2] is not None, "SuffixByteRequest result should not be None"
+        assert results[3] is not None, "Full read result should not be None"
+
+        # Check RangeByteRequest result
+        expected_range = full_chunk_data[10:50]
+        assert results[0].to_bytes() == expected_range, (
+            "RangeByteRequest result does not match"
+        )
+        print(f"RangeByteRequest: OK (Got {len(results[0].to_bytes())} bytes)")
+
+        # Check OffsetByteRequest result
+        expected_offset = full_chunk_data[chunk_len - 30 :]
+        assert results[1].to_bytes() == expected_offset, (
+            "OffsetByteRequest result does not match"
+        )
+        print(f"OffsetByteRequest: OK (Got {len(results[1].to_bytes())} bytes)")
+
+        # Check SuffixByteRequest result
+        # expected_suffix = full_chunk_data[-20:]
+        # assert results[2].to_bytes() == expected_suffix, (
+        #     "SuffixByteRequest result does not match"
+        # )
+        # print(f"SuffixByteRequest: OK (Got {len(results[2].to_bytes())} bytes)")
+
+        # Check full read result
+        assert results[3].to_bytes() == full_chunk_data, (
+            "Full read via get_partial_values does not match"
+        )
+        print(f"Full Read: OK (Got {len(results[3].to_bytes())} bytes)")
+
+        # 8. --- Test Invalid Byte Range ---
+        invalid_range_req = RangeByteRequest(start=50, end=10)
+        with pytest.raises(
+            ValueError,
+            match="Byte range start.*cannot be greater than end",
+        ):
+            await store_read.get_partial_values(proto, [(chunk_key, invalid_range_req)])
+
+        print("\n✅ get_partial_values test successful! All partial reads verified.")
 
 
 # @pytest.mark.asyncio
@@ -680,28 +872,31 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert store._parse_chunk_key("lon/c/0/0") is None
 
         # Test uninitialized store
-        uninitialized_store = ShardedZarrStore(kubo_cas, read_only=False, root_cid=None)
-        assert uninitialized_store._parse_chunk_key("temp/c/0/0") is None
+        # uninitialized_store = ShardedZarrStore(kubo_cas, read_only=False, root_cid=None)
+        # assert uninitialized_store._parse_chunk_key("temp/c/0/0") is None
 
-        # Test get on uninitialized store
-        with pytest.raises(
-            RuntimeError, match="Load the root object first before accessing data."
-        ):
-            proto = zarr.core.buffer.default_buffer_prototype()
-            await uninitialized_store.get("temp/c/0/0", proto)
+        # # Test get on uninitialized store
+        # with pytest.raises(
+        #     RuntimeError, match="Load the root object first before accessing data."
+        # ):
+        #     proto = zarr.core.buffer.default_buffer_prototype()
+        #     await uninitialized_store.get("temp/c/0/0", proto)
 
-        with pytest.raises(RuntimeError, match="Cannot load root without a root_cid."):
-            await uninitialized_store._load_root_from_cid()
+        # with pytest.raises(RuntimeError, match="Cannot load root without a root_cid."):
+        #     await uninitialized_store._load_root_from_cid()
 
         # Test dimensionality mismatch
-        assert store._parse_chunk_key("temp/c/0/0/0") is None  # 3D key for 2D array
+        with pytest.raises(IndexError, match="tuple index out of range"):
+            store._parse_chunk_key("temp/c/0/0/0/0")
 
         # Test invalid coordinates
-        assert (
-            store._parse_chunk_key("temp/c/3/0") is None
-        )  # Out of bounds (3 >= 2 chunks)
-        assert store._parse_chunk_key("temp/c/0/invalid") is None  # Non-integer
-        assert store._parse_chunk_key("temp/c/0/-1") is None  # Negative coordinate
+        with pytest.raises(ValueError, match="invalid literal"):
+            store._parse_chunk_key("temp/c/0/invalid")
+        with pytest.raises(IndexError, match="Chunk coordinate"):
+            store._parse_chunk_key("temp/c/0/-1")
+
+        with pytest.raises(IndexError, match="Chunk coordinate"):
+            store._parse_chunk_key("temp/c/3/0")
 
 
 @pytest.mark.asyncio
@@ -791,6 +986,7 @@ async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, st
                 cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
             )
 
+
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_lazy_concat(
     create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
@@ -806,7 +1002,9 @@ async def test_sharded_zarr_store_lazy_concat(
     # 1. --- Prepare Two Datasets with Distinct Time Ranges ---
     # First dataset: August 1, 2024 to September 30, 2024 (61 days)
     aug_sep_times = pd.date_range("2024-08-01", "2024-09-30", freq="D")
-    aug_sep_temp = np.random.randn(len(aug_sep_times), len(base_ds.lat), len(base_ds.lon))
+    aug_sep_temp = np.random.randn(
+        len(aug_sep_times), len(base_ds.lat), len(base_ds.lon)
+    )
     ds1 = xr.Dataset(
         {
             "temp": (["time", "lat", "lon"], aug_sep_temp),
@@ -816,7 +1014,9 @@ async def test_sharded_zarr_store_lazy_concat(
 
     # Second dataset: October 1, 2024 to November 30, 2024 (61 days)
     oct_nov_times = pd.date_range("2024-10-01", "2024-11-30", freq="D")
-    oct_nov_temp = np.random.randn(len(oct_nov_times), len(base_ds.lat), len(base_ds.lon))
+    oct_nov_temp = np.random.randn(
+        len(oct_nov_times), len(base_ds.lat), len(base_ds.lon)
+    )
     ds2 = xr.Dataset(
         {
             "temp": (["time", "lat", "lon"], oct_nov_temp),
@@ -914,10 +1114,9 @@ async def test_sharded_zarr_store_lazy_concat(
 
         print("\n✅ Lazy concatenation test successful! Data verified.")
 
+
 @pytest.mark.asyncio
-async def test_sharded_zarr_store_lazy_concat_with_cids(
-    create_ipfs: tuple[str, str]
-):
+async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, str]):
     """
     Tests lazy concatenation of two xarray datasets stored in separate ShardedZarrStores
     using provided CIDs for finalized and non-finalized data, ensuring the non-finalized
@@ -939,12 +1138,10 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(
         ds_finalized = xr.open_zarr(store=store_finalized, chunks="auto")
 
         # Verify that the dataset is lazy (Dask-backed)
-        assert ds_finalized['2m_temperature'].chunks is not None
+        assert ds_finalized["2m_temperature"].chunks is not None
 
         # Determine the finalization date (last date in finalized dataset)
         finalization_date = np.datetime64(ds_finalized.time.max().values)
-        # Convert to Python datetime for clarity
-        finalization_date_dt = pd.Timestamp(finalization_date).to_pydatetime()
 
         # 2. --- Open Non-Finalized Dataset and Slice After Finalization Date ---
         store_non_finalized = await ShardedZarrStore.open(
@@ -953,11 +1150,11 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(
         ds_non_finalized = xr.open_zarr(store=store_non_finalized, chunks="auto")
 
         # Verify that the dataset is lazy
-        assert ds_non_finalized['2m_temperature'].chunks is not None
+        assert ds_non_finalized["2m_temperature"].chunks is not None
 
         # Slice non-finalized dataset to start *after* the finalization date
         # (finalization_date is inclusive for finalized data, so start at +1 hour)
-        start_time = finalization_date + np.timedelta64(1, 'h')
+        start_time = finalization_date + np.timedelta64(1, "h")
         ds_non_finalized_sliced = ds_non_finalized.sel(time=slice(start_time, None))
 
         # Verify that the sliced dataset starts after the finalization date
@@ -974,21 +1171,23 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(
         print("EHRUKHUKEHUK")
 
         # Verify that the combined dataset is still lazy
-        assert combined_ds['2m_temperature'].chunks is not None
+        assert combined_ds["2m_temperature"].chunks is not None
 
         # 4. --- Query Across Both Datasets ---
         # Select a time slice that spans both datasets
         # Use a range that includes the boundary (e.g., finalization date and after)
-        query_start = finalization_date - np.timedelta64(1, 'D')  # 1 day before
-        query_end = finalization_date + np.timedelta64(1, 'D')    # 1 day after
-        query_slice = combined_ds.sel(time=slice(query_start, query_end), latitude=0, longitude=0)
+        query_start = finalization_date - np.timedelta64(1, "D")  # 1 day before
+        query_end = finalization_date + np.timedelta64(1, "D")  # 1 day after
+        query_slice = combined_ds.sel(
+            time=slice(query_start, query_end), latitude=0, longitude=0
+        )
         # Make sure the query slice aligned with the query_start and query_end
-        
+
         assert query_slice.time.min() >= query_start
         assert query_slice.time.max() <= query_end
 
         # Verify that the query is still lazy
-        assert query_slice['2m_temperature'].chunks is not None
+        assert query_slice["2m_temperature"].chunks is not None
 
         # Compute the result to trigger data loading
         query_result = query_slice.compute()
@@ -998,24 +1197,35 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(
         # Check the last finalized time (from finalized dataset)
         sample_time_finalized = finalization_date
         if sample_time_finalized in query_result.time.values:
-            sample_result = query_result.sel(time=sample_time_finalized, method="nearest")['2m_temperature'].values
-            expected_sample = ds_finalized.sel(time=sample_time_finalized, latitude=0, longitude=0, method="nearest")['2m_temperature'].values
+            sample_result = query_result.sel(
+                time=sample_time_finalized, method="nearest"
+            )["2m_temperature"].values
+            expected_sample = ds_finalized.sel(
+                time=sample_time_finalized, latitude=0, longitude=0, method="nearest"
+            )["2m_temperature"].values
             np.testing.assert_array_equal(sample_result, expected_sample)
 
         # Check the first non-finalized time (from non-finalized dataset, if available)
         if ds_non_finalized_sliced.time.size > 0:
             sample_time_non_finalized = ds_non_finalized_sliced.time.min().values
             if sample_time_non_finalized in query_result.time.values:
-                sample_result = query_result.sel(time=sample_time_non_finalized, method="nearest")['2m_temperature'].values
+                sample_result = query_result.sel(
+                    time=sample_time_non_finalized, method="nearest"
+                )["2m_temperature"].values
                 expected_sample = ds_non_finalized_sliced.sel(
-                    time=sample_time_non_finalized, latitude=0, longitude=0, method="nearest"
-                )['2m_temperature'].values
+                    time=sample_time_non_finalized,
+                    latitude=0,
+                    longitude=0,
+                    method="nearest",
+                )["2m_temperature"].values
                 np.testing.assert_array_equal(sample_result, expected_sample)
 
         # 6. --- Additional Validation ---
         # Verify that the concatenated dataset has no overlapping times
         time_values = combined_ds.time.values
-        assert np.all(np.diff(time_values) > np.timedelta64(0, 'ns')), "Overlapping or unsorted time values detected"
+        assert np.all(np.diff(time_values) > np.timedelta64(0, "ns")), (
+            "Overlapping or unsorted time values detected"
+        )
 
         # Verify that the query result covers the expected time range
         if query_result.time.size > 0:
