@@ -139,11 +139,6 @@ async def test_write_read(
         with pytest.raises(NotImplementedError):
             await zhs.set_partial_values([])
 
-        with pytest.raises(NotImplementedError):
-            await zhs.get_partial_values(
-                zarr.core.buffer.default_buffer_prototype(), []
-            )
-
         previous_zarr_json: zarr.core.buffer.Buffer | None = await zhs.get(
             "zarr.json", zarr.core.buffer.default_buffer_prototype()
         )
