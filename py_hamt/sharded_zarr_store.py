@@ -78,7 +78,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._total_chunks = math.prod(self._chunks_per_dim)
 
         if not self._total_chunks == 0:
-            self._num_shards = (self._total_chunks + self._chunks_per_shard - 1) // self._chunks_per_shard
+            self._num_shards = (
+                self._total_chunks + self._chunks_per_shard - 1
+            ) // self._chunks_per_shard
 
     @classmethod
     async def open(
