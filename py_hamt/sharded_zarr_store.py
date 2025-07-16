@@ -511,6 +511,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 c_local + c_offset
                 for c_local, c_offset in zip(local_coords, chunk_offset)
             )
+            print(local_coords, "->", global_coords, chunk_offset)
             linear_global_index = self._get_linear_chunk_index(global_coords)
             global_shard_idx, index_in_global_shard = self._get_shard_info(
                 linear_global_index
