@@ -178,6 +178,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # 1. Exclude .json files immediately (metadata)
         if key.endswith(".json"):
             return None
+        print(key)
         excluded_array_prefixes = {"time", "lat", "lon", "latitude", "longitude"}
 
         chunk_marker = "/c/"
