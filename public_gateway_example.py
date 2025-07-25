@@ -53,7 +53,7 @@ async def fetch_zarr_from_gateway(cid: str, gateway: str = "https://ipfs.io"):
 
 async def main():
     # Example CID - this points to a weather dataset stored on IPFS
-    cid = "bafyr4iecw3faqyvj75psutabk2jxpddpjdokdy5b26jdnjjzpkzbgb5xoq"
+    cid = "bafyr4idgcwyxddd2mlskpo7vltcicf5mtozlzt4vzpivqmn343hk3c5nbu"
 
     # Try different public gateways
     gateways = [
