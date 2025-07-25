@@ -37,7 +37,7 @@ jobs:
         run: uv sync
 
       - name: Install IPFS
-        uses: Faolain/dclimate-ipfs-kubo-setup-action@v0.7.0
+        uses: Faolain/setup-ipfs@v0.7.0
         with:
           ipfs_version: "0.36.0"
           run_daemon: true
