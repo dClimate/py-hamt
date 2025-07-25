@@ -758,95 +758,6 @@ async def test_sharded_zarr_store_get_partial_values(
 
         print("\n✅ get_partial_values test successful! All partial reads verified.")
 
-
-# @pytest.mark.asyncio
-# async def test_sharded_zarr_store_init_invalid_shapes(create_ipfs: tuple[str, str]):
-#     """Tests initialization with invalid shapes and manifest errors."""
-#     rpc_base_url, gateway_base_url = create_ipfs
-#     async with KuboCAS(
-#         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
-#     ) as kubo_cas:
-#         # Test negative chunk_shape dimension (line 136)
-#         with pytest.raises(
-#             ValueError, match="All chunk_shape dimensions must be positive"
-#         ):
-#             await ShardedZarrStore.open(
-#                 cas=kubo_cas,
-#                 read_only=False,
-#                 array_shape=(10, 10),
-#                 chunk_shape=(-5, 5),
-#                 chunks_per_shard=10,
-#             )
-
-#         # Test negative array_shape dimension (line 141)
-#         with pytest.raises(
-#             ValueError, match="All array_shape dimensions must be non-negative"
-#         ):
-#             await ShardedZarrStore.open(
-#                 cas=kubo_cas,
-#                 read_only=False,
-#                 array_shape=(10, -10),
-#                 chunk_shape=(5, 5),
-#                 chunks_per_shard=10,
-#             )
-
-#         # Test zero-sized array (lines 150, 163) - reinforce existing test
-#         store = await ShardedZarrStore.open(
-#             cas=kubo_cas,
-#             read_only=False,
-#             array_shape=(0, 10),
-#             chunk_shape=(5, 5),
-#             chunks_per_shard=10,
-#         )
-#         assert store._total_chunks == 0
-#         assert store._num_shards == 0
-#         assert len(store._root_obj["chunks"]["shard_cids"]) == 0  # Line 163
-#         root_cid = await store.flush()
-
-#         # Test invalid manifest version (line 224)
-#         invalid_root_obj = {
-#             "manifest_version": "invalid_version",
-#             "metadata": {},
-#             "chunks": {
-#                 "array_shape": [10, 10],
-#                 "chunk_shape": [5, 5],
-#                 "cid_byte_length": 59,
-#                 "sharding_config": {"chunks8048": 10},
-#                 "shard_cids": [None] * 4,
-#             },
-#         }
-#         invalid_root_cid = await kubo_cas.save(
-#             dag_cbor.encode(invalid_root_obj), codec="dag-cbor"
-#         )
-#         with pytest.raises(ValueError, match="Incompatible manifest version"):
-#             await ShardedZarrStore.open(
-#                 cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
-#             )
-
-#         # Test inconsistent shard count (line 236)
-#         invalid_root_obj = {
-#             "manifest_version": "sharded_zarr_v1",
-#             "metadata": {},
-#             "chunks": {
-#                 "array_shape": [
-#                     10,
-#                     10,
-#                 ],  # 100 chunks, with 10 chunks per shard -> 10 shards
-#                 "chunk_shape": [5, 5],
-#                 "cid_byte_length": 59,
-#                 "sharding_config": {"chunks_per_shard": 10},
-#                 "shard_cids": [None] * 5,  # Wrong number of shards
-#             },
-#         }
-#         invalid_root_cid = await kubo_cas.save(
-#             dag_cbor.encode(invalid_root_obj), codec="dag-cbor"
-#         )
-#         with pytest.raises(ValueError, match="Inconsistent number of shards"):
-#             await ShardedZarrStore.open(
-#                 cas=kubo_cas, read_only=True, root_cid=invalid_root_cid
-#             )
-
-
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
     """Tests chunk key parsing edge cases."""
@@ -1126,8 +1037,8 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, 
     rpc_base_url, gateway_base_url = create_ipfs
 
     # Provided CIDs
-    finalized_cid = "bafyr4icrox4pxashkfmbyztn7jhp6zjlpj3bufg5ggsjux74zr7ocnqdpu"
-    non_finalized_cid = "bafyr4ibj3bfl5oo7bf6gagzr2g33jlnf23mq2xo632mbl6ytfry7jbuepy"
+    finalized_cid = "bafyr4iacuutc5bgmirkfyzn4igi2wys7e42kkn674hx3c4dv4wrgjp2k2u"
+    non_finalized_cid = "bafyr4iayq3aaifmyv4o7ezoi4xyysstit3ohvnq4cnjlbjwueqehlbvkla"
     async with KuboCAS(
         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
     ) as kubo_cas:
@@ -1168,7 +1079,6 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, 
         combined_ds = xr.concat([ds_finalized, ds_non_finalized_sliced], dim="time")
         print("\nCombined dataset time range:")
         print(combined_ds.time.min().values, "to", combined_ds.time.max().values)
-        print("EHRUKHUKEHUK")
 
         # Verify that the combined dataset is still lazy
         assert combined_ds["2m_temperature"].chunks is not None
