@@ -170,7 +170,7 @@ async def test_kubocas_public_gateway():
         # Test local gateway as if it were a public gateway
         ("http://127.0.0.1:8080", "local gateway"),
         # Could add actual public gateways here, but they're unreliable for CI
-        # ("https://ipfs.io", "ipfs.io public gateway"),
+        ("https://ipfs.io", "ipfs.io public gateway"),
     ]
 
     for gateway_url, gateway_name in test_gateways:
