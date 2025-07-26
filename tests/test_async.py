@@ -104,26 +104,30 @@ async def test_kubocas_no_running_loop_in_aclose():
     # Create a client in the current loop
     _ = cas._loop_client()
 
-    # Simulate calling aclose when there's no event loop
-    # We'll mock this by calling the method directly
-    import unittest.mock
-
-    # Test the __del__ method with no running loop scenario
+    # Test __del__ behavior when there's no running loop
     with unittest.mock.patch(
         "asyncio.get_running_loop", side_effect=RuntimeError("No running loop")
     ):
-        # This will trigger the exception path in __del__
-        # where it gets a RuntimeError and sets loop = None
+        # This should handle the no-loop case gracefully
         cas.__del__()
 
-    # Now test the normal aclose path with no running loop
+    # Also test aclose directly with no loop
+    # First close it normally
+    await cas.aclose()
+
+    # Create a new instance
+    cas2 = KuboCAS()
+    _ = cas2._loop_client()
+
+    # Now mock no running loop for aclose
     with unittest.mock.patch(
         "asyncio.get_running_loop", side_effect=RuntimeError("No running loop")
     ):
-        await cas.aclose()
+        # The aclose method should handle this gracefully
+        await cas2.aclose()
 
-    # The client references should be cleared
-    assert len(cas._client_per_loop) == 0
+    # Verify cleanup happened
+    assert len(cas2._client_per_loop) == 0
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import unittest
 from threading import Event, Thread
 
 import pytest
@@ -120,3 +121,68 @@ async def test_del_closes_client():
     await asyncio.sleep(0)
 
     assert client.is_closed
+
+
+# --------------------------------------------------------------------------- #
+# 1.  Early‑return guard – instance missing internal sentinel attributes      #
+# --------------------------------------------------------------------------- #
+def test_del_missing_internal_attributes(monkeypatch):
+    """
+    If either ``_owns_client`` or ``_closed`` is absent, __del__ must bail out
+    immediately.  We remove one attribute and assert that nothing blows up.
+    """
+    cas = KuboCAS()  # fully‑initialised object
+    del cas._owns_client  # simulate a partially‑constructed instance
+
+    # __del__ should *just return* – no exceptions, no side effects
+    cas.__del__()  # noqa:  B023  (explicit dunder call is deliberate)
+
+
+# --------------------------------------------------------------------------- #
+# 2.  Loop present *but* not running  →  asyncio.run(...) branch (317‑322)    #
+# --------------------------------------------------------------------------- #
+def test_del_loop_not_running_branch(monkeypatch):
+    """
+    Force __del__ down the branch where an event loop *exists* but is *not*
+    running, then make ``asyncio.run()`` raise so the error‑handling block
+    is executed as well (two birds, one stone).
+    """
+    cas = KuboCAS()
+
+    # ------------------------------------------------------------------ #
+    # 2a.  Fake "current loop" object whose ``is_running()`` is *False*  #
+    # ------------------------------------------------------------------ #
+    dummy_loop = unittest.mock.Mock(is_running=lambda: False)
+
+    # Patch *this* thread’s "running loop" to our dummy object
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: dummy_loop)
+
+    # ------------------------------------------------------------------ #
+    # 2b.  Make ``asyncio.run()`` raise – triggers the except: block      #
+    # ------------------------------------------------------------------ #
+    run_called = {"flag": False}
+
+    def fake_run(coro):
+        run_called["flag"] = True
+        raise RuntimeError("simulated failure inside asyncio.run")
+
+    monkeypatch.setattr(asyncio, "run", fake_run)
+
+    # Inject a *placeholder* client so the clean‑up code has something
+    # to clear – avoids importing httpx in sync context.
+    cas._client_per_loop[dummy_loop] = object()
+
+    # Preconditions
+    assert cas._client_per_loop and not cas._closed
+
+    # -- fire! -----------------------------------------------------------------
+    cas.__del__()  # noqa:  B023
+
+    # ------------------------------------------------------------------ #
+    # 2c.  Post‑conditions:                                              #
+    #      • asyncio.run() was attempted                                 #
+    #      • the except‑branch cleared the client cache and marked closed#
+    # ------------------------------------------------------------------ #
+    assert run_called["flag"] is True
+    assert cas._closed is True
+    assert len(cas._client_per_loop) == 0

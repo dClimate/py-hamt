@@ -37,9 +37,9 @@ jobs:
         run: uv sync
 
       - name: Install IPFS
-        uses: oduwsdl/setup-ipfs@e92fedca9f61ab9184cb74940254859f4d7af4d9 # v0.6.3
+        uses: Faolain/setup-ipfs@v0.7.0
         with:
-          ipfs_version: "0.35.0"
+          ipfs_version: "0.36.0"
           run_daemon: true
 
       - name: Run pytest with coverage
