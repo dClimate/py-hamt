@@ -183,6 +183,10 @@ class KuboCAS(ContentAddressedStore):
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
 
+        self._owns_client: bool = True  # we'll create clients lazily by default
+        self._closed: bool = False
+        self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+
         chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
         if re.fullmatch(chunker_pattern, chunker) is None:
             raise ValueError("Invalid chunker specification")
@@ -210,21 +214,16 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url: str = gateway_base_url
         """@private"""
 
-        self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
-
         if client is not None:
             # user supplied → bind it to *their* current loop
             self._client_per_loop[asyncio.get_running_loop()] = client
-            self._owns_client: bool = False
-        else:
-            self._owns_client = True  # we'll create clients lazily
+            self._owns_client = False
 
         # store for later use by _loop_client()
         self._default_headers = headers
         self._default_auth = auth
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-        self._closed: bool = False
 
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #
@@ -256,6 +255,18 @@ class KuboCAS(ContentAddressedStore):
             # User supplied the client; they are responsible for closing it.
             return
 
+        # NEW: Handle case where there's no running event loop
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop - we're likely in a sync context or during shutdown
+            # In this case, we can't properly close async clients
+            # Just clear references and mark as closed
+            self._client_per_loop.clear()
+            self._closed = True
+            return
+
+        # EXISTING CODE: Close all clients
         for client in list(self._client_per_loop.values()):
             if not client.is_closed:
                 try:
@@ -277,6 +288,9 @@ class KuboCAS(ContentAddressedStore):
 
     def __del__(self) -> None:
         """Best-effort close for internally-created clients."""
+        if not hasattr(self, "_owns_client") or not hasattr(self, "_closed"):
+            return
+
         if not self._owns_client or self._closed:
             return
 
@@ -284,16 +298,28 @@ class KuboCAS(ContentAddressedStore):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = None
+            # No running loop - can't do async cleanup
+            # Just clear the client references synchronously
+            if hasattr(self, "_client_per_loop"):
+                # We can't await client.aclose() without a loop,
+                # so just clear the references
+                self._client_per_loop.clear()
+                self._closed = True
+            return
 
+        # If we get here, we have a running loop
         try:
-            if loop is None or not loop.is_running():
-                asyncio.run(self.aclose())
-            else:
+            if loop.is_running():
+                # Schedule cleanup in the existing loop
                 loop.create_task(self.aclose())
+            else:
+                # Loop exists but not running - try asyncio.run
+                asyncio.run(self.aclose())
         except Exception:
-            # Suppress all errors during interpreter shutdown or loop teardown
-            pass
+            # If all else fails, just clear references
+            if hasattr(self, "_client_per_loop"):
+                self._client_per_loop.clear()
+                self._closed = True
 
     # --------------------------------------------------------------------- #
     # save() – now uses the per-loop client                                 #
