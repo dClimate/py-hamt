@@ -180,3 +180,23 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
         # Encrypt it
         encrypted_bytes = self._encrypt(raw_bytes)
         await self.hamt.set(key, encrypted_bytes)
+
+    # we only need to override because we have extra ctor args
+    def with_read_only(self, read_only: bool = False) -> "SimpleEncryptedZarrHAMTStore":  # noqa: D401
+        if read_only == self.read_only:
+            return self
+
+        new_hamt = HAMT(
+            cas=self.hamt.cas,
+            root_node_id=self.hamt.root_node_id,
+            read_only=read_only,
+            values_are_bytes=self.hamt.values_are_bytes,
+            max_bucket_size=self.hamt.max_bucket_size,
+            hash_fn=self.hamt.hash_fn,
+        )
+        return type(self)(
+            new_hamt,
+            read_only,
+            encryption_key=self.encryption_key,
+            header=self.header,
+        )

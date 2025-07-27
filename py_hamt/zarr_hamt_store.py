@@ -83,6 +83,33 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         """@private"""
         return self.hamt.read_only
 
+    def with_read_only(self, read_only: bool = False) -> "ZarrHAMTStore":  # noqa: D401
+        """
+        Return *this* store or a lightweight clone with the requested
+        ``read_only`` flag.
+
+        The clone shares the same HAMT *content*: we rebuild a **new**
+        :class:`~py_hamt.hamt.HAMT` instance that
+        *points to the same root CID* but is initialised in the desired
+        mode.  This involves **no I/O** – merely instantiating a Python
+        object – and therefore keeps the helper strictly synchronous,
+        exactly as expected by Zarr.
+        """
+        # Fast‑path: nothing to do
+        if read_only == self.read_only:
+            return self
+
+        # Re‑use all immutable HAMT knobs so that behaviour is identical
+        new_hamt = HAMT(
+            cas=self.hamt.cas,
+            root_node_id=self.hamt.root_node_id,
+            read_only=read_only,
+            values_are_bytes=self.hamt.values_are_bytes,
+            max_bucket_size=self.hamt.max_bucket_size,
+            hash_fn=self.hamt.hash_fn,
+        )
+        return type(self)(new_hamt, read_only=read_only)
+
     def __eq__(self, other: object) -> bool:
         """@private"""
         if not isinstance(other, ZarrHAMTStore):
