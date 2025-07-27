@@ -169,7 +169,7 @@ def create_ipfs():
     if client is None:
         pytest.skip("Neither IPFS daemon nor Docker available – skipping IPFS tests")
 
-    image = "ipfs/kubo:master-latest"
+    image = "ipfs/kubo:v0.36.0"
     rpc_p = _free_port()
     gw_p = _free_port()
 
