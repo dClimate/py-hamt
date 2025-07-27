@@ -95,7 +95,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         instance; no flushing, network traffic or async work is done.
         """
         # Fast path
-        if read_only == self._read_only:
+        if read_only == self.read_only:
             return self  # Same mode, return same instance
 
         # Create new instance with different read_only flag
