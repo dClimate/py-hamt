@@ -82,7 +82,9 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
     @property
     def read_only(self) -> bool:  # type: ignore[override]
-        return getattr(self, "_forced_read_only", self.hamt.read_only)
+        if self._forced_read_only is not None:  # instance attr overrides
+            return self._forced_read_only
+        return self.hamt.read_only
 
     def with_read_only(self, read_only: bool = False) -> "ZarrHAMTStore":
         """
@@ -102,7 +104,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
         # Copy attributes that matter
         clone.hamt = self.hamt  # Share the HAMT
-        clone._read_only = read_only
+        clone._forced_read_only = read_only
         clone.metadata_read_cache = self.metadata_read_cache.copy()
 
         # Re‑initialise the zarr base class so that Zarr sees the flag
@@ -172,7 +174,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
     async def set(self, key: str, value: zarr.core.buffer.Buffer) -> None:
         """@private"""
         if self.read_only:
-            raise zarr.abc.store.ReadOnlyError("Cannot write to read-only store")
+            raise Exception("Cannot write to a read-only store.")
 
         if key in self.metadata_read_cache:
             self.metadata_read_cache[key] = value.to_bytes()
@@ -197,7 +199,7 @@ class ZarrHAMTStore(zarr.abc.store.Store):
     async def delete(self, key: str) -> None:
         """@private"""
         if self.read_only:
-            raise zarr.abc.store.ReadOnlyError("Cannot delete from read-only store")
+            raise Exception("Cannot write to a read-only store.")
         try:
             await self.hamt.delete(key)
             # In practice these lines never seem to be needed, creating and appending data are the only operations most zarrs actually undergo
