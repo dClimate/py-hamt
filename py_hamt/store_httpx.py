@@ -1,7 +1,7 @@
 import asyncio
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Literal, Tuple, cast
+from typing import Any, Literal, Tuple, cast
 
 import httpx
 from dag_cbor.ipld import IPLDKind
@@ -183,10 +183,6 @@ class KuboCAS(ContentAddressedStore):
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
 
-        self._owns_client: bool = True  # we'll create clients lazily by default
-        self._closed: bool = False
-        self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
-
         chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
         if re.fullmatch(chunker_pattern, chunker) is None:
             raise ValueError("Invalid chunker specification")
@@ -215,9 +211,16 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
 
         if client is not None:
-            # user supplied → bind it to *their* current loop
-            self._client_per_loop[asyncio.get_running_loop()] = client
+            # A client was supplied by the user. We don't own it.
             self._owns_client = False
+            self._client_per_loop = {asyncio.get_running_loop(): client}
+        else:
+            # No client supplied. We will own any clients we create.
+            self._owns_client = True
+            self._client_per_loop = {}
+
+        # The instance is never closed on initialization.
+        self._closed = False
 
         # store for later use by _loop_client()
         self._default_headers = headers
