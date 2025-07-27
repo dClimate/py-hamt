@@ -1,5 +1,6 @@
 import asyncio
 
+import dag_cbor
 import httpx
 import pytest
 
@@ -305,6 +306,50 @@ async def test_fix_kubocas_load():
         pytest.skip("Local IPFS daemon not running")
     finally:
         await cas.aclose()
+
+
+SMALL_DAG_CBOR_CID = "bafyreibwzifwg3a3z5h6vxxalxdtfv5ihof6j4mhy4cl4kxh3fbxn6v2iq"
+
+
+@pytest.mark.asyncio
+async def test_local_dag_cbor_accept_header():
+    """Local gateway should honour Accept: application/vnd.ipld.dag-cbor"""
+
+    # Step 1: Minimal DAG-CBOR object (e.g., [1, 2, 3])
+    dag_cbor_data = dag_cbor.encode([1, 2, 3])  # Expected output: b'\x83\x01\x02\x03'
+
+    # Step 2: Store it via Kubo RPC as dag-cbor
+    cas = KuboCAS(
+        rpc_base_url="http://127.0.0.1:5001",
+        gateway_base_url="http://127.0.0.1:8080",
+    )
+
+    try:
+        cid = await cas.save(dag_cbor_data, codec="dag-cbor")
+        print(f"Saved DAG-CBOR CID: {cid}")
+        await asyncio.sleep(0.5)  # Give IPFS time to index the block
+    finally:
+        await cas.aclose()
+
+    # Step 3: Fetch using Accept header
+    url = f"http://127.0.0.1:8080/ipfs/{cid}"
+    headers = {"Accept": "application/vnd.ipld.dag-cbor"}
+
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        try:
+            r = await client.get(url, headers=headers)
+        except (httpx.ConnectError, httpx.TimeoutException):
+            pytest.skip("Local IPFS gateway not reachable")
+
+    if r.status_code >= 500:
+        pytest.skip(f"Local gateway returned {r.status_code}")
+
+    # Step 4: Verify response
+    assert r.headers.get("content-type", "").startswith(
+        "application/vnd.ipld.dag-cbor"
+    ), "Gateway did not honor Accept header"
+
+    assert r.content[:1] == b"\x83", "Response is not a DAG-CBOR array of length 3"
 
 
 if __name__ == "__main__":
