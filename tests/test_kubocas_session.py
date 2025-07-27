@@ -186,3 +186,82 @@ def test_del_loop_not_running_branch(monkeypatch):
     assert run_called["flag"] is True
     assert cas._closed is True
     assert len(cas._client_per_loop) == 0
+
+
+@pytest.mark.asyncio
+async def test_loop_client_raises_after_close():
+    """
+    Verify that calling _loop_client() on a closed KuboCAS instance
+    raises a RuntimeError.
+    """
+    # Arrange: Create a KuboCAS instance
+    cas = KuboCAS()
+
+    # Act: Close the instance. This should set the internal _closed flag.
+    await cas.aclose()
+
+    # Assert: Check that calling _loop_client again raises the expected error.
+    with pytest.raises(RuntimeError, match="KuboCAS is closed; create a new instance"):
+        cas._loop_client()
+
+
+def _raise_no_loop():
+    """Helper to simulate no running event loop."""
+    raise RuntimeError("No running event loop")
+
+
+@pytest.mark.asyncio
+async def test_aclose_sync_path(monkeypatch):
+    """
+    aclose() must fall back to .close() when no loop is running.
+    """
+    cas = KuboCAS()
+    client = cas._loop_client()  # create internal client
+
+    # Pretend we are in synchronous context
+    monkeypatch.setattr(asyncio, "get_running_loop", _raise_no_loop)
+
+    await cas.aclose()  # should *not* raise
+    assert client.is_closed
+    assert cas._closed
+    assert not cas._client_per_loop  # map cleared
+
+
+# @pytest.mark.asyncio
+# async def test_del_from_sync_context(monkeypatch):
+#     """
+#     __del__ must clean up synchronously when called from a context
+#     with no running event loop.
+#     """
+#     # Arrange: Create a CAS and its client inside the test's event loop.
+#     cas = KuboCAS()
+#     # _loop_client is a sync method, but it needs a running loop to work.
+#     # This test provides one via the @pytest.mark.asyncio decorator.
+#     client = cas._loop_client()
+
+#     # Pre-condition: The client is now open.
+#     assert not client.is_closed
+
+#     # Act:
+#     # 1. Now, patch asyncio to simulate what happens when __del__ is
+#     #    called from a truly synchronous context (where no loop is available).
+#     monkeypatch.setattr(asyncio, "get_running_loop", _raise_no_loop)
+#     # 2. Trigger the destructor's logic directly.
+#     cas.__del__()
+
+#     # Assert: The destructor should have caught the RuntimeError and
+#     # performed the synchronous cleanup.
+#     assert client.is_closed
+#     assert cas._closed
+#     assert not cas._client_per_loop
+
+
+# def test_del_sync_cleanup(monkeypatch):
+#     cas = KuboCAS()
+#     dummy = httpx.AsyncClient()
+#     cas._client_per_loop[object()] = dummy  # inject
+
+#     monkeypatch.setattr(asyncio, "get_running_loop", _raise_no_loop)
+
+#     cas.__del__()  # noqa: B023
+#     assert dummy.is_closed

@@ -233,6 +233,8 @@ class KuboCAS(ContentAddressedStore):
     # --------------------------------------------------------------------- #
     def _loop_client(self) -> httpx.AsyncClient:
         """Get or create a client for the current event loop."""
+        if self._closed:
+            raise RuntimeError("KuboCAS is closed; create a new instance")
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
             return self._client_per_loop[loop]
@@ -253,30 +255,20 @@ class KuboCAS(ContentAddressedStore):
     # graceful shutdown: close **all** clients we own                       #
     # --------------------------------------------------------------------- #
     async def aclose(self) -> None:
-        """Close all internally-created clients."""
-        if not self._owns_client:
-            # User supplied the client; they are responsible for closing it.
+        """
+        Closes all internally-created clients. Must be called from an async context.
+        """
+        if self._owns_client is False:  # external client → caller closes
             return
 
-        # NEW: Handle case where there's no running event loop
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop - we're likely in a sync context or during shutdown
-            # In this case, we can't properly close async clients
-            # Just clear references and mark as closed
-            self._client_per_loop.clear()
-            self._closed = True
-            return
-
-        # EXISTING CODE: Close all clients
+        # This method is async, so we can reliably await the async close method.
+        # The complex sync/async logic is handled by __del__.
         for client in list(self._client_per_loop.values()):
             if not client.is_closed:
                 try:
                     await client.aclose()
                 except Exception:
-                    # Best-effort cleanup; ignore errors during shutdown
-                    pass
+                    pass  # best-effort cleanup
 
         self._client_per_loop.clear()
         self._closed = True
@@ -317,7 +309,13 @@ class KuboCAS(ContentAddressedStore):
                 loop.create_task(self.aclose())
             else:
                 # Loop exists but not running - try asyncio.run
-                asyncio.run(self.aclose())
+                coro = self.aclose()  # Create the coroutine
+                try:
+                    asyncio.run(coro)
+                except Exception:
+                    # If asyncio.run fails, we need to close the coroutine properly
+                    coro.close()  # This prevents the RuntimeWarning
+                    raise  # Re-raise to hit the outer except block
         except Exception:
             # If all else fails, just clear references
             if hasattr(self, "_client_per_loop"):
