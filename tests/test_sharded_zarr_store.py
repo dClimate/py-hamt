@@ -97,7 +97,7 @@ async def test_load_or_initialize_shard_cache_concurrent_loads(
         # Create a shard with data
         shard_idx = 0
         shard_data = [
-            CID.decode("bafyr4idgcwyxddd2mlskpo7vltcicf5mtozlzt4vzpivqmn343hk3c5nbu")
+            CID.decode("bafyr4iacuutc5bgmirkfyzn4igi2wys7e42kkn674hx3c4dv4wrgjp2k2u")
             for _ in range(4)
         ]
         shard_data_bytes = dag_cbor.encode(shard_data)
@@ -1039,7 +1039,7 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, 
 
     # Provided CIDs
     finalized_cid = "bafyr4iacuutc5bgmirkfyzn4igi2wys7e42kkn674hx3c4dv4wrgjp2k2u"
-    non_finalized_cid = "bafyr4iayq3aaifmyv4o7ezoi4xyysstit3ohvnq4cnjlbjwueqehlbvkla"
+    non_finalized_cid = "bafyr4ihicmzx4uw4pefk7idba3mz5r5g27au3l7d62yj4gguxx6neaa5ti"
     async with KuboCAS(
         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
     ) as kubo_cas:

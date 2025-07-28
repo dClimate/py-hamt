@@ -6,7 +6,7 @@ from multiformats import CID
 
 from py_hamt import KuboCAS
 
-TEST_CID = "bafyr4idgcwyxddd2mlskpo7vltcicf5mtozlzt4vzpivqmn343hk3c5nbu"
+TEST_CID = "bafyr4ibiduv7ml3jeyl3gn6cjcrcizfqss7j64rywpbj3whr7tc6xipt3y"
 
 
 async def verify_response_content(url: str, client=None):
