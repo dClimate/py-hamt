@@ -39,6 +39,26 @@ async def test_plain_with_same_flag_returns_self():
     assert rw.with_read_only(False) is rw  # early‑return path
 
 
+@pytest.mark.asyncio
+async def test_roundtrip_plain_store():
+    rw = await _rw_plain()  # writable store
+    ro = rw.with_read_only(True)  # clone → RO
+    assert ro.read_only is True
+    assert ro.hamt is rw.hamt
+
+    # idempotent: RO→RO returns same object
+    assert ro.with_read_only(True) is ro
+
+    # back to RW (new wrapper)
+    rw2 = ro.with_read_only(False)
+    assert rw2.read_only is False and rw2 is not ro
+    assert rw2.hamt is rw.hamt
+
+    # guard: cannot write through RO wrapper
+    with pytest.raises(Exception):
+        await ro.set("k", np.array([0], dtype="u1"))
+
+
 # ---------- encrypted store -------------------------------------------
 @pytest.mark.asyncio
 async def test_encrypted_read_only_guards_and_self():
