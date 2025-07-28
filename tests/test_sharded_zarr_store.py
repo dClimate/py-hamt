@@ -272,6 +272,9 @@ async def test_sharded_zarr_store_metadata(
         assert await store_read.exists("time/c/0")
         # assert not await store_read.exists("nonexistent")
 
+        # Test does not exist
+        assert not await store_read.exists("temp/c/20/0/0")  # Non-existent chunk
+
         # Test list
         keys = [key async for key in store_read.list()]
         assert len(keys) > 0
@@ -736,11 +739,11 @@ async def test_sharded_zarr_store_get_partial_values(
         print(f"OffsetByteRequest: OK (Got {len(results[1].to_bytes())} bytes)")
 
         # Check SuffixByteRequest result
-        # expected_suffix = full_chunk_data[-20:]
-        # assert results[2].to_bytes() == expected_suffix, (
-        #     "SuffixByteRequest result does not match"
-        # )
-        # print(f"SuffixByteRequest: OK (Got {len(results[2].to_bytes())} bytes)")
+        expected_suffix = full_chunk_data[-20:]
+        assert results[2].to_bytes() == expected_suffix, (
+            "SuffixByteRequest result does not match"
+        )
+        print(f"SuffixByteRequest: OK (Got {len(results[2].to_bytes())} bytes)")
 
         # Check full read result
         assert results[3].to_bytes() == full_chunk_data, (
@@ -782,20 +785,6 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert store._parse_chunk_key("time/c/0") is None
         assert store._parse_chunk_key("lat/c/0/0") is None
         assert store._parse_chunk_key("lon/c/0/0") is None
-
-        # Test uninitialized store
-        # uninitialized_store = ShardedZarrStore(kubo_cas, read_only=False, root_cid=None)
-        # assert uninitialized_store._parse_chunk_key("temp/c/0/0") is None
-
-        # # Test get on uninitialized store
-        # with pytest.raises(
-        #     RuntimeError, match="Load the root object first before accessing data."
-        # ):
-        #     proto = zarr.core.buffer.default_buffer_prototype()
-        #     await uninitialized_store.get("temp/c/0/0", proto)
-
-        # with pytest.raises(RuntimeError, match="Cannot load root without a root_cid."):
-        #     await uninitialized_store._load_root_from_cid()
 
         # Test dimensionality mismatch
         with pytest.raises(IndexError, match="tuple index out of range"):
@@ -1024,8 +1013,6 @@ async def test_sharded_zarr_store_lazy_concat(
         ).temp.values
         np.testing.assert_array_equal(sample_result, expected_sample)
 
-        print("\n✅ Lazy concatenation test successful! Data verified.")
-
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, str]):
@@ -1072,14 +1059,9 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, 
         # Verify that the sliced dataset starts after the finalization date
         if ds_non_finalized_sliced.time.size > 0:
             assert ds_non_finalized_sliced.time.min() > finalization_date
-        else:
-            # Handle case where non-finalized dataset is empty after slicing
-            print("Warning: Non-finalized dataset is empty after slicing.")
 
         # 3. --- Lazily Concatenate Datasets ---
         combined_ds = xr.concat([ds_finalized, ds_non_finalized_sliced], dim="time")
-        print("\nCombined dataset time range:")
-        print(combined_ds.time.min().values, "to", combined_ds.time.max().values)
 
         # Verify that the combined dataset is still lazy
         assert combined_ds["2m_temperature"].chunks is not None
@@ -1142,5 +1124,3 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, 
         if query_result.time.size > 0:
             assert query_result.time.min() >= query_start
             assert query_result.time.max() <= query_end
-
-        print("\n✅ Lazy concatenation with CIDs test successful! Data verified.")

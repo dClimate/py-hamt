@@ -407,6 +407,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # Metadata is often saved as 'raw', chunks as well unless compressed.
         data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
         await self.set_pointer(key, str(data_cid_obj))
+        return None
 
     async def set_pointer(self, key: str, pointer: str) -> None:
         chunk_coords = self._parse_chunk_key(key)
@@ -416,7 +417,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if chunk_coords is None:  # Metadata key
             self._root_obj["metadata"][key] = pointer_cid_obj
             self._dirty_root = True
-            return
+            return None
 
         linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
         shard_idx, index_in_shard = self._get_shard_info(linear_chunk_index)
@@ -428,16 +429,20 @@ class ShardedZarrStore(zarr.abc.store.Store):
             if target_shard_list[index_in_shard] != pointer_cid_obj:
                 target_shard_list[index_in_shard] = pointer_cid_obj
                 self._dirty_shards.add(shard_idx)
+        return None
 
     async def exists(self, key: str) -> bool:
-        chunk_coords = self._parse_chunk_key(key)
-        if chunk_coords is None:  # Metadata
-            return key in self._root_obj.get("metadata", {})
-        linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
-        shard_idx, index_in_shard = self._get_shard_info(linear_chunk_index)
-        # Load shard if not cached and check the index
-        target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
-        return target_shard_list[index_in_shard] is not None
+        try:
+            chunk_coords = self._parse_chunk_key(key)
+            if chunk_coords is None:  # Metadata
+                return key in self._root_obj.get("metadata", {})
+            linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
+            shard_idx, index_in_shard = self._get_shard_info(linear_chunk_index)
+            # Load shard if not cached and check the index
+            target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
+            return target_shard_list[index_in_shard] is not None
+        except (ValueError, IndexError, KeyError):
+            return False
 
     @property
     def supports_writes(self) -> bool:
@@ -461,7 +466,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 self._dirty_root = True
             else:
                 raise KeyError(f"Metadata key '{key}' not found.")
-            return
+            return None
 
         linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
         shard_idx, index_in_shard = self._get_shard_info(linear_chunk_index)
@@ -600,7 +605,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             new_zarr_metadata_bytes, codec="raw"
         )
 
-        self._root_obj["metadata"][zarr_metadata_key] = str(new_zarr_metadata_cid)
+        self._root_obj["metadata"][zarr_metadata_key] = new_zarr_metadata_cid
         self._dirty_root = True
 
     async def list_dir(self, prefix: str) -> AsyncIterator[str]:
