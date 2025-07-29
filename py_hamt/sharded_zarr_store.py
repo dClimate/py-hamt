@@ -344,7 +344,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
             target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
 
         # Get the CID object (or None) from the cached list.
-        chunk_cid_obj = target_shard_list[index_in_shard]
+        chunk_cid_obj = target_shard_list[index_in_shard] 
+
+        print(key, str(chunk_cid_str))
 
         if chunk_cid_obj is None:
             return None  # Chunk is empty/doesn't exist.
@@ -374,6 +376,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return prototype.buffer.from_bytes(data)
 
     async def set(self, key: str, value: zarr.core.buffer.Buffer) -> None:
+        print(f"Setting key: {key}, value size: {len(value.to_bytes())} bytes")
         if self.read_only:
             raise PermissionError("Cannot write to a read-only store.")
         await self._resize_complete.wait()
