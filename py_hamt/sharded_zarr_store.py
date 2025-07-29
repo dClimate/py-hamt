@@ -346,7 +346,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # Get the CID object (or None) from the cached list.
         chunk_cid_obj = target_shard_list[index_in_shard] 
 
-        print(key, str(chunk_cid_str))
+        print(key, str(chunk_cid_obj))
 
         if chunk_cid_obj is None:
             return None  # Chunk is empty/doesn't exist.
