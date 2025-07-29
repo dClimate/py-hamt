@@ -104,6 +104,7 @@ async def test_kubocas_public_gateway():
     cas = KuboCAS(
         rpc_base_url="http://127.0.0.1:5001",  # Keep local RPC for saves
         gateway_base_url="https://ipfs.io",  # Use public gateway for loads
+        max_retries=0,
     )
 
     try:
@@ -134,6 +135,7 @@ async def test_trailing_slash_gateway():
     cas = KuboCAS(
         rpc_base_url="http://127.0.0.1:5001",
         gateway_base_url="http://127.0.0.1:8080/",  # Note the trailing slash
+        max_retries=0,
     )
 
     try:
@@ -196,7 +198,9 @@ async def test_fix_kubocas_load():
 
     # Use the fixed implementation with a public gateway
     cas = FixedKuboCAS(
-        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="https://ipfs.io/ipfs/"
+        rpc_base_url="http://127.0.0.1:5001",
+        gateway_base_url="https://ipfs.io/ipfs/",
+        max_retries=0,
     )
 
     try:
