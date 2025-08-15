@@ -206,6 +206,22 @@ async def test_loop_client_reopens_after_close():
     await cas.aclose()
 
 
+@pytest.mark.asyncio
+async def test_loop_client_rejects_reuse_of_external_client(global_client_session):
+    """Calling _loop_client() after aclose() raises when client is user-supplied."""
+    cas = KuboCAS(
+        client=global_client_session,
+        rpc_base_url="http://127.0.0.1:5001",
+        gateway_base_url="http://127.0.0.1:8080",
+    )
+    assert cas._loop_client() is global_client_session
+
+    await cas.aclose()
+    cas._closed = True  # simulate closed instance with external client
+    with pytest.raises(RuntimeError, match="KuboCAS is closed; create a new instance"):
+        cas._loop_client()
+
+
 def _raise_no_loop():
     """Helper to simulate no running event loop."""
     raise RuntimeError("No running event loop")
