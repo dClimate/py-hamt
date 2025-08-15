@@ -3,6 +3,7 @@ import inspect
 import unittest
 from threading import Event, Thread
 
+import httpx
 import pytest
 
 from py_hamt import KuboCAS
@@ -189,20 +190,20 @@ def test_del_loop_not_running_branch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_loop_client_raises_after_close():
-    """
-    Verify that calling _loop_client() on a closed KuboCAS instance
-    raises a RuntimeError.
-    """
-    # Arrange: Create a KuboCAS instance
+async def test_loop_client_reopens_after_close():
+    """Calling _loop_client() after aclose() recreates a fresh client."""
     cas = KuboCAS()
 
-    # Act: Close the instance. This should set the internal _closed flag.
+    first = cas._loop_client()
     await cas.aclose()
 
-    # Assert: Check that calling _loop_client again raises the expected error.
-    with pytest.raises(RuntimeError, match="KuboCAS is closed; create a new instance"):
-        cas._loop_client()
+    # Should no longer raise; instead a new client is created.
+    reopened = cas._loop_client()
+    assert isinstance(reopened, httpx.AsyncClient)
+    assert reopened is not first
+    assert cas._closed is False
+
+    await cas.aclose()
 
 
 def _raise_no_loop():
