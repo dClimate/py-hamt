@@ -335,15 +335,34 @@ async def test_kubo_http_status_error_no_retry():
                     mock_sleep.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_kubo_http_runtime_error():
-    async with KuboCAS(max_retries=-1) as kubo_cas:
-        with pytest.raises(RuntimeError, match="Exited the retry loop unexpectedly"):
-            await kubo_cas.load("invalid_cid")
-
 
 @pytest.mark.asyncio
-async def test_kubo_save_http_runtime_error():
-    async with KuboCAS(max_retries=-1) as kubo_cas:
-        with pytest.raises(RuntimeError, match="Exited the retry loop unexpectedly"):
-            await kubo_cas.save(b"some data", codec="raw")
+async def test_kubo_cas_retry_validation():
+    """Test validation of retry parameters in KuboCAS constructor"""
+    
+    # Test max_retries validation
+    with pytest.raises(ValueError, match="max_retries must be non-negative"):
+        KuboCAS(max_retries=-1)
+    
+    with pytest.raises(ValueError, match="max_retries must be non-negative"):
+        KuboCAS(max_retries=-5)
+    
+    # Test initial_delay validation
+    with pytest.raises(ValueError, match="initial_delay must be positive"):
+        KuboCAS(initial_delay=0)
+    
+    with pytest.raises(ValueError, match="initial_delay must be positive"):
+        KuboCAS(initial_delay=-1.0)
+    
+    # Test backoff_factor validation
+    with pytest.raises(ValueError, match="backoff_factor must be >= 1.0 for exponential backoff"):
+        KuboCAS(backoff_factor=0.5)
+    
+    with pytest.raises(ValueError, match="backoff_factor must be >= 1.0 for exponential backoff"):
+        KuboCAS(backoff_factor=0.9)
+    
+    # Test valid edge case values
+    async with KuboCAS(max_retries=0, initial_delay=0.001, backoff_factor=1.0) as kubo_cas:
+        assert kubo_cas.max_retries == 0
+        assert kubo_cas.initial_delay == 0.001
+        assert kubo_cas.backoff_factor == 1.0

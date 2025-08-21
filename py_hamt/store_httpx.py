@@ -232,6 +232,15 @@ class KuboCAS(ContentAddressedStore):
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
         self._closed: bool = False
+        
+        # Validate retry parameters
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        if initial_delay <= 0:
+            raise ValueError("initial_delay must be positive")
+        if backoff_factor < 1.0:
+            raise ValueError("backoff_factor must be >= 1.0 for exponential backoff")
+        
         self.max_retries = max_retries
         self.initial_delay = initial_delay
         self.backoff_factor = backoff_factor
@@ -378,13 +387,12 @@ class KuboCAS(ContentAddressedStore):
                         self.backoff_factor ** (retry_count - 1)
                     )
                     # Add some jitter to prevent thundering herd
-                    jitter = delay * 0.1 * (0.5 - random.random() / 2)
+                    jitter = delay * 0.1 * (random.random() - 0.5)
                     await asyncio.sleep(delay + jitter)
 
                 except httpx.HTTPStatusError:
                     # Re-raise non-timeout HTTP errors immediately
                     raise
-        raise RuntimeError("Exited the retry loop unexpectedly.")
 
     async def load(self, id: IPLDKind) -> bytes:
         cid = cast(CID, id)
@@ -414,10 +422,9 @@ class KuboCAS(ContentAddressedStore):
                         self.backoff_factor ** (retry_count - 1)
                     )
                     # Add some jitter to prevent thundering herd
-                    jitter = delay * 0.1 * (0.5 - random.random() / 2)
+                    jitter = delay * 0.1 * (random.random() - 0.5)
                     await asyncio.sleep(delay + jitter)
 
                 except httpx.HTTPStatusError:
                     # Re-raise non-timeout HTTP errors immediately
                     raise
-        raise RuntimeError("Exited the retry loop unexpectedly.")
