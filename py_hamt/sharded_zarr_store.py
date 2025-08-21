@@ -268,6 +268,48 @@ class ShardedZarrStore(zarr.abc.store.Store):
         results = await asyncio.gather(*tasks)
         return results
 
+    def with_read_only(self, read_only: bool = False) -> "ShardedZarrStore":
+        """
+        Return this store (if the flag already matches) or a *shallow*
+        clone that presents the requested read‑only status.
+
+        The clone **shares** the same CAS instance and internal state;
+        no flushing, network traffic or async work is done.
+        """
+        # Fast path
+        if read_only == self.read_only:
+            return self  # Same mode, return same instance
+
+        # Create new instance with different read_only flag
+        # Creates a *bare* instance without running its __init__
+        clone = type(self).__new__(type(self))
+
+        # Copy all attributes from the current instance
+        clone.cas = self.cas
+        clone._root_cid = self._root_cid
+        clone._root_obj = self._root_obj
+
+        clone._resize_lock = self._resize_lock
+        clone._resize_complete = self._resize_complete
+        clone._shard_locks = self._shard_locks
+
+        clone._shard_data_cache = self._shard_data_cache
+        clone._dirty_shards = self._dirty_shards
+        clone._pending_shard_loads = self._pending_shard_loads
+
+        clone._array_shape = self._array_shape
+        clone._chunk_shape = self._chunk_shape
+        clone._chunks_per_dim = self._chunks_per_dim
+        clone._chunks_per_shard = self._chunks_per_shard
+        clone._num_shards = self._num_shards
+        clone._total_chunks = self._total_chunks
+
+        clone._dirty_root = self._dirty_root
+
+        # Re‑initialise the zarr base class so that Zarr sees the flag
+        zarr.abc.store.Store.__init__(clone, read_only=read_only)
+        return clone
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ShardedZarrStore):
             return False

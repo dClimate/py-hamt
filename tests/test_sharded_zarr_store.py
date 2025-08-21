@@ -525,6 +525,62 @@ async def test_store_eq_method(create_ipfs: tuple[str, str]):
 
 
 @pytest.mark.asyncio
+async def test_with_read_only(create_ipfs: tuple[str, str]):
+    """Tests the with_read_only method."""
+    rpc_base_url, gateway_base_url = create_ipfs
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # Create a writable store
+        store_write = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=(10, 10),
+            chunk_shape=(5, 5),
+            chunks_per_shard=4,
+        )
+
+        # Test same mode returns same instance
+        same_store = store_write.with_read_only(False)
+        assert same_store is store_write
+
+        # Test switching to read-only
+        store_read_only = store_write.with_read_only(True)
+        assert store_read_only is not store_write
+        assert store_read_only.read_only is True
+        assert store_write.read_only is False
+
+        # Test that clone shares the same state
+        assert store_read_only.cas is store_write.cas
+        assert store_read_only._root_cid == store_write._root_cid
+        assert store_read_only._root_obj is store_write._root_obj
+        assert store_read_only._shard_data_cache is store_write._shard_data_cache
+        assert store_read_only._dirty_shards is store_write._dirty_shards
+        assert store_read_only._array_shape == store_write._array_shape
+        assert store_read_only._chunk_shape == store_write._chunk_shape
+        assert store_read_only._chunks_per_shard == store_write._chunks_per_shard
+
+        # Test switching back to writable
+        store_write_again = store_read_only.with_read_only(False)
+        assert store_write_again is not store_read_only
+        assert store_write_again.read_only is False
+
+        # Test write operations are blocked on read-only store
+        proto = zarr.core.buffer.default_buffer_prototype()
+        test_data = proto.buffer.from_bytes(b"test_data")
+
+        with pytest.raises(PermissionError):
+            await store_read_only.set("test_key", test_data)
+
+        with pytest.raises(PermissionError):
+            await store_read_only.delete("test_key")
+
+        # Test write operations work on writable store
+        await store_write.set("test_key", test_data)
+        await store_write.delete("test_key")
+
+
+@pytest.mark.asyncio
 async def test_listing_and_metadata(
     create_ipfs: tuple[str, str], random_zarr_dataset: xr.Dataset
 ):
