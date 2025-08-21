@@ -232,9 +232,21 @@ class KuboCAS(ContentAddressedStore):
     # helper: get or create the client bound to the current running loop    #
     # --------------------------------------------------------------------- #
     def _loop_client(self) -> httpx.AsyncClient:
-        """Get or create a client for the current event loop."""
+        """Get or create a client for the current event loop.
+
+        If the instance was previously closed but owns its clients, a fresh
+        client mapping is lazily created on demand.  Users that supplied their
+        own ``httpx.AsyncClient`` still receive an error when the instance has
+        been closed, as we cannot safely recreate their client.
+        """
         if self._closed:
-            raise RuntimeError("KuboCAS is closed; create a new instance")
+            if not self._owns_client:
+                raise RuntimeError("KuboCAS is closed; create a new instance")
+            # We previously closed all internally-owned clients. Reset the
+            # state so that new clients can be created lazily.
+            self._closed = False
+            self._client_per_loop = {}
+
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
             return self._client_per_loop[loop]
@@ -245,7 +257,7 @@ class KuboCAS(ContentAddressedStore):
                 headers=self._default_headers,
                 auth=self._default_auth,
                 limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
-                # Uncomment when they finally support Robost HTTP/2 GOAWAY responses
+                # Uncomment when they finally support Robust HTTP/2 GOAWAY responses
                 # http2=True,
             )
             self._client_per_loop[loop] = client
