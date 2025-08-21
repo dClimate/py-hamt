@@ -110,6 +110,19 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
         self.header = header
         self.metadata_read_cache: dict[str, bytes] = {}
 
+    def with_read_only(self, read_only: bool = False) -> "SimpleEncryptedZarrHAMTStore":
+        if read_only == self.read_only:
+            return self
+
+        clone = type(self).__new__(type(self))
+        clone.hamt = self.hamt
+        clone.encryption_key = self.encryption_key
+        clone.header = self.header
+        clone.metadata_read_cache = self.metadata_read_cache
+        clone._forced_read_only = read_only  # safe; attribute is declared
+        zarr.abc.store.Store.__init__(clone, read_only=read_only)
+        return clone
+
     def _encrypt(self, val: bytes) -> bytes:
         """Encrypts data using ChaCha20-Poly1305."""
         nonce = get_random_bytes(24)  # XChaCha20 uses a 24-byte nonce

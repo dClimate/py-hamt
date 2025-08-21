@@ -9,7 +9,7 @@ dependencies = [
     "dag-cbor>=0.3.3",
     "msgspec>=0.18.6",
     "multiformats[full]>=0.3.1.post4",
-    "zarr>=3.0.8",
+    "zarr==3.0.9",
     "pycryptodome>=3.21.0",
 ]
 
