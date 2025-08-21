@@ -6,7 +6,6 @@ import pytest
 
 from py_hamt import KuboCAS
 
-TEST_CID = "bafyr4ibiduv7ml3jeyl3gn6cjcrcizfqss7j64rywpbj3whr7tc6xipt3y"
 """
 Tests for IPFS gateway functionality.
 
