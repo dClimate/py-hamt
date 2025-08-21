@@ -223,9 +223,6 @@ class KuboCAS(ContentAddressedStore):
             self._owns_client = True
             self._client_per_loop = {}
 
-        # The instance is never closed on initialization.
-        self._closed = False
-
         # store for later use by _loop_client()
         self._default_headers = headers
         self._default_auth = auth
