@@ -390,6 +390,7 @@ class KuboCAS(ContentAddressedStore):
                 except httpx.HTTPStatusError:
                     # Re-raise non-timeout HTTP errors immediately
                     raise
+        raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     async def load(self, id: IPLDKind) -> bytes:
         cid = cast(CID, id)
@@ -425,3 +426,4 @@ class KuboCAS(ContentAddressedStore):
                 except httpx.HTTPStatusError:
                     # Re-raise non-timeout HTTP errors immediately
                     raise
+        raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
