@@ -189,3 +189,24 @@ async def test_list_dir_dedup():
     await hamt.set("foo/bar/1", b"")
     results = [n async for n in zhs.list_dir("foo/")]
     assert results == ["bar"]  # no duplicates
+
+
+@pytest.mark.asyncio
+async def test_open_rw_store_triggers_helper():
+    """
+    A write‑enabled ZarrHAMTStore must open cleanly in read‑mode.
+    Behaviour before 3.2.0:  ValueError  → helper missing.
+    Behaviour after  3.2.0:  success     → helper present.
+    """
+    # --- 1. create a small dataset and a RW HAMT backed by in‑memory CAS
+    cas = InMemoryCAS()
+    hamt = await HAMT.build(cas=cas, values_are_bytes=True)  # read/write
+    store_rw = ZarrHAMTStore(hamt, read_only=False)
+
+    ds = xr.Dataset({"x": ("t", np.arange(3))})
+    ds.to_zarr(store=store_rw, mode="w", zarr_format=3)
+
+    # --- 2. try to re‑open **the same write‑enabled store** in *read* mode
+    #       – this calls Store.with_read_only(True) internally
+    reopened = xr.open_zarr(store=store_rw)  # <-- MUST NOT raise
+    assert reopened.x.shape == (3,)  # sanity check
