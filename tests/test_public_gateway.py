@@ -286,30 +286,30 @@ async def test_fix_kubocas_load():
         )
         await cas.aclose()
 
-            # Clean the base URL to prevent path issues
-            base_url = self.gateway_base_url
-            if "/ipfs/" in base_url:
-                base_url = base_url.split("/ipfs/")[0]
+        # Clean the base URL to prevent path issues
+        base_url = self.gateway_base_url
+        if "/ipfs/" in base_url:
+            base_url = base_url.split("/ipfs/")[0]
 
-            # Construction of URL that works with public gateways
-            if base_url.endswith("/"):
-                url = f"{base_url}ipfs/{cid}?format=dag-cbor"
-            else:
-                url = f"{base_url}/ipfs/{cid}?format=dag-cbor"
+        # Construction of URL that works with public gateways
+        if base_url.endswith("/"):
+            url = f"{base_url}ipfs/{cid}?format=dag-cbor"
+        else:
+            url = f"{base_url}/ipfs/{cid}?format=dag-cbor"
 
-            print(f"Requesting URL: {url}")
+        print(f"Requesting URL: {url}")
 
-            async with self._sem:
-                client = self._loop_client()
+        async with self._sem:
+            client = self._loop_client()
 
-                # For public gateways, add appropriate Accept header to get raw content
-                headers = {
-                    "Accept": "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
-                }
+            # For public gateways, add appropriate Accept header to get raw content
+            headers = {
+                "Accept": "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
+            }
 
-                response = await client.get(url, headers=headers)
-                response.raise_for_status()
-                return response.content
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            return response.content
 
     # Use the fixed implementation with a public gateway
     cas = FixedKuboCAS(
