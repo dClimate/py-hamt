@@ -232,7 +232,7 @@ class KuboCAS(ContentAddressedStore):
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
         self._closed: bool = False
-        
+
         # Validate retry parameters
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
@@ -240,7 +240,7 @@ class KuboCAS(ContentAddressedStore):
             raise ValueError("initial_delay must be positive")
         if backoff_factor < 1.0:
             raise ValueError("backoff_factor must be >= 1.0 for exponential backoff")
-        
+
         self.max_retries = max_retries
         self.initial_delay = initial_delay
         self.backoff_factor = backoff_factor

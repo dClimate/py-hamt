@@ -280,7 +280,11 @@ async def test_fix_kubocas_load():
     ]
 
     for input_url, expected_base in test_cases:
-        cas = KuboCAS(rpc_base_url="http://127.0.0.1:5001", gateway_base_url=input_url, max_retries=0)
+        cas = KuboCAS(
+            rpc_base_url="http://127.0.0.1:5001",
+            gateway_base_url=input_url,
+            max_retries=0,
+        )
         assert cas.gateway_base_url == expected_base, (
             f"URL construction failed for {input_url}"
         )
@@ -288,7 +292,9 @@ async def test_fix_kubocas_load():
 
     # Test actual loading with local gateway
     cas = KuboCAS(
-        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080", max_retries=0,
+        rpc_base_url="http://127.0.0.1:5001",
+        gateway_base_url="http://127.0.0.1:8080",
+        max_retries=0,
     )
 
     try:
@@ -308,6 +314,7 @@ async def test_fix_kubocas_load():
         pytest.skip("Local IPFS daemon not running")
     finally:
         await cas.aclose()
+
 
 SMALL_DAG_CBOR_CID = "bafyreibwzifwg3a3z5h6vxxalxdtfv5ihof6j4mhy4cl4kxh3fbxn6v2iq"
 
