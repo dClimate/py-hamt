@@ -286,36 +286,9 @@ async def test_fix_kubocas_load():
         )
         await cas.aclose()
 
-        # Clean the base URL to prevent path issues
-        base_url = self.gateway_base_url
-        if "/ipfs/" in base_url:
-            base_url = base_url.split("/ipfs/")[0]
-
-        # Construction of URL that works with public gateways
-        if base_url.endswith("/"):
-            url = f"{base_url}ipfs/{cid}?format=dag-cbor"
-        else:
-            url = f"{base_url}/ipfs/{cid}?format=dag-cbor"
-
-        print(f"Requesting URL: {url}")
-
-        async with self._sem:
-            client = self._loop_client()
-
-            # For public gateways, add appropriate Accept header to get raw content
-            headers = {
-                "Accept": "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/octet-stream"
-            }
-
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            return response.content
-
-    # Use the fixed implementation with a public gateway
-    cas = FixedKuboCAS(
-        rpc_base_url="http://127.0.0.1:5001",
-        gateway_base_url="https://ipfs.io/ipfs/",
-        max_retries=0,
+    # Test actual loading with local gateway
+    cas = KuboCAS(
+        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080", max_retries=0,
     )
 
     try:
@@ -335,7 +308,6 @@ async def test_fix_kubocas_load():
         pytest.skip("Local IPFS daemon not running")
     finally:
         await cas.aclose()
-
 
 SMALL_DAG_CBOR_CID = "bafyreibwzifwg3a3z5h6vxxalxdtfv5ihof6j4mhy4cl4kxh3fbxn6v2iq"
 
