@@ -262,20 +262,38 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
 
         if client is not None:
-            # user supplied → bind it to *their* current loop
-            self._client_per_loop[asyncio.get_running_loop()] = client
+            # A client was supplied by the user. We don't own it.
             self._owns_client = False
+            self._client_per_loop = {asyncio.get_running_loop(): client}
         else:
-            self._owns_client = True  # we'll create clients lazily
+            # No client supplied. We will own any clients we create.
+            self._owns_client = True
+            self._client_per_loop = {}
+
+        # The instance is never closed on initialization.
+        self._closed = False
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-        self._closed = False
 
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #
     # --------------------------------------------------------------------- #
     def _loop_client(self) -> httpx.AsyncClient:
-        """Get or create a client for the current event loop."""
+        """Get or create a client for the current event loop.
+
+        If the instance was previously closed but owns its clients, a fresh
+        client mapping is lazily created on demand.  Users that supplied their
+        own ``httpx.AsyncClient`` still receive an error when the instance has
+        been closed, as we cannot safely recreate their client.
+        """
+        if self._closed:
+            if not self._owns_client:
+                raise RuntimeError("KuboCAS is closed; create a new instance")
+            # We previously closed all internally-owned clients. Reset the
+            # state so that new clients can be created lazily.
+            self._closed = False
+            self._client_per_loop = {}
+
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
             return self._client_per_loop[loop]
@@ -286,7 +304,7 @@ class KuboCAS(ContentAddressedStore):
                 headers=self._default_headers,
                 auth=self._default_auth,
                 limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
-                # Uncomment when they finally support Robost HTTP/2 GOAWAY responses
+                # Uncomment when they finally support Robust HTTP/2 GOAWAY responses
                 # http2=True,
             )
             self._client_per_loop[loop] = client
@@ -296,18 +314,20 @@ class KuboCAS(ContentAddressedStore):
     # graceful shutdown: close **all** clients we own                       #
     # --------------------------------------------------------------------- #
     async def aclose(self) -> None:
-        """Close all internally-created clients."""
-        if not self._owns_client:
-            # User supplied the client; they are responsible for closing it.
+        """
+        Closes all internally-created clients. Must be called from an async context.
+        """
+        if self._owns_client is False:  # external client → caller closes
             return
 
+        # This method is async, so we can reliably await the async close method.
+        # The complex sync/async logic is handled by __del__.
         for client in list(self._client_per_loop.values()):
             if not client.is_closed:
                 try:
                     await client.aclose()
                 except Exception:
-                    # Best-effort cleanup; ignore errors during shutdown
-                    pass
+                    pass  # best-effort cleanup
 
         self._client_per_loop.clear()
         self._closed = True
@@ -322,6 +342,9 @@ class KuboCAS(ContentAddressedStore):
 
     def __del__(self) -> None:
         """Best-effort close for internally-created clients."""
+        if not hasattr(self, "_owns_client") or not hasattr(self, "_closed"):
+            return
+
         if not self._owns_client or self._closed:
             return
 
@@ -329,16 +352,34 @@ class KuboCAS(ContentAddressedStore):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = None
+            # No running loop - can't do async cleanup
+            # Just clear the client references synchronously
+            if hasattr(self, "_client_per_loop"):
+                # We can't await client.aclose() without a loop,
+                # so just clear the references
+                self._client_per_loop.clear()
+                self._closed = True
+            return
 
+        # If we get here, we have a running loop
         try:
-            if loop is None or not loop.is_running():
-                asyncio.run(self.aclose())
-            else:
+            if loop.is_running():
+                # Schedule cleanup in the existing loop
                 loop.create_task(self.aclose())
+            else:
+                # Loop exists but not running - try asyncio.run
+                coro = self.aclose()  # Create the coroutine
+                try:
+                    asyncio.run(coro)
+                except Exception:
+                    # If asyncio.run fails, we need to close the coroutine properly
+                    coro.close()  # This prevents the RuntimeWarning
+                    raise  # Re-raise to hit the outer except block
         except Exception:
-            # Suppress all errors during interpreter shutdown or loop teardown
-            pass
+            # If all else fails, just clear references
+            if hasattr(self, "_client_per_loop"):
+                self._client_per_loop.clear()
+                self._closed = True
 
     # --------------------------------------------------------------------- #
     # save() – now uses the per-loop client                                 #

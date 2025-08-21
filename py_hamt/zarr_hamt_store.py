@@ -52,6 +52,8 @@ class ZarrHAMTStore(zarr.abc.store.Store):
     ```
     """
 
+    _forced_read_only: bool | None = None  # sentinel for wrapper clones
+
     def __init__(self, hamt: HAMT, read_only: bool = False) -> None:
         """
         ### `hamt` and `read_only`
@@ -103,9 +105,35 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         return offset, length, suffix
 
     @property
-    def read_only(self) -> bool:
-        """@private"""
+    def read_only(self) -> bool:  # type: ignore[override]
+        if self._forced_read_only is not None:  # instance attr overrides
+            return self._forced_read_only
         return self.hamt.read_only
+
+    def with_read_only(self, read_only: bool = False) -> "ZarrHAMTStore":
+        """
+        Return this store (if the flag already matches) or a *shallow*
+        clone that presents the requested read‑only status.
+
+        The clone **shares** the same :class:`~py_hamt.hamt.HAMT`
+        instance; no flushing, network traffic or async work is done.
+        """
+        # Fast path
+        if read_only == self.read_only:
+            return self  # Same mode, return same instance
+
+        # Create new instance with different read_only flag
+        # Creates a *bare* instance without running its __init__
+        clone = type(self).__new__(type(self))
+
+        # Copy attributes that matter
+        clone.hamt = self.hamt  # Share the HAMT
+        clone._forced_read_only = read_only
+        clone.metadata_read_cache = self.metadata_read_cache.copy()
+
+        # Re‑initialise the zarr base class so that Zarr sees the flag
+        zarr.abc.store.Store.__init__(clone, read_only=read_only)
+        return clone
 
     def __eq__(self, other: object) -> bool:
         """@private"""
@@ -182,6 +210,9 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
     async def set(self, key: str, value: zarr.core.buffer.Buffer) -> None:
         """@private"""
+        if self.read_only:
+            raise Exception("Cannot write to a read-only store.")
+
         if key in self.metadata_read_cache:
             self.metadata_read_cache[key] = value.to_bytes()
         await self.hamt.set(key, value.to_bytes())
@@ -204,6 +235,8 @@ class ZarrHAMTStore(zarr.abc.store.Store):
 
     async def delete(self, key: str) -> None:
         """@private"""
+        if self.read_only:
+            raise Exception("Cannot write to a read-only store.")
         try:
             await self.hamt.delete(key)
             # In practice these lines never seem to be needed, creating and appending data are the only operations most zarrs actually undergo
