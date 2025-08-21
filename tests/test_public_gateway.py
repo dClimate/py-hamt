@@ -280,7 +280,7 @@ async def test_fix_kubocas_load():
     ]
 
     for input_url, expected_base in test_cases:
-        cas = KuboCAS(rpc_base_url="http://127.0.0.1:5001", gateway_base_url=input_url)
+        cas = KuboCAS(rpc_base_url="http://127.0.0.1:5001", gateway_base_url=input_url, max_retries=0)
         assert cas.gateway_base_url == expected_base, (
             f"URL construction failed for {input_url}"
         )
