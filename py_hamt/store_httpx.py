@@ -187,7 +187,7 @@ class KuboCAS(ContentAddressedStore):
         *,
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
-        pinOnAdd: bool = False,
+        pin_on_add: bool = False,
         chunker: str = "size-1048576",
     ):
         """
@@ -255,8 +255,8 @@ class KuboCAS(ContentAddressedStore):
         else:
             gateway_base_url = f"{gateway_base_url}/ipfs/"
 
-        pinString: str = "true" if pinOnAdd else "false"
-        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pinString}"
+        pin_string: str = "true" if pin_on_add else "false"
+        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pin_string}"
         """@private"""
         self.gateway_base_url: str = gateway_base_url
         """@private"""
