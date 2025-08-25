@@ -447,7 +447,7 @@ class KuboCAS(ContentAddressedStore):
 
         Args:
             cid (CID): The Content ID to pin.
-            name (Optional[str]): An optional name for the pin.
+            target_rpc (str): The RPC URL of the Kubo node.
         """
         params = {"arg": str(cid), "recursive": "true"}
         pin_add_url_base: str = f"{target_rpc}/api/v0/pin/add"
