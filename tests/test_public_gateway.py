@@ -152,6 +152,7 @@ async def test_kubocas_public_gateway():
     cas_save = KuboCAS(
         rpc_base_url="http://127.0.0.1:5001",
         gateway_base_url="http://127.0.0.1:8080",
+        max_retries=0,
     )
 
     try:
@@ -218,6 +219,7 @@ async def test_trailing_slash_gateway():
     cas = KuboCAS(
         rpc_base_url="http://127.0.0.1:5001",
         gateway_base_url="http://127.0.0.1:8080/",  # Note the trailing slash
+        max_retries=0,
     )
 
     try:
@@ -278,7 +280,11 @@ async def test_fix_kubocas_load():
     ]
 
     for input_url, expected_base in test_cases:
-        cas = KuboCAS(rpc_base_url="http://127.0.0.1:5001", gateway_base_url=input_url)
+        cas = KuboCAS(
+            rpc_base_url="http://127.0.0.1:5001",
+            gateway_base_url=input_url,
+            max_retries=0,
+        )
         assert cas.gateway_base_url == expected_base, (
             f"URL construction failed for {input_url}"
         )
@@ -286,7 +292,9 @@ async def test_fix_kubocas_load():
 
     # Test actual loading with local gateway
     cas = KuboCAS(
-        rpc_base_url="http://127.0.0.1:5001", gateway_base_url="http://127.0.0.1:8080"
+        rpc_base_url="http://127.0.0.1:5001",
+        gateway_base_url="http://127.0.0.1:8080",
+        max_retries=0,
     )
 
     try:
