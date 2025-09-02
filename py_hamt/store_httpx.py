@@ -1,4 +1,5 @@
 import asyncio
+import random
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Literal, Optional, Tuple, cast
@@ -189,6 +190,9 @@ class KuboCAS(ContentAddressedStore):
         auth: Tuple[str, str] | None = None,
         pin_on_add: bool = False,
         chunker: str = "size-1048576",
+        max_retries: int = 3,
+        initial_delay: float = 1.0,
+        backoff_factor: float = 2.0,
     ):
         """
         If None is passed into the rpc or gateway base url, then the default for kubo local daemons will be used. The default local values will also be used if nothing is passed in at all.
@@ -270,10 +274,24 @@ class KuboCAS(ContentAddressedStore):
             self._owns_client = True
             self._client_per_loop = {}
 
-        # The instance is never closed on initialization.
-        self._closed = False
+        # store for later use by _loop_client()
+        self._default_headers = headers
+        self._default_auth = auth
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
+        self._closed: bool = False
+
+        # Validate retry parameters
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        if initial_delay <= 0:
+            raise ValueError("initial_delay must be positive")
+        if backoff_factor < 1.0:
+            raise ValueError("backoff_factor must be >= 1.0 for exponential backoff")
+
+        self.max_retries = max_retries
+        self.initial_delay = initial_delay
+        self.backoff_factor = backoff_factor
 
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #
@@ -385,20 +403,45 @@ class KuboCAS(ContentAddressedStore):
     # save() – now uses the per-loop client                                 #
     # --------------------------------------------------------------------- #
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
-        async with self._sem:  # throttle RPC
-            # Create multipart form data
+        async with self._sem:
             files = {"file": data}
-
-            # Send the POST request
             client = self._loop_client()
-            response = await client.post(self.rpc_url, files=files)
-            response.raise_for_status()
-            cid_str: str = response.json()["Hash"]
+            retry_count = 0
 
-        cid: CID = CID.decode(cid_str)
-        if cid.codec.code != self.DAG_PB_MARKER:
-            cid = cid.set(codec=codec)
-        return cid
+            while retry_count <= self.max_retries:
+                try:
+                    response = await client.post(
+                        self.rpc_url, files=files, timeout=60.0
+                    )
+                    response.raise_for_status()
+                    cid_str: str = response.json()["Hash"]
+                    cid: CID = CID.decode(cid_str)
+                    if cid.codec.code != self.DAG_PB_MARKER:
+                        cid = cid.set(codec=codec)
+                    return cid
+
+                except (httpx.TimeoutException, httpx.RequestError) as e:
+                    retry_count += 1
+                    if retry_count > self.max_retries:
+                        raise httpx.TimeoutException(
+                            f"Failed to save data after {self.max_retries} retries: {str(e)}",
+                            request=e.request
+                            if isinstance(e, httpx.RequestError)
+                            else None,
+                        )
+
+                    # Calculate backoff delay
+                    delay = self.initial_delay * (
+                        self.backoff_factor ** (retry_count - 1)
+                    )
+                    # Add some jitter to prevent thundering herd
+                    jitter = delay * 0.1 * (random.random() - 0.5)
+                    await asyncio.sleep(delay + jitter)
+
+                except httpx.HTTPStatusError:
+                    # Re-raise non-timeout HTTP errors immediately
+                    raise
+        raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     async def load(
         self,
@@ -407,7 +450,7 @@ class KuboCAS(ContentAddressedStore):
         length: Optional[int] = None,
         suffix: Optional[int] = None,
     ) -> bytes:
-        """@private"""
+        """Load data from a CID using the IPFS gateway with optional Range requests."""
         cid = cast(CID, id)
         url: str = f"{self.gateway_base_url + str(cid)}"
         headers: Dict[str, str] = {}
@@ -426,11 +469,34 @@ class KuboCAS(ContentAddressedStore):
             # Standard HTTP Range: bytes=-N (last N bytes)
             headers["Range"] = f"bytes=-{suffix}"
 
-        async with self._sem:  # throttle gateway
+        async with self._sem:  # Throttle gateway
             client = self._loop_client()
-            response = await client.get(url, headers=headers or None)
-            response.raise_for_status()
-            return response.content
+            retry_count = 0
+
+            while retry_count <= self.max_retries:
+                try:
+                    response = await client.get(url, headers=headers or None, timeout=60.0)
+                    response.raise_for_status()
+                    return response.content
+
+                except (httpx.TimeoutException, httpx.RequestError) as e:
+                    retry_count += 1
+                    if retry_count > self.max_retries:
+                        raise httpx.TimeoutException(
+                            f"Failed to load data after {self.max_retries} retries: {str(e)}",
+                            request=e.request if isinstance(e, httpx.RequestError) else None,
+                        )
+
+                    # Calculate backoff delay with jitter
+                    delay = self.initial_delay * (self.backoff_factor ** (retry_count - 1))
+                    jitter = delay * 0.1 * (random.random() - 0.5)
+                    await asyncio.sleep(delay + jitter)
+
+                except httpx.HTTPStatusError:
+                    # Re-raise non-timeout HTTP errors immediately
+                    raise
+
+        raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     # --------------------------------------------------------------------- #
     # pin_cid() – method to pin a CID                                       #
