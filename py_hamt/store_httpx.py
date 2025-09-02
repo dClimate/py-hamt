@@ -279,7 +279,7 @@ class KuboCAS(ContentAddressedStore):
         self._default_auth = auth
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-        self._closed: bool = False
+        self._closed = False
 
         # Validate retry parameters
         if max_retries < 0:
@@ -475,7 +475,9 @@ class KuboCAS(ContentAddressedStore):
 
             while retry_count <= self.max_retries:
                 try:
-                    response = await client.get(url, headers=headers or None, timeout=60.0)
+                    response = await client.get(
+                        url, headers=headers or None, timeout=60.0
+                    )
                     response.raise_for_status()
                     return response.content
 
@@ -484,11 +486,15 @@ class KuboCAS(ContentAddressedStore):
                     if retry_count > self.max_retries:
                         raise httpx.TimeoutException(
                             f"Failed to load data after {self.max_retries} retries: {str(e)}",
-                            request=e.request if isinstance(e, httpx.RequestError) else None,
+                            request=e.request
+                            if isinstance(e, httpx.RequestError)
+                            else None,
                         )
 
                     # Calculate backoff delay with jitter
-                    delay = self.initial_delay * (self.backoff_factor ** (retry_count - 1))
+                    delay = self.initial_delay * (
+                        self.backoff_factor ** (retry_count - 1)
+                    )
                     jitter = delay * 0.1 * (random.random() - 0.5)
                     await asyncio.sleep(delay + jitter)
 
