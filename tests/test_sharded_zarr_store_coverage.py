@@ -281,7 +281,6 @@ async def test_memory_bounded_lru_cache_empty_shard():
 
 @pytest.mark.asyncio
 async def test_memory_bounded_lru_cache_update_existing():
-    """Test lines 64-65: cache update logic when shard already exists"""
     from multiformats import CID
 
     from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
@@ -293,7 +292,6 @@ async def test_memory_bounded_lru_cache_update_existing():
     shard1 = [test_cid] * 2
     await cache.put(0, shard1)
 
-    # Update existing shard (lines 64-65 should be hit)
     shard2 = [test_cid] * 3
     await cache.put(0, shard2, is_dirty=True)
 
@@ -372,7 +370,6 @@ async def test_sharded_zarr_store_duplicate_root_loading():
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_invalid_root_object_structure():
-    """Test lines 274 and 278-280: root object structure validation"""
     import dag_cbor
 
     from py_hamt.sharded_zarr_store import ShardedZarrStore
@@ -405,7 +402,6 @@ async def test_sharded_zarr_store_invalid_root_object_structure():
     with pytest.raises(ValueError, match="Root object is not a valid dictionary"):
         await store._load_root_from_cid()
 
-    # Test lines 278-280: shard_cids is not a list
     mock_cas_invalid_shard_cids = MockCAS({
         "manifest_version": "sharded_zarr_v1",
         "metadata": {},
@@ -439,7 +435,6 @@ async def test_sharded_zarr_store_invalid_root_object_structure():
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_invalid_manifest_version():
-    """Test lines 281-283: manifest version validation"""
     import dag_cbor
 
     from py_hamt.sharded_zarr_store import ShardedZarrStore
@@ -467,7 +462,6 @@ async def test_sharded_zarr_store_invalid_manifest_version():
             }
             return dag_cbor.encode(root_obj)
 
-    # Test with wrong manifest version (should hit lines 281-283)
     mock_cas = MockCAS("wrong_version")
     store = ShardedZarrStore(mock_cas, True, "test_cid")
 
@@ -477,9 +471,6 @@ async def test_sharded_zarr_store_invalid_manifest_version():
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_shard_fetch_retry():
-    """Test lines 333-343: shard fetch retry and error logging"""
-    from unittest.mock import patch
-
     from py_hamt.sharded_zarr_store import ShardedZarrStore
 
     class MockCAS:
@@ -526,11 +517,9 @@ async def test_sharded_zarr_store_shard_fetch_retry():
     )
     store._root_obj["chunks"]["shard_cids"][0] = shard_cid
 
-    # This should retry and eventually succeed (testing retry logic lines 325-329)
-    with patch("builtins.print") as mock_print:
-        shard_data = await store._load_or_initialize_shard_cache(0)
-        assert shard_data is not None
-        assert len(shard_data) == 4
+    shard_data = await store._load_or_initialize_shard_cache(0)
+    assert shard_data is not None
+    assert len(shard_data) == 4
 
     # Test case where all retries fail
     mock_cas_fail = MockCAS(fail_count=5)  # Fail more than max_retries
@@ -543,14 +532,8 @@ async def test_sharded_zarr_store_shard_fetch_retry():
     )
     store_fail._root_obj["chunks"]["shard_cids"][0] = shard_cid
 
-    # This should hit lines 332-337 (failure after max retries)
-    with patch("builtins.print") as mock_print:
-        with pytest.raises(
-            RuntimeError, match="Failed to fetch shard 0 after 3 attempts"
-        ):
-            await store_fail._load_or_initialize_shard_cache(0)
-        # Should print failure message (line 333)
-        mock_print.assert_called()
+    with pytest.raises(RuntimeError, match="Failed to fetch shard 0 after 3 attempts"):
+        await store_fail._load_or_initialize_shard_cache(0)
 
 
 @pytest.mark.asyncio
@@ -627,7 +610,6 @@ async def test_sharded_zarr_store_get_method_line_565():
 
 @pytest.mark.asyncio
 async def test_sharded_zarr_store_exists_exception_handling():
-    """Test lines 694-695: exists method exception handling"""
     from py_hamt import ShardedZarrStore
 
     class MockCAS:
@@ -646,7 +628,6 @@ async def test_sharded_zarr_store_exists_exception_handling():
         chunks_per_shard=2,
     )
 
-    # Test exists with invalid chunk key that will cause exception (lines 694-695)
     # This should trigger the exception handling and return False
     exists = await store.exists("invalid/chunk/key/format")
     assert exists is False
@@ -683,7 +664,6 @@ async def test_sharded_zarr_store_cas_save_failure():
         chunks_per_shard=2,
     )
 
-    # Test that cas.save failure raises RuntimeError (lines 656-657)
     proto = zarr.core.buffer.default_buffer_prototype()
     test_data = proto.buffer.from_bytes(b"test_data")
 
@@ -791,7 +771,6 @@ async def test_sharded_zarr_store_failed_to_load_or_initialize_shard():
         with patch.object(
             store._shard_data_cache, "put", side_effect=mock_put_does_nothing
         ):
-            # This should hit lines 451-452 (RuntimeError for failed to load or initialize)
             with pytest.raises(
                 RuntimeError, match="Failed to load or initialize shard 0"
             ):
@@ -847,12 +826,10 @@ async def test_sharded_zarr_store_timeout_cleanup_logic():
             coro.close()
         raise asyncio.TimeoutError()
 
-    # Test cleanup logic (lines 431-439)
     with patch("asyncio.wait_for", side_effect=mock_wait_for):
         with pytest.raises(RuntimeError, match="Timeout waiting for shard 0 to load"):
             await store._load_or_initialize_shard_cache(0)
 
-    # Verify cleanup occurred (lines 433-437)
     # The event should be set and removed from pending loads
     assert 0 not in store._pending_shard_loads  # Should be cleaned up
 

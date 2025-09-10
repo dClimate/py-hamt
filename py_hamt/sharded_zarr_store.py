@@ -333,17 +333,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     )  # Exponential backoff
                     continue
                 else:
-                    # Log the failure and raise a specific error
-                    print(
-                        f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
-                    )
                     raise RuntimeError(
                         f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
                     )
             except Exception as e:
-                # Handle non-transient errors immediately
-                print(f"Error fetching shard {shard_idx}: {e}")
-                raise
+                raise e
 
     def _parse_chunk_key(self, key: str) -> Optional[Tuple[int, ...]]:
         # 1. Exclude .json files immediately (metadata)
