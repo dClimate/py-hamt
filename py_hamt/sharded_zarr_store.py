@@ -2,7 +2,8 @@ import asyncio
 import itertools
 import json
 import math
-from collections import defaultdict
+import sys
+from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Iterable
 from typing import DefaultDict, Dict, List, Optional, Set, Tuple
 
@@ -14,6 +15,123 @@ from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteReques
 from zarr.core.common import BytesLike
 
 from .store_httpx import ContentAddressedStore
+
+
+class MemoryBoundedLRUCache:
+    """
+    An LRU cache that evicts items when memory usage exceeds a threshold.
+
+    Memory usage is calculated using sys.getsizeof for accurate sizing.
+    Dirty shards (those marked for writing) are never evicted until marked clean.
+    All operations are thread-safe for async access using an asyncio.Lock.
+    """
+
+    def __init__(self, max_memory_bytes: int = 100 * 1024 * 1024):  # 100MB default
+        self.max_memory_bytes = max_memory_bytes
+        self._cache: OrderedDict[int, List[Optional[CID]]] = OrderedDict()
+        self._dirty_shards: Set[int] = set()
+        self._shard_sizes: Dict[int, int] = {}  # Cached sizes for each shard
+        self._actual_memory_usage = 0
+        self._cache_lock = asyncio.Lock()
+
+    def _get_shard_size(self, shard_data: List[Optional[CID]]) -> int:
+        """Compute actual size: list overhead + sum of item sizes."""
+        if not shard_data:
+            return sys.getsizeof(shard_data)
+        total = sys.getsizeof(shard_data)
+        for item in shard_data:
+            total += sys.getsizeof(item)
+        return total
+
+    async def get(self, shard_idx: int) -> Optional[List[Optional[CID]]]:
+        """Get a shard from cache, moving it to end (most recently used)."""
+        async with self._cache_lock:
+            if shard_idx not in self._cache:
+                return None
+            shard_data = self._cache.pop(shard_idx)
+            self._cache[shard_idx] = shard_data
+            return shard_data
+
+    async def put(
+        self, shard_idx: int, shard_data: List[Optional[CID]], is_dirty: bool = False
+    ) -> None:
+        """Add or update a shard in cache, evicting old items if needed."""
+        async with self._cache_lock:
+            shard_size = self._get_shard_size(shard_data)
+
+            # If shard exists, remove its old size
+            if shard_idx in self._cache:
+                self._cache.pop(shard_idx)
+                self._actual_memory_usage -= self._shard_sizes.pop(shard_idx, 0)
+
+            # Track dirty status
+            if is_dirty:
+                self._dirty_shards.add(shard_idx)
+
+            # Add new shard
+            self._cache[shard_idx] = shard_data
+            self._shard_sizes[shard_idx] = shard_size
+            self._actual_memory_usage += shard_size
+
+            # Evict old items if over memory limit, never evict dirty shards
+            while (
+                self._actual_memory_usage > self.max_memory_bytes
+                and len(self._cache) > 1
+            ):
+                evicted = False
+                while self._cache:
+                    candidate_idx, candidate_data = self._cache.popitem(last=False)
+                    if candidate_idx not in self._dirty_shards:
+                        # Evict this clean LRU
+                        self._actual_memory_usage -= self._shard_sizes.pop(
+                            candidate_idx, 0
+                        )
+                        evicted = True
+                        break
+                    else:
+                        # Dirty: move to MRU
+                        self._cache[candidate_idx] = candidate_data
+                if not evicted:
+                    # No clean shards to evict
+                    break
+
+    async def mark_dirty(self, shard_idx: int) -> None:
+        """Mark a shard as dirty (should not be evicted)."""
+        async with self._cache_lock:
+            if shard_idx in self._cache:
+                self._dirty_shards.add(shard_idx)
+
+    async def mark_clean(self, shard_idx: int) -> None:
+        """Mark a shard as clean (can be evicted)."""
+        async with self._cache_lock:
+            self._dirty_shards.discard(shard_idx)
+
+    async def clear(self) -> None:
+        """Clear all cached data."""
+        async with self._cache_lock:
+            self._cache.clear()
+            self._dirty_shards.clear()
+            self._shard_sizes.clear()
+            self._actual_memory_usage = 0
+
+    async def __contains__(self, shard_idx: int) -> bool:
+        async with self._cache_lock:
+            return shard_idx in self._cache
+
+    @property
+    def estimated_memory_usage(self) -> int:
+        """Current memory usage in bytes, based on actual sizes."""
+        return self._actual_memory_usage
+
+    @property
+    def cache_size(self) -> int:
+        """Number of items currently cached."""
+        return len(self._cache)
+
+    @property
+    def dirty_cache_size(self) -> int:
+        """Number of dirty items currently cached."""
+        return len(self._dirty_shards)
 
 
 class ShardedZarrStore(zarr.abc.store.Store):
@@ -36,6 +154,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
         cas: ContentAddressedStore,
         read_only: bool,
         root_cid: Optional[str] = None,
+        *,
+        max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
     ):
         """Use the async `open()` classmethod to instantiate this class."""
         super().__init__(read_only=read_only)
@@ -50,8 +170,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._resize_complete.set()
         self._shard_locks: DefaultDict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-        self._shard_data_cache: Dict[int, list[Optional[CID]]] = {}
-        self._dirty_shards: Set[int] = set()
+        self._shard_data_cache = MemoryBoundedLRUCache(max_cache_memory_bytes)
         self._pending_shard_loads: Dict[int, asyncio.Event] = {}
 
         self._array_shape: Tuple[int, ...]
@@ -63,7 +182,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         self._dirty_root = False
 
-    def _update_geometry(self):
+    def __update_geometry(self):
         """Calculates derived geometric properties from the base shapes."""
 
         if not all(cs > 0 for cs in self._chunk_shape):
@@ -92,11 +211,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         array_shape: Optional[Tuple[int, ...]] = None,
         chunk_shape: Optional[Tuple[int, ...]] = None,
         chunks_per_shard: Optional[int] = None,
+        max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
     ) -> "ShardedZarrStore":
         """
         Asynchronously opens an existing ShardedZarrStore or initializes a new one.
         """
-        store = cls(cas, read_only, root_cid)
+        store = cls(
+            cas, read_only, root_cid, max_cache_memory_bytes=max_cache_memory_bytes
+        )
         if root_cid:
             await store._load_root_from_cid()
         elif not read_only:
@@ -123,7 +245,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._chunk_shape = chunk_shape
         self._chunks_per_shard = chunks_per_shard
 
-        self._update_geometry()
+        self.__update_geometry()
 
         self._root_obj = {
             "manifest_version": "sharded_zarr_v1",
@@ -141,6 +263,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
     async def _load_root_from_cid(self):
         root_bytes = await self.cas.load(self._root_cid)
+        try:
+            self._root_obj = dag_cbor.decode(root_bytes)
+            if not isinstance(self._root_obj, dict) or "chunks" not in self._root_obj:
+                raise ValueError(
+                    "Root object is not a valid dictionary with 'chunks' key."
+                )
+            if not isinstance(self._root_obj["chunks"]["shard_cids"], list):
+                raise ValueError("shard_cids is not a list.")
+        except Exception as e:
+            raise ValueError(f"Failed to decode root object: {e}")
         self._root_obj = dag_cbor.decode(root_bytes)
 
         if self._root_obj.get("manifest_version") != "sharded_zarr_v1":
@@ -153,26 +285,60 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._chunk_shape = tuple(chunk_info["chunk_shape"])
         self._chunks_per_shard = chunk_info["sharding_config"]["chunks_per_shard"]
 
-        self._update_geometry()
+        self.__update_geometry()
 
         if len(chunk_info["shard_cids"]) != self._num_shards:
             raise ValueError(
                 f"Inconsistent number of shards. Expected {self._num_shards}, found {len(chunk_info['shard_cids'])}."
             )
 
-    async def _fetch_and_cache_full_shard(self, shard_idx: int, shard_cid: str):
-        try:
-            shard_data_bytes = await self.cas.load(shard_cid)
-            decoded_shard = dag_cbor.decode(shard_data_bytes)
-            if not isinstance(decoded_shard, list):
-                raise TypeError(f"Shard {shard_idx} did not decode to a list.")
-            self._shard_data_cache[shard_idx] = decoded_shard
-        except Exception:
-            raise
-        finally:
-            if shard_idx in self._pending_shard_loads:
-                self._pending_shard_loads[shard_idx].set()  # Signal completion
-                del self._pending_shard_loads[shard_idx]
+    async def _fetch_and_cache_full_shard(
+        self,
+        shard_idx: int,
+        shard_cid: str,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+    ) -> None:
+        """
+        Fetch a shard from CAS and cache it, with retry logic for transient errors.
+
+        Args:
+            shard_idx: The index of the shard to fetch.
+            shard_cid: The CID of the shard.
+            max_retries: Maximum number of retry attempts for transient errors.
+            retry_delay: Delay between retry attempts in seconds.
+        """
+        for attempt in range(max_retries):
+            try:
+                shard_data_bytes = await self.cas.load(shard_cid)
+                decoded_shard = dag_cbor.decode(shard_data_bytes)
+                if not isinstance(decoded_shard, list):
+                    raise TypeError(f"Shard {shard_idx} did not decode to a list.")
+                await self._shard_data_cache.put(shard_idx, decoded_shard)
+                # Always set the Event to unblock waiting coroutines
+                if shard_idx in self._pending_shard_loads:
+                    self._pending_shard_loads[shard_idx].set()
+                    del self._pending_shard_loads[shard_idx]
+                return  # Success
+            except (ConnectionError, TimeoutError) as e:
+                # Handle transient errors (e.g., network issues)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(
+                        retry_delay * (2**attempt)
+                    )  # Exponential backoff
+                    continue
+                else:
+                    # Log the failure and raise a specific error
+                    print(
+                        f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
+                    )
+                    raise RuntimeError(
+                        f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
+                    )
+            except Exception as e:
+                # Handle non-transient errors immediately
+                print(f"Error fetching shard {shard_idx}: {e}")
+                raise
 
     def _parse_chunk_key(self, key: str) -> Optional[Tuple[int, ...]]:
         # 1. Exclude .json files immediately (metadata)
@@ -229,14 +395,45 @@ class ShardedZarrStore(zarr.abc.store.Store):
         index_in_shard = linear_chunk_index % self._chunks_per_shard
         return shard_idx, index_in_shard
 
-    async def _load_or_initialize_shard_cache(self, shard_idx: int) -> list:
-        if shard_idx in self._shard_data_cache:
-            return self._shard_data_cache[shard_idx]
+    async def _load_or_initialize_shard_cache(
+        self, shard_idx: int
+    ) -> List[Optional[CID]]:
+        """
+        Load a shard into the cache or initialize an empty shard if it doesn't exist.
+
+        Args:
+            shard_idx: The index of the shard to load or initialize.
+
+        Returns:
+            List[Optional[CID]]: The shard data (list of CIDs or None).
+
+        Raises:
+            ValueError: If the shard index is out of bounds.
+            RuntimeError: If the shard cannot be loaded or initialized.
+        """
+        cached_shard = await self._shard_data_cache.get(shard_idx)
+        if cached_shard is not None:
+            return cached_shard
 
         if shard_idx in self._pending_shard_loads:
-            await self._pending_shard_loads[shard_idx].wait()
-            if shard_idx in self._shard_data_cache:
-                return self._shard_data_cache[shard_idx]
+            try:
+                # Wait for the pending load with a timeout (e.g., 60 seconds)
+                await asyncio.wait_for(
+                    self._pending_shard_loads[shard_idx].wait(), timeout=60.0
+                )
+                cached_shard = await self._shard_data_cache.get(shard_idx)
+                if cached_shard is not None:
+                    return cached_shard
+                else:
+                    raise RuntimeError(
+                        f"Shard {shard_idx} not found in cache after pending load completed."
+                    )
+            except asyncio.TimeoutError:
+                # Clean up the pending load to allow retry
+                if shard_idx in self._pending_shard_loads:
+                    self._pending_shard_loads[shard_idx].set()
+                    del self._pending_shard_loads[shard_idx]
+                raise RuntimeError(f"Timeout waiting for shard {shard_idx} to load.")
 
         if not (0 <= shard_idx < self._num_shards):
             raise ValueError(f"Shard index {shard_idx} out of bounds.")
@@ -244,13 +441,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
         shard_cid_obj = self._root_obj["chunks"]["shard_cids"][shard_idx]
         if shard_cid_obj:
             self._pending_shard_loads[shard_idx] = asyncio.Event()
-            # The CID in the root should already be a CID object if loaded correctly.
             shard_cid_str = str(shard_cid_obj)
             await self._fetch_and_cache_full_shard(shard_idx, shard_cid_str)
         else:
-            self._shard_data_cache[shard_idx] = [None] * self._chunks_per_shard
+            empty_shard = [None] * self._chunks_per_shard
+            await self._shard_data_cache.put(shard_idx, empty_shard)
 
-        return self._shard_data_cache[shard_idx]
+        result = await self._shard_data_cache.get(shard_idx)
+        if result is None:
+            raise RuntimeError(f"Failed to load or initialize shard {shard_idx}")
+        return result  # type: ignore[return-value]
 
     async def set_partial_values(
         self, key_start_values: Iterable[Tuple[str, int, BytesLike]]
@@ -294,7 +494,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
         clone._shard_locks = self._shard_locks
 
         clone._shard_data_cache = self._shard_data_cache
-        clone._dirty_shards = self._dirty_shards
         clone._pending_shard_loads = self._pending_shard_loads
 
         clone._array_shape = self._array_shape
@@ -318,10 +517,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
     # If nothing to flush, return the root CID.
     async def flush(self) -> str:
-        if self._dirty_shards:
-            for shard_idx in sorted(list(self._dirty_shards)):
+        async with self._shard_data_cache._cache_lock:
+            dirty_shards = list(self._shard_data_cache._dirty_shards)
+        if dirty_shards:
+            for shard_idx in sorted(dirty_shards):
                 # Get the list of CIDs/Nones from the cache
-                shard_data_list = self._shard_data_cache[shard_idx]
+                shard_data_list = await self._shard_data_cache.get(shard_idx)
+                if shard_data_list is None:
+                    raise RuntimeError(f"Dirty shard {shard_idx} not found in cache")
 
                 # Encode this list into a DAG-CBOR byte representation
                 shard_data_bytes = dag_cbor.encode(shard_data_list)
@@ -341,8 +544,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
                         new_shard_cid_obj
                     )
                     self._dirty_root = True
-
-            self._dirty_shards.clear()
+                    # Mark shard as clean after flushing
+                    await self._shard_data_cache.mark_clean(shard_idx)
 
         if self._dirty_root:
             # Ensure all metadata CIDs are CID objects for correct encoding
@@ -447,9 +650,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
         raw_data_bytes = value.to_bytes()
         # Save the data to CAS first to get its CID.
         # Metadata is often saved as 'raw', chunks as well unless compressed.
-        data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
-        await self.set_pointer(key, str(data_cid_obj))
-        return None
+        try:
+            data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
+            await self.set_pointer(key, str(data_cid_obj))
+        except Exception as e:
+            raise RuntimeError(f"Failed to save data for key {key}: {e}")
+        return None  # type: ignore[return-value]
 
     async def set_pointer(self, key: str, pointer: str) -> None:
         chunk_coords = self._parse_chunk_key(key)
@@ -470,7 +676,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
             if target_shard_list[index_in_shard] != pointer_cid_obj:
                 target_shard_list[index_in_shard] = pointer_cid_obj
-                self._dirty_shards.add(shard_idx)
+                await self._shard_data_cache.mark_dirty(shard_idx)
         return None
 
     async def exists(self, key: str) -> bool:
@@ -518,7 +724,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             target_shard_list = await self._load_or_initialize_shard_cache(shard_idx)
             if target_shard_list[index_in_shard] is not None:
                 target_shard_list[index_in_shard] = None
-                self._dirty_shards.add(shard_idx)
+                await self._shard_data_cache.mark_dirty(shard_idx)
 
     @property
     def supports_listing(self) -> bool:
@@ -572,7 +778,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 )
                 if target_shard_list[index_in_global_shard] != pointer_cid_obj:
                     target_shard_list[index_in_global_shard] = pointer_cid_obj
-                    self._dirty_shards.add(global_shard_idx)
+                    await self._shard_data_cache.mark_dirty(global_shard_idx)
 
     async def resize_store(self, new_shape: Tuple[int, ...]):
         """

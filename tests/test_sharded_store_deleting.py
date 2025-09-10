@@ -63,7 +63,7 @@ async def test_delete_chunk_success(create_ipfs: tuple[str, str]):
         shard_idx, index_in_shard = store._get_shard_info(linear_index)
         target_shard_list = await store._load_or_initialize_shard_cache(shard_idx)
         assert target_shard_list[index_in_shard] is None
-        assert shard_idx in store._dirty_shards
+        assert shard_idx in store._shard_data_cache._dirty_shards
 
         # Flush and verify persistence
         root_cid = await store.flush()
@@ -135,7 +135,7 @@ async def test_delete_nonexistent_key(create_ipfs: tuple[str, str]):
 
         # flush it
         await store.flush()
-        assert not store._dirty_shards  # No dirty shards after flush
+        assert not store._shard_data_cache._dirty_shards  # No dirty shards after flush
 
         # Try to delete nonexistent metadata key
         with pytest.raises(KeyError, match="Metadata key 'nonexistent.json' not found"):
@@ -149,7 +149,7 @@ async def test_delete_nonexistent_key(create_ipfs: tuple[str, str]):
         await store.delete("temp/c/0/0")  # Should not raise, as it sets to None
         assert not await store.exists("temp/c/0/0")
         assert (
-            store._dirty_shards
+            store._shard_data_cache._dirty_shards
         )  # Shard is marked dirty even if chunk was already None
 
 
@@ -232,7 +232,9 @@ async def test_delete_concurrency(create_ipfs: tuple[str, str]):
             assert await store.get(key, proto) is None
 
         # Verify shards are marked dirty
-        assert store._dirty_shards  # At least one shard should be dirty
+        assert (
+            store._shard_data_cache._dirty_shards
+        )  # At least one shard should be dirty
 
         # Flush and verify persistence
         root_cid = await store.flush()

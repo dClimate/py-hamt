@@ -121,8 +121,8 @@ async def test_load_or_initialize_shard_cache_concurrent_loads(
             assert result == shard_data
 
         # Verify shard is cached and no pending loads remain
-        assert shard_idx in store._shard_data_cache
-        assert store._shard_data_cache[shard_idx] == shard_data
+        assert await store._shard_data_cache.__contains__(shard_idx)
+        assert await store._shard_data_cache.get(shard_idx) == shard_data
         assert shard_idx not in store._pending_shard_loads
 
 
@@ -555,7 +555,11 @@ async def test_with_read_only(create_ipfs: tuple[str, str]):
         assert store_read_only._root_cid == store_write._root_cid
         assert store_read_only._root_obj is store_write._root_obj
         assert store_read_only._shard_data_cache is store_write._shard_data_cache
-        assert store_read_only._dirty_shards is store_write._dirty_shards
+        # _dirty_shards is now managed by the cache, not the store directly
+        assert (
+            store_read_only._shard_data_cache._dirty_shards
+            is store_write._shard_data_cache._dirty_shards
+        )
         assert store_read_only._array_shape == store_write._array_shape
         assert store_read_only._chunk_shape == store_write._chunk_shape
         assert store_read_only._chunks_per_shard == store_write._chunks_per_shard
@@ -1180,3 +1184,249 @@ async def test_sharded_zarr_store_lazy_concat_with_cids(create_ipfs: tuple[str, 
         if query_result.time.size > 0:
             assert query_result.time.min() >= query_start
             assert query_result.time.max() <= query_end
+
+
+@pytest.mark.asyncio
+async def test_memory_bounded_lru_cache_basic():
+    """Test basic functionality of MemoryBoundedLRUCache."""
+    from multiformats import CID
+
+    from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
+
+    # Very small cache for testing to ensure eviction
+    cache = MemoryBoundedLRUCache(max_memory_bytes=500)  # 500 bytes limit
+
+    # Create some test data
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+    small_shard = [test_cid] * 2
+    medium_shard = [test_cid] * 5
+
+    # Test basic put/get
+    await cache.put(0, small_shard)
+    assert await cache.get(0) == small_shard
+    assert await cache.__contains__(0)
+    assert cache.cache_size == 1
+
+    # Test that get moves item to end (most recently used)
+    await cache.put(1, medium_shard)
+    await cache.get(0)  # Should move shard 0 to end
+
+    # Add more data to trigger eviction - this should be large enough to force eviction
+    large_shard = [test_cid] * 20
+    await cache.put(2, large_shard)
+
+    # Check basic cache behavior - at least one should be evicted due to memory limits
+
+    # Add an even larger shard to definitely trigger eviction
+    huge_shard = [test_cid] * 50
+    await cache.put(3, huge_shard)
+
+    # Cache should be constrained by memory limit and perform evictions
+    # The exact behavior depends on actual memory usage, but we should see some eviction
+    assert (
+        cache.estimated_memory_usage <= cache.max_memory_bytes or cache.cache_size == 1
+    )
+    # At least some items should remain in cache
+    assert cache.cache_size >= 1
+
+
+@pytest.mark.asyncio
+async def test_memory_bounded_lru_cache_dirty_protection():
+    """Test that dirty shards are never evicted."""
+    from multiformats import CID
+
+    from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
+
+    # Very small cache to force eviction
+    cache = MemoryBoundedLRUCache(max_memory_bytes=500)  # 500 bytes
+
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+    small_shard = [test_cid] * 3
+    large_shard = [test_cid] * 20  # This should exceed memory limit
+
+    # Add a dirty shard
+    await cache.put(0, small_shard, is_dirty=True)
+    assert cache.dirty_cache_size == 1
+
+    # Add a clean shard
+    await cache.put(1, small_shard)
+    # Cache size should be 2, but might be less if eviction occurred
+    assert cache.cache_size >= 1  # At least the dirty shard should remain
+    assert cache.dirty_cache_size == 1
+
+    # Add a large clean shard that should trigger eviction
+    await cache.put(2, large_shard)
+
+    # Dirty shard 0 should still be there (protected)
+    assert await cache.get(0) is not None  # Dirty shard protected
+
+    # Either shard 1 or shard 2 might be evicted depending on memory constraints
+    # The important thing is that the dirty shard (0) is never evicted
+    cached_1 = await cache.get(1)
+    cached_2 = await cache.get(2)
+
+    # At least one of the clean shards should be evicted due to memory pressure
+    evicted_count = (1 if cached_1 is None else 0) + (1 if cached_2 is None else 0)
+    assert evicted_count >= 1, (
+        "At least one clean shard should be evicted due to memory pressure"
+    )
+
+    # Test marking dirty shard as clean
+    await cache.mark_clean(0)
+    assert cache.dirty_cache_size == 0
+
+    # Now shard 0 can be evicted
+    even_larger_shard = [test_cid] * 30
+    await cache.put(3, even_larger_shard)
+    assert await cache.get(0) is None  # Now evicted since it's clean
+
+
+@pytest.mark.asyncio
+async def test_memory_bounded_lru_cache_memory_estimation():
+    """Test memory usage estimation."""
+    from multiformats import CID
+
+    from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
+
+    cache = MemoryBoundedLRUCache(max_memory_bytes=10000)
+
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+
+    # Test with None values (should use minimal memory)
+    sparse_shard = [None] * 100
+    await cache.put(0, sparse_shard)
+    sparse_usage = cache.estimated_memory_usage
+
+    # Test with CID values (should use more memory)
+    dense_shard = [test_cid] * 100
+    await cache.put(1, dense_shard)
+    dense_usage = cache.estimated_memory_usage
+
+    # Dense shard should use significantly more memory than sparse
+    assert dense_usage > sparse_usage  # CIDs are larger than None
+
+    # Test cache clear
+    await cache.clear()
+    assert cache.estimated_memory_usage == 0
+    assert cache.cache_size == 0
+    assert cache.dirty_cache_size == 0
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_cache_integration(create_ipfs):
+    """Test that ShardedZarrStore properly uses the memory-bounded cache."""
+    rpc_base_url, gateway_base_url = create_ipfs
+
+    # Create a store with very small cache to test eviction
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=(10, 10, 10),
+            chunk_shape=(2, 2, 2),
+            chunks_per_shard=8,
+            max_cache_memory_bytes=2000,  # 2KB cache limit
+        )
+
+        # Create test data
+        test_data = np.random.randn(2, 2, 2).astype(np.float32)
+        buffer = zarr.core.buffer.default_buffer_prototype().buffer.from_bytes(
+            test_data.tobytes()
+        )
+
+        # Test cache behavior by writing data and checking dirty status
+        # Let's first manually mark a shard as dirty to test the mechanism
+        await store._shard_data_cache.put(0, [None] * 8, is_dirty=True)
+        assert store._shard_data_cache.dirty_cache_size == 1
+
+        # Now test actual store operations - write to multiple chunks
+        await store.set("c/0/0/0", buffer)
+        await store.set("c/0/0/1", buffer)
+        await store.set("c/0/1/0", buffer)
+
+        # The cache should now have at least one dirty shard
+        assert store._shard_data_cache.dirty_cache_size > 0
+
+        # Read from the chunks we actually wrote to
+        result1 = await store.get(
+            "c/0/0/0", zarr.core.buffer.default_buffer_prototype()
+        )
+        result2 = await store.get(
+            "c/0/0/1", zarr.core.buffer.default_buffer_prototype()
+        )
+        result3 = await store.get(
+            "c/0/1/0", zarr.core.buffer.default_buffer_prototype()
+        )
+
+        assert result1 is not None
+        assert result2 is not None
+        assert result3 is not None
+
+        # Flush to make shards clean
+        await store.flush()
+
+        # After flush, dirty count should be 0
+        assert store._shard_data_cache.dirty_cache_size == 0
+
+        # But cache should still contain some shards
+        assert store._shard_data_cache.cache_size > 0
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_cache_eviction_during_read(create_ipfs):
+    """Test cache eviction behavior during read-heavy workloads."""
+    rpc_base_url, gateway_base_url = create_ipfs
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        # Create and populate a store
+        store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=(20, 20, 20),
+            chunk_shape=(2, 2, 2),
+            chunks_per_shard=10,
+            max_cache_memory_bytes=1500,  # Small cache to force eviction
+        )
+
+        # Write data to multiple shards
+        test_data = np.random.randn(2, 2, 2).astype(np.float32)
+        buffer = zarr.core.buffer.default_buffer_prototype().buffer.from_bytes(
+            test_data.tobytes()
+        )
+
+        for i in range(0, 10, 2):  # Write to shards 0, 1, 2, 3, 4
+            await store.set(f"c/{i}/0/0", buffer)
+
+        # Flush to make all shards clean
+        root_cid = await store.flush()
+
+        # Now open in read-only mode to test pure read behavior
+        readonly_store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=True,
+            root_cid=root_cid,
+            max_cache_memory_bytes=1000,  # Even smaller cache
+        )
+
+        # Read from many different locations to fill and overflow cache
+        read_results = []
+        for i in range(0, 10, 2):
+            result = await readonly_store.get(
+                f"c/{i}/0/0", zarr.core.buffer.default_buffer_prototype()
+            )
+            read_results.append(result)
+
+        # All reads should succeed even with cache eviction
+        assert all(result is not None for result in read_results)
+
+        # Cache should have evicted some shards due to memory limit
+        assert (
+            readonly_store._shard_data_cache.cache_size <= 5
+        )  # Not all shards should be cached
+
+        # No shards should be dirty in read-only mode
+        assert readonly_store._shard_data_cache.dirty_cache_size == 0

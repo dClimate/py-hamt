@@ -5,8 +5,10 @@ import time
 import xarray as xr
 from multiformats import CID
 
-from py_hamt import HAMT, KuboCAS, ShardedZarrStore
-from py_hamt.zarr_hamt_store import ZarrHAMTStore
+from .hamt import HAMT
+from .sharded_zarr_store import ShardedZarrStore
+from .store_httpx import KuboCAS
+from .zarr_hamt_store import ZarrHAMTStore
 
 
 async def convert_hamt_to_sharded(

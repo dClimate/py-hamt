@@ -87,7 +87,9 @@ async def test_graft_store_success(create_ipfs: tuple[str, str]):
         assert target_store._chunks_per_dim == (4, 2)  # ceil(40/10) = 4
         assert target_store._total_chunks == 8  # 4 * 2
         assert target_store._num_shards == 2  # ceil(8/4) = 2
-        assert target_store._dirty_shards  # Grafting marks shards as dirty
+        assert (
+            target_store._shard_data_cache._dirty_shards
+        )  # Grafting marks shards as dirty
 
         # Flush and verify persistence
         target_root_cid = await target_store.flush()
@@ -200,7 +202,9 @@ async def test_graft_store_empty_source(create_ipfs: tuple[str, str]):
 
         # Verify no chunks were grafted
         assert not await target_store.exists("temp/c/1/1")
-        assert not target_store._dirty_shards  # No shards marked dirty since no changes
+        assert (
+            not target_store._shard_data_cache._dirty_shards
+        )  # No shards marked dirty since no changes
 
         # Flush and verify
         target_root_cid = await target_store.flush()
@@ -395,7 +399,7 @@ async def test_graft_store_overlapping_chunks(create_ipfs: tuple[str, str]):
         assert read_data is not None
         assert read_data.to_bytes() == existing_data
         assert (
-            target_store._dirty_shards
+            target_store._shard_data_cache._dirty_shards
         )  # Shard is marked dirty due to attempted write
 
         # Verify other grafted chunks

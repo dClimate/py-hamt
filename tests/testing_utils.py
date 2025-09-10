@@ -26,17 +26,15 @@ def cid_strategy() -> SearchStrategy:
 
 
 def ipld_strategy() -> SearchStrategy:
-    return st.one_of(
-        [
-            st.none(),
-            st.booleans(),
-            st.integers(min_value=-9223372036854775808, max_value=9223372036854775807),
-            st.floats(allow_infinity=False, allow_nan=False),
-            st.text(),
-            st.binary(),
-            cid_strategy(),
-        ]
-    )
+    return st.one_of([
+        st.none(),
+        st.booleans(),
+        st.integers(min_value=-9223372036854775808, max_value=9223372036854775807),
+        st.floats(allow_infinity=False, allow_nan=False),
+        st.text(),
+        st.binary(),
+        cid_strategy(),
+    ])
 
 
 key_value_list = st.lists(
