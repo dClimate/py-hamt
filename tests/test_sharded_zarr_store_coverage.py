@@ -260,3 +260,397 @@ async def test_sharded_zarr_store_other_exceptions(create_ipfs: tuple[str, str])
 
         # with pytest.raises(ValueError, match="Linear chunk index cannot be negative."):
         #     await store_no_root._get_shard_info(-1)
+
+
+@pytest.mark.asyncio
+async def test_memory_bounded_lru_cache_empty_shard():
+    """Test line 40: empty shard handling in _get_shard_size"""
+    from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
+
+    cache = MemoryBoundedLRUCache(max_memory_bytes=1000)
+    empty_shard = []
+
+    # Test that empty shard is handled correctly (line 40)
+    size = cache._get_shard_size(empty_shard)
+    assert size > 0  # sys.getsizeof should return some size even for empty list
+
+    await cache.put(0, empty_shard)
+    retrieved = await cache.get(0)
+    assert retrieved == empty_shard
+
+
+@pytest.mark.asyncio
+async def test_memory_bounded_lru_cache_update_existing():
+    """Test lines 64-65: cache update logic when shard already exists"""
+    from multiformats import CID
+
+    from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
+
+    cache = MemoryBoundedLRUCache(max_memory_bytes=10000)
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+
+    # First put
+    shard1 = [test_cid] * 2
+    await cache.put(0, shard1)
+
+    # Update existing shard (lines 64-65 should be hit)
+    shard2 = [test_cid] * 3
+    await cache.put(0, shard2, is_dirty=True)
+
+    retrieved = await cache.get(0)
+    assert retrieved == shard2
+    assert cache.dirty_cache_size == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_bounded_lru_cache_eviction_break():
+    """Test line 96: eviction break when no clean shards available"""
+    from multiformats import CID
+
+    from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
+
+    cache = MemoryBoundedLRUCache(max_memory_bytes=500)  # Small cache
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+
+    # Add several dirty shards to fill cache
+    large_shard = [test_cid] * 10
+    for i in range(3):
+        await cache.put(i, large_shard, is_dirty=True)
+
+    # Try to add another large shard - should trigger line 96 break
+    huge_shard = [test_cid] * 20
+    await cache.put(3, huge_shard)
+
+    # All dirty shards should still be in cache (not evicted)
+    for i in range(3):
+        assert await cache.get(i) is not None
+    assert cache.dirty_cache_size == 3
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_duplicate_root_loading():
+    """Test line 277: duplicate root object loading"""
+    import dag_cbor
+
+    from py_hamt.sharded_zarr_store import ShardedZarrStore
+
+    # Create mock CAS that returns malformed data to trigger line 277
+    class MockCAS:
+        def __init__(self):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            # Return valid DAG-CBOR for a sharded zarr root
+            root_obj = {
+                "manifest_version": "sharded_zarr_v1",
+                "metadata": {},
+                "chunks": {
+                    "array_shape": [10],
+                    "chunk_shape": [5],
+                    "sharding_config": {"chunks_per_shard": 1},
+                    "shard_cids": [None, None],
+                },
+            }
+            return dag_cbor.encode(root_obj)
+
+    # Create store with mock CAS
+    mock_cas = MockCAS()
+    store = ShardedZarrStore(mock_cas, True, "test_cid")
+
+    # This should trigger line 277 where root_obj gets set twice
+    await store._load_root_from_cid()
+
+    assert store._root_obj is not None
+    assert store._array_shape == (10,)
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_invalid_root_object_structure():
+    """Test lines 274 and 278-280: root object structure validation"""
+    import dag_cbor
+
+    from py_hamt.sharded_zarr_store import ShardedZarrStore
+
+    class MockCAS:
+        def __init__(self, root_obj):
+            self.root_obj = root_obj
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            return dag_cbor.encode(self.root_obj)
+
+    # Test line 274: root object is not a dict
+    mock_cas_not_dict = MockCAS("not a dictionary")
+    store = ShardedZarrStore(mock_cas_not_dict, True, "test_cid")
+    with pytest.raises(ValueError, match="Root object is not a valid dictionary"):
+        await store._load_root_from_cid()
+
+    # Test line 274: root object missing 'chunks' key
+    mock_cas_no_chunks = MockCAS({
+        "metadata": {},
+        "manifest_version": "sharded_zarr_v1",
+    })
+    store = ShardedZarrStore(mock_cas_no_chunks, True, "test_cid")
+    with pytest.raises(ValueError, match="Root object is not a valid dictionary"):
+        await store._load_root_from_cid()
+
+    # Test lines 278-280: shard_cids is not a list
+    mock_cas_invalid_shard_cids = MockCAS({
+        "manifest_version": "sharded_zarr_v1",
+        "metadata": {},
+        "chunks": {
+            "array_shape": [10],
+            "chunk_shape": [5],
+            "sharding_config": {"chunks_per_shard": 1},
+            "shard_cids": "not a list",  # Should be a list
+        },
+    })
+    store = ShardedZarrStore(mock_cas_invalid_shard_cids, True, "test_cid")
+    with pytest.raises(ValueError, match="shard_cids is not a list"):
+        await store._load_root_from_cid()
+
+    # Test line 280: generic exception handling (invalid DAG-CBOR)
+    class MockCASInvalidDagCbor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            return b"invalid dag-cbor data"  # This will cause dag_cbor.decode to fail
+
+    mock_cas_invalid_cbor = MockCASInvalidDagCbor()
+    store = ShardedZarrStore(mock_cas_invalid_cbor, True, "test_cid")
+    with pytest.raises(ValueError, match="Failed to decode root object"):
+        await store._load_root_from_cid()
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_invalid_manifest_version():
+    """Test lines 281-283: manifest version validation"""
+    import dag_cbor
+
+    from py_hamt.sharded_zarr_store import ShardedZarrStore
+
+    class MockCAS:
+        def __init__(self, manifest_version):
+            self.manifest_version = manifest_version
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            root_obj = {
+                "manifest_version": self.manifest_version,
+                "metadata": {},
+                "chunks": {
+                    "array_shape": [10],
+                    "chunk_shape": [5],
+                    "sharding_config": {"chunks_per_shard": 1},
+                    "shard_cids": [None, None],
+                },
+            }
+            return dag_cbor.encode(root_obj)
+
+    # Test with wrong manifest version (should hit lines 281-283)
+    mock_cas = MockCAS("wrong_version")
+    store = ShardedZarrStore(mock_cas, True, "test_cid")
+
+    with pytest.raises(ValueError, match="Incompatible manifest version"):
+        await store._load_root_from_cid()
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_shard_fetch_retry():
+    """Test lines 333-343: shard fetch retry and error logging"""
+    from unittest.mock import patch
+
+    from py_hamt.sharded_zarr_store import ShardedZarrStore
+
+    class MockCAS:
+        def __init__(self, fail_count=2):
+            self.fail_count = fail_count
+            self.attempts = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            self.attempts += 1
+            if self.attempts <= self.fail_count:
+                raise ConnectionError("Mock connection error")
+            # Success on final attempt
+            import dag_cbor
+
+            return dag_cbor.encode([None] * 4)
+
+        async def save(self, data, codec=None):
+            from multiformats import CID
+
+            return CID.decode(
+                "bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm"
+            )
+
+    mock_cas = MockCAS(fail_count=2)  # Fail twice, succeed on 3rd attempt
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=4,
+    )
+
+    # Set up a shard CID to fetch
+    from multiformats import CID
+
+    shard_cid = CID.decode(
+        "bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm"
+    )
+    store._root_obj["chunks"]["shard_cids"][0] = shard_cid
+
+    # This should retry and eventually succeed (testing retry logic lines 325-329)
+    with patch("builtins.print") as mock_print:
+        shard_data = await store._load_or_initialize_shard_cache(0)
+        assert shard_data is not None
+        assert len(shard_data) == 4
+
+    # Test case where all retries fail
+    mock_cas_fail = MockCAS(fail_count=5)  # Fail more than max_retries
+    store_fail = await ShardedZarrStore.open(
+        cas=mock_cas_fail,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=4,
+    )
+    store_fail._root_obj["chunks"]["shard_cids"][0] = shard_cid
+
+    # This should hit lines 332-337 (failure after max retries)
+    with patch("builtins.print") as mock_print:
+        with pytest.raises(
+            RuntimeError, match="Failed to fetch shard 0 after 3 attempts"
+        ):
+            await store_fail._load_or_initialize_shard_cache(0)
+        # Should print failure message (line 333)
+        mock_print.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_with_read_only_clone_attribute():
+    """Test line 490: with_read_only clone attribute assignment"""
+    from py_hamt import ShardedZarrStore
+
+    class MockCAS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_cas = MockCAS()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=2,
+    )
+
+    # Create clone with different read_only status (should hit line 490)
+    clone = store.with_read_only(True)
+
+    # Verify line 490: clone._root_obj = self._root_obj
+    assert clone._root_obj is store._root_obj
+    assert clone.read_only is True
+    assert store.read_only is False
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_get_method_line_565():
+    """Test line 565: get method start (line 565 is the method definition)"""
+    import zarr.core.buffer
+
+    from py_hamt import ShardedZarrStore
+
+    class MockCAS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid, offset=None, length=None, suffix=None):
+            return b"metadata_content"
+
+    mock_cas = MockCAS()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=2,
+    )
+
+    # Add metadata to test the get method
+    from multiformats import CID
+
+    metadata_cid = CID.decode(
+        "bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm"
+    )
+    store._root_obj["metadata"]["test.json"] = metadata_cid
+
+    # Test get method (line 565 is the method signature)
+    proto = zarr.core.buffer.default_buffer_prototype()
+    result = await store.get("test.json", proto)
+
+    assert result is not None
+    assert result.to_bytes() == b"metadata_content"
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_exists_exception_handling():
+    """Test lines 694-695: exists method exception handling"""
+    from py_hamt import ShardedZarrStore
+
+    class MockCAS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_cas = MockCAS()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=2,
+    )
+
+    # Test exists with invalid chunk key that will cause exception (lines 694-695)
+    # This should trigger the exception handling and return False
+    exists = await store.exists("invalid/chunk/key/format")
+    assert exists is False
+
+    # Test exists with valid chunk key that's out of bounds (should also return False)
+    exists = await store.exists("c/100")  # Out of bounds chunk
+    assert exists is False

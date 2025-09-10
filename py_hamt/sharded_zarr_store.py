@@ -79,6 +79,7 @@ class MemoryBoundedLRUCache:
                 and len(self._cache) > 1
             ):
                 evicted = False
+                checked_dirty_shards = set()
                 while self._cache:
                     candidate_idx, candidate_data = self._cache.popitem(last=False)
                     if candidate_idx not in self._dirty_shards:
@@ -91,6 +92,10 @@ class MemoryBoundedLRUCache:
                     else:
                         # Dirty: move to MRU
                         self._cache[candidate_idx] = candidate_data
+                        checked_dirty_shards.add(candidate_idx)
+                        # If we've checked all dirty shards, no clean shards available
+                        if len(checked_dirty_shards) == len(self._dirty_shards):
+                            break
                 if not evicted:
                     # No clean shards to evict
                     break
