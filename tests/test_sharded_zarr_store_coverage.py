@@ -654,3 +654,266 @@ async def test_sharded_zarr_store_exists_exception_handling():
     # Test exists with valid chunk key that's out of bounds (should also return False)
     exists = await store.exists("c/100")  # Out of bounds chunk
     assert exists is False
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_cas_save_failure():
+    """Test RuntimeError when cas.save fails in set method"""
+    import zarr.core.buffer
+
+    from py_hamt import ShardedZarrStore
+
+    class MockCASFailingSave:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def save(self, data, codec=None):
+            # Always fail to save
+            raise ConnectionError("Mock CAS save failure")
+
+    mock_cas = MockCASFailingSave()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=2,
+    )
+
+    # Test that cas.save failure raises RuntimeError (lines 656-657)
+    proto = zarr.core.buffer.default_buffer_prototype()
+    test_data = proto.buffer.from_bytes(b"test_data")
+
+    with pytest.raises(RuntimeError, match="Failed to save data for key test_key"):
+        await store.set("test_key", test_data)
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_flush_dirty_shard_not_found():
+    """Test RuntimeError when dirty shard not found in cache during flush"""
+    from unittest.mock import patch
+
+    from multiformats import CID
+
+    from py_hamt import ShardedZarrStore
+
+    class MockCAS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def save(self, data, codec=None):
+            return CID.decode(
+                "bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm"
+            )
+
+    mock_cas = MockCAS()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=2,
+    )
+
+    # First put a shard in the cache and mark it as dirty
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+    shard_data = [test_cid, None]
+    await store._shard_data_cache.put(0, shard_data, is_dirty=True)
+
+    # Verify the shard is dirty
+    assert store._shard_data_cache.dirty_cache_size == 1
+    assert 0 in store._shard_data_cache._dirty_shards
+
+    # Mock the cache.get to return None for the dirty shard (simulating cache corruption)
+    original_get = store._shard_data_cache.get
+
+    async def mock_get_returns_none(shard_idx):
+        if shard_idx == 0:  # Return None for the dirty shard
+            return None
+        return await original_get(shard_idx)
+
+    with patch.object(
+        store._shard_data_cache, "get", side_effect=mock_get_returns_none
+    ):
+        # This should hit line 529 (RuntimeError for dirty shard not found in cache)
+        with pytest.raises(RuntimeError, match="Dirty shard 0 not found in cache"):
+            await store.flush()
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_failed_to_load_or_initialize_shard():
+    """Test RuntimeError when shard fails to load or initialize"""
+    from unittest.mock import patch
+
+    from multiformats import CID
+
+    from py_hamt import ShardedZarrStore
+
+    class MockCAS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            import dag_cbor
+
+            return dag_cbor.encode([None] * 4)
+
+    mock_cas = MockCAS()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=4,
+    )
+
+    # Set up a shard CID to fetch
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+    store._root_obj["chunks"]["shard_cids"][0] = test_cid
+
+    # Mock the cache to always return None, even after put operations
+    async def mock_get_always_none(shard_idx):
+        return None  # Always return None to simulate cache failure
+
+    async def mock_put_does_nothing(shard_idx, shard_data, is_dirty=False):
+        pass  # Do nothing, so cache remains empty
+
+    with patch.object(store._shard_data_cache, "get", side_effect=mock_get_always_none):
+        with patch.object(
+            store._shard_data_cache, "put", side_effect=mock_put_does_nothing
+        ):
+            # This should hit lines 451-452 (RuntimeError for failed to load or initialize)
+            with pytest.raises(
+                RuntimeError, match="Failed to load or initialize shard 0"
+            ):
+                await store._load_or_initialize_shard_cache(0)
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_timeout_cleanup_logic():
+    """Test timeout cleanup logic in _load_or_initialize_shard_cache"""
+    import asyncio
+    from unittest.mock import patch
+
+    from multiformats import CID
+
+    from py_hamt import ShardedZarrStore
+
+    class MockCAS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            # Never completes to simulate timeout
+            await asyncio.sleep(100)
+
+    mock_cas = MockCAS()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=4,
+    )
+
+    # Set up a shard CID
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+    store._root_obj["chunks"]["shard_cids"][0] = test_cid
+
+    # Manually create a pending load event to simulate the scenario
+    pending_event = asyncio.Event()
+    store._pending_shard_loads[0] = pending_event
+
+    # Verify the pending load is set up
+    assert 0 in store._pending_shard_loads
+    assert not store._pending_shard_loads[0].is_set()
+
+    # Mock wait_for to properly await the coroutine but still raise TimeoutError
+    async def mock_wait_for(coro, timeout=None):
+        # Properly cancel the coroutine to avoid the warning
+        if hasattr(coro, "close"):
+            coro.close()
+        raise asyncio.TimeoutError()
+
+    # Test cleanup logic (lines 431-439)
+    with patch("asyncio.wait_for", side_effect=mock_wait_for):
+        with pytest.raises(RuntimeError, match="Timeout waiting for shard 0 to load"):
+            await store._load_or_initialize_shard_cache(0)
+
+    # Verify cleanup occurred (lines 433-437)
+    # The event should be set and removed from pending loads
+    assert 0 not in store._pending_shard_loads  # Should be cleaned up
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_pending_load_cache_miss():
+    """Test RuntimeError when pending load completes but shard not found in cache"""
+    import asyncio
+    from unittest.mock import patch
+
+    from multiformats import CID
+
+    from py_hamt import ShardedZarrStore
+
+    class MockCAS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def load(self, cid):
+            import dag_cbor
+
+            return dag_cbor.encode([None] * 4)
+
+    mock_cas = MockCAS()
+    store = await ShardedZarrStore.open(
+        cas=mock_cas,
+        read_only=False,
+        array_shape=(10,),
+        chunk_shape=(5,),
+        chunks_per_shard=4,
+    )
+
+    # Set up a shard CID
+    test_cid = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+    store._root_obj["chunks"]["shard_cids"][0] = test_cid
+
+    # Create a pending load event and manually add it
+    pending_event = asyncio.Event()
+    store._pending_shard_loads[0] = pending_event
+
+    # Set up mocks: wait_for succeeds (doesn't timeout) but cache.get returns None
+    async def mock_wait_for(coro, timeout=None):
+        # Properly handle the coroutine to avoid warnings
+        if hasattr(coro, "close"):
+            coro.close()
+        # Simulate successful wait - the pending event gets set
+        pending_event.set()
+        return True  # Successful wait
+
+    async def mock_cache_get(shard_idx):
+        # Always return None to simulate cache miss after pending load
+        return None
+
+    # Test the scenario where pending load "completes" but shard not in cache (line 428-430)
+    with patch("asyncio.wait_for", side_effect=mock_wait_for):
+        with patch.object(store._shard_data_cache, "get", side_effect=mock_cache_get):
+            with pytest.raises(
+                RuntimeError,
+                match="Shard 0 not found in cache after pending load completed",
+            ):
+                await store._load_or_initialize_shard_cache(0)
