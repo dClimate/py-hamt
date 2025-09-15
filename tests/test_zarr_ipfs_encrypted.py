@@ -4,9 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
-import zarr
-import zarr.core.buffer
 from Crypto.Random import get_random_bytes
+from dag_cbor.ipld import IPLDKind
 
 from py_hamt import HAMT, KuboCAS, SimpleEncryptedZarrHAMTStore
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
@@ -91,9 +90,7 @@ async def test_encrypted_write_read(
     correct_key = get_random_bytes(32)
     wrong_key = get_random_bytes(32)
     header = b"test-encryption-header"
-
-    root_cid = None
-
+    root_cid: IPLDKind = None
     # --- Write Phase ---
     async with KuboCAS(
         rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
@@ -109,7 +106,7 @@ async def test_encrypted_write_read(
         assert ezhs_write != hamt_write
 
         assert ezhs_write.supports_writes
-        test_ds.to_zarr(store=ezhs_write, mode="w", zarr_format=3)  # Use mode='w'
+        test_ds.to_zarr(store=ezhs_write, mode="w", zarr_format=3)  # type: ignore
 
         await hamt_write.make_read_only()
         root_cid = hamt_write.root_node_id
@@ -195,13 +192,8 @@ async def test_encrypted_write_read(
         with pytest.raises(NotImplementedError):
             await ezhs_read_ok.set_partial_values([])
 
-        with pytest.raises(NotImplementedError):
-            await ezhs_read_ok.get_partial_values(
-                zarr.core.buffer.default_buffer_prototype(), []
-            )
-
         with pytest.raises(Exception):
-            await ezhs_read_ok.set("new_key", np.array([b"a"], dtype=np.bytes_))
+            await ezhs_read_ok.set("new_key", np.array([b"a"], dtype=np.bytes_))  # type: ignore
 
         with pytest.raises(Exception):
             await ezhs_read_ok.delete("zarr.json")

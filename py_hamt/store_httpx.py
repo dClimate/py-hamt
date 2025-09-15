@@ -2,7 +2,7 @@ import asyncio
 import random
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Literal, Tuple, cast
+from typing import Any, Dict, Literal, Optional, Tuple, cast
 
 import httpx
 from dag_cbor.ipld import IPLDKind
@@ -32,8 +32,32 @@ class ContentAddressedStore(ABC):
         """
 
     @abstractmethod
-    async def load(self, id: IPLDKind) -> bytes:
+    async def load(
+        self,
+        id: IPLDKind,
+        offset: Optional[int] = None,
+        length: Optional[int] = None,
+        suffix: Optional[int] = None,
+    ) -> bytes:
         """Retrieve data."""
+
+    async def pin_cid(self, id: IPLDKind, target_rpc: str) -> None:
+        """Pin a CID in the storage."""
+        pass  # pragma: no cover
+
+    async def unpin_cid(self, id: IPLDKind, target_rpc: str) -> None:
+        """Unpin a CID in the storage."""
+        pass  # pragma: no cover
+
+    async def pin_update(
+        self, old_id: IPLDKind, new_id: IPLDKind, target_rpc: str
+    ) -> None:
+        """Update the pinned CID in the storage."""
+        pass  # pragma: no cover
+
+    async def pin_ls(self, target_rpc: str) -> list[Dict[str, Any]]:
+        """List all pinned CIDs in the storage."""
+        return []  # pragma: no cover
 
 
 class InMemoryCAS(ContentAddressedStore):
@@ -51,7 +75,13 @@ class InMemoryCAS(ContentAddressedStore):
         self.store[hash] = data
         return hash
 
-    async def load(self, id: IPLDKind) -> bytes:
+    async def load(
+        self,
+        id: IPLDKind,
+        offset: Optional[int] = None,
+        length: Optional[int] = None,
+        suffix: Optional[int] = None,
+    ) -> bytes:
         """
         `ContentAddressedStore` allows any IPLD scalar key.  For the in-memory
         backend we *require* a `bytes` hash; anything else is rejected at run
@@ -66,11 +96,23 @@ class InMemoryCAS(ContentAddressedStore):
             raise TypeError(
                 f"InMemoryCAS only supports byte‐hash keys; got {type(id).__name__}"
             )
-
+        data: bytes
         try:
-            return self.store[key]
+            data = self.store[key]
         except KeyError as exc:
             raise KeyError("Object not found in in-memory store") from exc
+
+        if offset is not None:
+            start = offset
+            if length is not None:
+                end = start + length
+                return data[start:end]
+            else:
+                return data[start:]
+        elif suffix is not None:  # If only length is given, assume start from 0
+            return data[-suffix:]
+        else:  # Full load
+            return data
 
 
 class KuboCAS(ContentAddressedStore):
@@ -146,6 +188,7 @@ class KuboCAS(ContentAddressedStore):
         *,
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
+        pin_on_add: bool = False,
         chunker: str = "size-1048576",
         max_retries: int = 3,
         initial_delay: float = 1.0,
@@ -187,6 +230,13 @@ class KuboCAS(ContentAddressedStore):
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
 
+        self._owns_client: bool = False
+        self._closed: bool = True
+        self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+        self._default_headers = headers
+        self._default_auth = auth
+
+        # Now, perform validation that might raise an exception
         chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
         if re.fullmatch(chunker_pattern, chunker) is None:
             raise ValueError("Invalid chunker specification")
@@ -209,7 +259,8 @@ class KuboCAS(ContentAddressedStore):
         else:
             gateway_base_url = f"{gateway_base_url}/ipfs/"
 
-        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin=false"
+        pin_string: str = "true" if pin_on_add else "false"
+        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pin_string}"
         """@private"""
         self.gateway_base_url: str = gateway_base_url
         """@private"""
@@ -228,7 +279,7 @@ class KuboCAS(ContentAddressedStore):
         self._default_auth = auth
 
         self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-        self._closed: bool = False
+        self._closed = False
 
         # Validate retry parameters
         if max_retries < 0:
@@ -392,16 +443,41 @@ class KuboCAS(ContentAddressedStore):
                     raise
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
-    async def load(self, id: IPLDKind) -> bytes:
+    async def load(
+        self,
+        id: IPLDKind,
+        offset: Optional[int] = None,
+        length: Optional[int] = None,
+        suffix: Optional[int] = None,
+    ) -> bytes:
+        """Load data from a CID using the IPFS gateway with optional Range requests."""
         cid = cast(CID, id)
         url: str = f"{self.gateway_base_url + str(cid)}"
-        async with self._sem:
+        headers: Dict[str, str] = {}
+
+        # Construct the Range header if required
+        if offset is not None:
+            start = offset
+            if length is not None:
+                # Standard HTTP Range: bytes=start-end (inclusive)
+                end = start + length - 1
+                headers["Range"] = f"bytes={start}-{end}"
+            else:
+                # Standard HTTP Range: bytes=start- (from start to end)
+                headers["Range"] = f"bytes={start}-"
+        elif suffix is not None:
+            # Standard HTTP Range: bytes=-N (last N bytes)
+            headers["Range"] = f"bytes=-{suffix}"
+
+        async with self._sem:  # Throttle gateway
             client = self._loop_client()
             retry_count = 0
 
             while retry_count <= self.max_retries:
                 try:
-                    response = await client.get(url, timeout=60.0)
+                    response = await client.get(
+                        url, headers=headers or None, timeout=60.0
+                    )
                     response.raise_for_status()
                     return response.content
 
@@ -415,15 +491,96 @@ class KuboCAS(ContentAddressedStore):
                             else None,
                         )
 
-                    # Calculate backoff delay
+                    # Calculate backoff delay with jitter
                     delay = self.initial_delay * (
                         self.backoff_factor ** (retry_count - 1)
                     )
-                    # Add some jitter to prevent thundering herd
                     jitter = delay * 0.1 * (random.random() - 0.5)
                     await asyncio.sleep(delay + jitter)
 
                 except httpx.HTTPStatusError:
                     # Re-raise non-timeout HTTP errors immediately
                     raise
+
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
+
+    # --------------------------------------------------------------------- #
+    # pin_cid() – method to pin a CID                                       #
+    # --------------------------------------------------------------------- #
+    async def pin_cid(
+        self,
+        cid: CID,
+        target_rpc: str = "http://127.0.0.1:5001",
+    ) -> None:
+        """
+        Pins a CID to the local Kubo node via the RPC API.
+
+        This call is recursive by default, pinning all linked objects.
+
+        Args:
+            cid (CID): The Content ID to pin.
+            target_rpc (str): The RPC URL of the Kubo node.
+        """
+        params = {"arg": str(cid), "recursive": "true"}
+        pin_add_url_base: str = f"{target_rpc}/api/v0/pin/add"
+
+        async with self._sem:  # throttle RPC
+            client = self._loop_client()
+            response = await client.post(pin_add_url_base, params=params)
+            response.raise_for_status()
+
+    async def unpin_cid(
+        self, cid: CID, target_rpc: str = "http://127.0.0.1:5001"
+    ) -> None:
+        """
+        Unpins a CID from the local Kubo node via the RPC API.
+
+        Args:
+            cid (CID): The Content ID to unpin.
+        """
+        params = {"arg": str(cid), "recursive": "true"}
+        unpin_url_base: str = f"{target_rpc}/api/v0/pin/rm"
+        async with self._sem:  # throttle RPC
+            client = self._loop_client()
+            response = await client.post(unpin_url_base, params=params)
+            response.raise_for_status()
+
+    async def pin_update(
+        self,
+        old_id: IPLDKind,
+        new_id: IPLDKind,
+        target_rpc: str = "http://127.0.0.1:5001",
+    ) -> None:
+        """
+        Updates the pinned CID in the storage.
+
+        Args:
+            old_id (IPLDKind): The old Content ID to replace.
+            new_id (IPLDKind): The new Content ID to pin.
+        """
+        params = {"arg": [str(old_id), str(new_id)]}
+        pin_update_url_base: str = f"{target_rpc}/api/v0/pin/update"
+        async with self._sem:  # throttle RPC
+            client = self._loop_client()
+            response = await client.post(pin_update_url_base, params=params)
+            response.raise_for_status()
+
+    async def pin_ls(
+        self, target_rpc: str = "http://127.0.0.1:5001"
+    ) -> list[Dict[str, Any]]:
+        """
+        Lists all pinned CIDs on the local Kubo node via the RPC API.
+
+        Args:
+            target_rpc (str): The RPC URL of the Kubo node.
+
+        Returns:
+            List[CID]: A list of pinned CIDs.
+        """
+        pin_ls_url_base: str = f"{target_rpc}/api/v0/pin/ls"
+        async with self._sem:  # throttle RPC
+            client = self._loop_client()
+            response = await client.post(pin_ls_url_base)
+            response.raise_for_status()
+            pins = response.json().get("Keys", [])
+            return pins

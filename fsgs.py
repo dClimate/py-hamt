@@ -16,7 +16,7 @@ print(f"httpx version: {httpx.__version__}")
 
 
 async def main():
-    cid = "bafyr4iecw3faqyvj75psutabk2jxpddpjdokdy5b26jdnjjzpkzbgb5xoq"
+    cid = "bafyr4ibiduv7ml3jeyl3gn6cjcrcizfqss7j64rywpbj3whr7tc6xipt3y"
 
     # Use KuboCAS as an async context manager
     async with KuboCAS() as kubo_cas:  # connects to a local kubo node
