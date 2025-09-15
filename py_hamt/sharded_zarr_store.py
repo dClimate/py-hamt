@@ -278,7 +278,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 raise ValueError("shard_cids is not a list.")
         except Exception as e:
             raise ValueError(f"Failed to decode root object: {e}")
-        self._root_obj = dag_cbor.decode(root_bytes)
 
         if self._root_obj.get("manifest_version") != "sharded_zarr_v1":
             raise ValueError(
