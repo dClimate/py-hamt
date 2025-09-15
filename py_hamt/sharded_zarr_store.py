@@ -336,8 +336,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     raise RuntimeError(
                         f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
                     )
-            except Exception as e:
-                raise e
 
     def _parse_chunk_key(self, key: str) -> Optional[Tuple[int, ...]]:
         # 1. Exclude .json files immediately (metadata)
@@ -627,7 +625,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             and not key.startswith("time/")
             and not key.startswith(("lat/", "latitude/"))
             and not key.startswith(("lon/", "longitude/"))
-            and not len(key) == 9
+            and not key == "zarr.json"
         ):
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
             new_array_shape = metadata_json.get("shape")
