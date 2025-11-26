@@ -627,18 +627,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise PermissionError("Cannot write to a read-only store.")
         await self._resize_complete.wait()
 
-        if (
-            key.endswith("zarr.json")
-            and not key == "zarr.json"
-        ):
+        if key.endswith("zarr.json") and not key == "zarr.json":
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
             new_array_shape = metadata_json.get("shape")
             if not new_array_shape:
                 raise ValueError("Shape not found in metadata.")
             # Only resize when the metadata shape represents the primary array.
-            if len(new_array_shape) == len(self._array_shape) and tuple(
-                new_array_shape
-            ) != self._array_shape:
+            if (
+                len(new_array_shape) == len(self._array_shape)
+                and tuple(new_array_shape) != self._array_shape
+            ):
                 async with self._resize_lock:
                     # Double-check after acquiring the lock, in case another task
                     # just finished this exact resize while we were waiting.

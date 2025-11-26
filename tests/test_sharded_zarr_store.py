@@ -108,14 +108,12 @@ async def test_sharded_zarr_store_forecast_step_coordinates(
             "latitude": latitude,
             "longitude": longitude,
         },
-    ).chunk(
-        {
-            "forecast_reference_time": 2,
-            "step": 2,
-            "latitude": 2,
-            "longitude": 4,
-        }
-    )
+    ).chunk({
+        "forecast_reference_time": 2,
+        "step": 2,
+        "latitude": 2,
+        "longitude": 4,
+    })
 
     ordered_dims = list(ds.sizes)
     array_shape_tuple = tuple(ds.sizes[dim] for dim in ordered_dims)
