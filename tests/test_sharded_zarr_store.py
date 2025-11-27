@@ -149,6 +149,54 @@ async def test_sharded_zarr_store_forecast_step_coordinates(
 
 
 @pytest.mark.asyncio
+async def test_coordinate_metadata_delete_idempotent(create_ipfs: tuple[str, str]):
+    """Deleting coordinate metadata keys should be a no-op if already absent."""
+    rpc_base_url, gateway_base_url = create_ipfs
+    ds = xr.Dataset(
+        {
+            "t": (
+                ["forecast_reference_time", "step", "latitude", "longitude"],
+                np.random.randn(1, 1, 2, 2),
+            )
+        },
+        coords={
+            "forecast_reference_time": pd.date_range("2024-01-01", periods=1),
+            "step": pd.to_timedelta([0], unit="h"),
+            "latitude": np.array([0.0, 1.0]),
+            "longitude": np.array([0.0, 1.0]),
+        },
+    ).chunk(
+        {
+            "forecast_reference_time": 1,
+            "step": 1,
+            "latitude": 1,
+            "longitude": 1,
+        }
+    )
+
+    ordered_dims = list(ds.sizes)
+    array_shape_tuple = tuple(ds.sizes[dim] for dim in ordered_dims)
+    chunk_shape_tuple = tuple(ds.chunks[dim][0] for dim in ordered_dims)
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=array_shape_tuple,
+            chunk_shape=chunk_shape_tuple,
+            chunks_per_shard=8,
+        )
+        ds.to_zarr(store=store, mode="w")
+        # Delete coordinate metadata once (present) and again (absent) without errors.
+        await store.delete("forecast_reference_time/c/0")
+        await store.delete("forecast_reference_time/c/0")
+        await store.delete("step/c/0")
+        await store.delete("step/c/0")
+
+
+@pytest.mark.asyncio
 async def test_load_or_initialize_shard_cache_concurrent_loads(
     create_ipfs: tuple[str, str],
 ):

@@ -715,10 +715,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         chunk_coords = self._parse_chunk_key(key)
         if chunk_coords is None:  # Metadata
-            if self._root_obj["metadata"].pop(key, None):
+            # Coordinate/metadata deletions should be idempotent for caller convenience.
+            if self._root_obj["metadata"].pop(key, None) is not None:
                 self._dirty_root = True
-            else:
-                raise KeyError(f"Metadata key '{key}' not found.")
             return None
 
         linear_chunk_index = self._get_linear_chunk_index(chunk_coords)
