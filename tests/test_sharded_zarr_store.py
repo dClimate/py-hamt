@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 
 import dag_cbor
@@ -194,6 +195,30 @@ async def test_coordinate_metadata_delete_idempotent(create_ipfs: tuple[str, str
         await store.delete("forecast_reference_time/c/0")
         await store.delete("step/c/0")
         await store.delete("step/c/0")
+
+
+@pytest.mark.asyncio
+async def test_metadata_without_shape_does_not_resize(create_ipfs: tuple[str, str]):
+    """Metadata files lacking a shape should not trigger resize or errors."""
+    rpc_base_url, gateway_base_url = create_ipfs
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=(10, 10),
+            chunk_shape=(5, 5),
+            chunks_per_shard=4,
+        )
+        proto = zarr.core.buffer.default_buffer_prototype()
+        metadata_without_shape = proto.buffer.from_bytes(
+            json.dumps({"zarr_format": 3}).encode("utf-8")
+        )
+        await store.set("group/zarr.json", metadata_without_shape)
+        # No resize should occur; geometry stays the same.
+        assert store._array_shape == (10, 10)
+        assert store._chunks_per_dim == (2, 2)
 
 
 @pytest.mark.asyncio

@@ -630,27 +630,27 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if key.endswith("zarr.json") and not key == "zarr.json":
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
             new_array_shape = metadata_json.get("shape")
-            if not new_array_shape:
-                raise ValueError("Shape not found in metadata.")
-            # Only resize when the metadata shape represents the primary array.
-            if (
-                len(new_array_shape) == len(self._array_shape)
-                and tuple(new_array_shape) != self._array_shape
-            ):
-                async with self._resize_lock:
-                    # Double-check after acquiring the lock, in case another task
-                    # just finished this exact resize while we were waiting.
-                    if (
-                        len(new_array_shape) == len(self._array_shape)
-                        and tuple(new_array_shape) != self._array_shape
-                    ):
-                        # Block all other tasks until resize is complete.
-                        self._resize_complete.clear()
-                        try:
-                            await self.resize_store(new_shape=tuple(new_array_shape))
-                        finally:
-                            # All waiting tasks will now un-pause and proceed safely.
-                            self._resize_complete.set()
+            # Some metadata entries (e.g., group metadata) do not have a shape field.
+            if new_array_shape:
+                # Only resize when the metadata shape represents the primary array.
+                if (
+                    len(new_array_shape) == len(self._array_shape)
+                    and tuple(new_array_shape) != self._array_shape
+                ):
+                    async with self._resize_lock:
+                        # Double-check after acquiring the lock, in case another task
+                        # just finished this exact resize while we were waiting.
+                        if (
+                            len(new_array_shape) == len(self._array_shape)
+                            and tuple(new_array_shape) != self._array_shape
+                        ):
+                            # Block all other tasks until resize is complete.
+                            self._resize_complete.clear()
+                            try:
+                                await self.resize_store(new_shape=tuple(new_array_shape))
+                            finally:
+                                # All waiting tasks will now un-pause and proceed safely.
+                                self._resize_complete.set()
 
         raw_data_bytes = value.to_bytes()
         # Save the data to CAS first to get its CID.

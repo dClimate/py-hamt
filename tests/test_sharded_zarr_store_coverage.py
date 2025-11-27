@@ -205,11 +205,8 @@ async def test_sharded_zarr_store_get_set_exceptions(create_ipfs: tuple[str, str
         with pytest.raises(NotImplementedError):
             await store.set_partial_values([])
 
-        # Test ValueError when shape is not found in metadata during set
-        with pytest.raises(ValueError, match="Shape not found in metadata."):
-            await store.set(
-                "test/zarr.json", proto.buffer.from_bytes(b'{"not": "a shape"}')
-            )
+        # Metadata lacking shape should be accepted without resizing
+        await store.set("test/zarr.json", proto.buffer.from_bytes(b'{"not": "a shape"}'))
 
 
 @pytest.mark.asyncio
