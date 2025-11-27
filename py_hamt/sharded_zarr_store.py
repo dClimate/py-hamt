@@ -647,7 +647,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
                             # Block all other tasks until resize is complete.
                             self._resize_complete.clear()
                             try:
-                                await self.resize_store(new_shape=tuple(new_array_shape))
+                                await self.resize_store(
+                                    new_shape=tuple(new_array_shape)
+                                )
                             finally:
                                 # All waiting tasks will now un-pause and proceed safely.
                                 self._resize_complete.set()

@@ -166,14 +166,12 @@ async def test_coordinate_metadata_delete_idempotent(create_ipfs: tuple[str, str
             "latitude": np.array([0.0, 1.0]),
             "longitude": np.array([0.0, 1.0]),
         },
-    ).chunk(
-        {
-            "forecast_reference_time": 1,
-            "step": 1,
-            "latitude": 1,
-            "longitude": 1,
-        }
-    )
+    ).chunk({
+        "forecast_reference_time": 1,
+        "step": 1,
+        "latitude": 1,
+        "longitude": 1,
+    })
 
     ordered_dims = list(ds.sizes)
     array_shape_tuple = tuple(ds.sizes[dim] for dim in ordered_dims)

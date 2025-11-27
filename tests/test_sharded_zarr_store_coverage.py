@@ -206,7 +206,9 @@ async def test_sharded_zarr_store_get_set_exceptions(create_ipfs: tuple[str, str
             await store.set_partial_values([])
 
         # Metadata lacking shape should be accepted without resizing
-        await store.set("test/zarr.json", proto.buffer.from_bytes(b'{"not": "a shape"}'))
+        await store.set(
+            "test/zarr.json", proto.buffer.from_bytes(b'{"not": "a shape"}')
+        )
 
 
 @pytest.mark.asyncio
