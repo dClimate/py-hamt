@@ -134,7 +134,8 @@ async def test_sharded_zarr_store_forecast_step_coordinates(
         # The primary array geometry should remain unchanged after writing
         assert store_write._array_shape == array_shape_tuple
         assert store_write._chunks_per_dim == tuple(
-            math.ceil(a / c) for a, c in zip(array_shape_tuple, chunk_shape_tuple)
+            math.ceil(a / c)
+            for a, c in zip(array_shape_tuple, chunk_shape_tuple, strict=True)
         )
         root_cid = await store_write.flush()
 
