@@ -1,4 +1,6 @@
 import asyncio
+import json
+import math
 
 import dag_cbor
 import numpy as np
@@ -74,6 +76,148 @@ async def test_sharded_zarr_store_write_read(
         with pytest.raises(PermissionError):
             proto = zarr.core.buffer.default_buffer_prototype()
             await store_read.set("temp/c/0/0", proto.buffer.from_bytes(b"test_data"))
+
+
+@pytest.mark.asyncio
+async def test_sharded_zarr_store_forecast_step_coordinates(
+    create_ipfs: tuple[str, str],
+):
+    """Ensure datasets with forecast_reference_time/step coordinates write and read."""
+    rpc_base_url, gateway_base_url = create_ipfs
+    forecast_reference_time = pd.date_range("2024-01-01", periods=3, freq="6H")
+    step = pd.to_timedelta([0, 6, 12, 18], unit="h")
+    latitude = np.linspace(-90, 90, 4)
+    longitude = np.linspace(-180, 180, 8)
+
+    temperature = np.random.randn(
+        len(forecast_reference_time),
+        len(step),
+        len(latitude),
+        len(longitude),
+    )
+
+    ds = xr.Dataset(
+        {
+            "t2m": (
+                ["forecast_reference_time", "step", "latitude", "longitude"],
+                temperature,
+            )
+        },
+        coords={
+            "forecast_reference_time": forecast_reference_time,
+            "step": step,
+            "latitude": latitude,
+            "longitude": longitude,
+        },
+    ).chunk({
+        "forecast_reference_time": 2,
+        "step": 2,
+        "latitude": 2,
+        "longitude": 4,
+    })
+
+    ordered_dims = list(ds.sizes)
+    array_shape_tuple = tuple(ds.sizes[dim] for dim in ordered_dims)
+    chunk_shape_tuple = tuple(ds.chunks[dim][0] for dim in ordered_dims)
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        store_write = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=array_shape_tuple,
+            chunk_shape=chunk_shape_tuple,
+            chunks_per_shard=32,
+        )
+        ds.to_zarr(store=store_write, mode="w")
+        # The primary array geometry should remain unchanged after writing
+        assert store_write._array_shape == array_shape_tuple
+        assert store_write._chunks_per_dim == tuple(
+            math.ceil(a / c)
+            for a, c in zip(array_shape_tuple, chunk_shape_tuple, strict=True)
+        )
+        root_cid = await store_write.flush()
+
+        store_read = await ShardedZarrStore.open(
+            cas=kubo_cas, read_only=True, root_cid=root_cid
+        )
+        ds_read = xr.open_zarr(store=store_read)
+        xr.testing.assert_identical(ds, ds_read)
+
+        # Coordinate arrays should be stored and retrievable
+        assert await store_read.exists("forecast_reference_time/c/0")
+        assert await store_read.exists("step/c/0")
+
+
+@pytest.mark.asyncio
+async def test_coordinate_metadata_delete_idempotent(create_ipfs: tuple[str, str]):
+    """Deleting coordinate metadata keys should be a no-op if already absent."""
+    rpc_base_url, gateway_base_url = create_ipfs
+    ds = xr.Dataset(
+        {
+            "t": (
+                ["forecast_reference_time", "step", "latitude", "longitude"],
+                np.random.randn(1, 1, 2, 2),
+            )
+        },
+        coords={
+            "forecast_reference_time": pd.date_range("2024-01-01", periods=1),
+            "step": pd.to_timedelta([0], unit="h"),
+            "latitude": np.array([0.0, 1.0]),
+            "longitude": np.array([0.0, 1.0]),
+        },
+    ).chunk({
+        "forecast_reference_time": 1,
+        "step": 1,
+        "latitude": 1,
+        "longitude": 1,
+    })
+
+    ordered_dims = list(ds.sizes)
+    array_shape_tuple = tuple(ds.sizes[dim] for dim in ordered_dims)
+    chunk_shape_tuple = tuple(ds.chunks[dim][0] for dim in ordered_dims)
+
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=array_shape_tuple,
+            chunk_shape=chunk_shape_tuple,
+            chunks_per_shard=8,
+        )
+        ds.to_zarr(store=store, mode="w")
+        # Delete coordinate metadata once (present) and again (absent) without errors.
+        await store.delete("forecast_reference_time/c/0")
+        await store.delete("forecast_reference_time/c/0")
+        await store.delete("step/c/0")
+        await store.delete("step/c/0")
+
+
+@pytest.mark.asyncio
+async def test_metadata_without_shape_does_not_resize(create_ipfs: tuple[str, str]):
+    """Metadata files lacking a shape should not trigger resize or errors."""
+    rpc_base_url, gateway_base_url = create_ipfs
+    async with KuboCAS(
+        rpc_base_url=rpc_base_url, gateway_base_url=gateway_base_url
+    ) as kubo_cas:
+        store = await ShardedZarrStore.open(
+            cas=kubo_cas,
+            read_only=False,
+            array_shape=(10, 10),
+            chunk_shape=(5, 5),
+            chunks_per_shard=4,
+        )
+        proto = zarr.core.buffer.default_buffer_prototype()
+        metadata_without_shape = proto.buffer.from_bytes(
+            json.dumps({"zarr_format": 3}).encode("utf-8")
+        )
+        await store.set("group/zarr.json", metadata_without_shape)
+        # No resize should occur; geometry stays the same.
+        assert store._array_shape == (10, 10)
+        assert store._chunks_per_dim == (2, 2)
 
 
 @pytest.mark.asyncio

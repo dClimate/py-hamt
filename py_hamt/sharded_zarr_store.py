@@ -340,7 +340,15 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # 1. Exclude .json files immediately (metadata)
         if key.endswith(".json"):
             return None
-        excluded_array_prefixes = {"time", "lat", "lon", "latitude", "longitude"}
+        excluded_array_prefixes = {
+            "time",
+            "lat",
+            "lon",
+            "latitude",
+            "longitude",
+            "forecast_reference_time",
+            "step",
+        }
 
         chunk_marker = "/c/"
         marker_idx = key.rfind(chunk_marker)  # Use rfind for robustness
@@ -360,7 +368,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if path_before_c:
             actual_array_name = path_before_c.split("/")[-1]
 
-        # 2. If the determined array name is in our exclusion list, return None.
+        # If the determined array name is in our exclusion list, return None.
         if actual_array_name in excluded_array_prefixes:
             return None
 
@@ -619,29 +627,32 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise PermissionError("Cannot write to a read-only store.")
         await self._resize_complete.wait()
 
-        if (
-            key.endswith("zarr.json")
-            and not key.startswith("time/")
-            and not key.startswith(("lat/", "latitude/"))
-            and not key.startswith(("lon/", "longitude/"))
-            and not key == "zarr.json"
-        ):
+        if key.endswith("zarr.json") and not key == "zarr.json":
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
             new_array_shape = metadata_json.get("shape")
-            if not new_array_shape:
-                raise ValueError("Shape not found in metadata.")
-            if tuple(new_array_shape) != self._array_shape:
-                async with self._resize_lock:
-                    # Double-check after acquiring the lock, in case another task
-                    # just finished this exact resize while we were waiting.
-                    if tuple(new_array_shape) != self._array_shape:
-                        # Block all other tasks until resize is complete.
-                        self._resize_complete.clear()
-                        try:
-                            await self.resize_store(new_shape=tuple(new_array_shape))
-                        finally:
-                            # All waiting tasks will now un-pause and proceed safely.
-                            self._resize_complete.set()
+            # Some metadata entries (e.g., group metadata) do not have a shape field.
+            if new_array_shape:
+                # Only resize when the metadata shape represents the primary array.
+                if (
+                    len(new_array_shape) == len(self._array_shape)
+                    and tuple(new_array_shape) != self._array_shape
+                ):
+                    async with self._resize_lock:
+                        # Double-check after acquiring the lock, in case another task
+                        # just finished this exact resize while we were waiting.
+                        if (
+                            len(new_array_shape) == len(self._array_shape)
+                            and tuple(new_array_shape) != self._array_shape
+                        ):
+                            # Block all other tasks until resize is complete.
+                            self._resize_complete.clear()
+                            try:
+                                await self.resize_store(
+                                    new_shape=tuple(new_array_shape)
+                                )
+                            finally:
+                                # All waiting tasks will now un-pause and proceed safely.
+                                self._resize_complete.set()
 
         raw_data_bytes = value.to_bytes()
         # Save the data to CAS first to get its CID.
@@ -706,10 +717,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         chunk_coords = self._parse_chunk_key(key)
         if chunk_coords is None:  # Metadata
-            if self._root_obj["metadata"].pop(key, None):
+            # Coordinate/metadata deletions should be idempotent for caller convenience.
+            if self._root_obj["metadata"].pop(key, None) is not None:
                 self._dirty_root = True
-            else:
-                raise KeyError(f"Metadata key '{key}' not found.")
             return None
 
         linear_chunk_index = self._get_linear_chunk_index(chunk_coords)

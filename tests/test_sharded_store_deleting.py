@@ -137,10 +137,6 @@ async def test_delete_nonexistent_key(create_ipfs: tuple[str, str]):
         await store.flush()
         assert not store._shard_data_cache._dirty_shards  # No dirty shards after flush
 
-        # Try to delete nonexistent metadata key
-        with pytest.raises(KeyError, match="Metadata key 'nonexistent.json' not found"):
-            await store.delete("nonexistent.json")
-
         # Try to delete nonexistent chunk key (out of bounds)
         with pytest.raises(IndexError, match="Chunk coordinate"):
             await store.delete("temp/c/3/0")  # Out of bounds for 2x2 chunk grid

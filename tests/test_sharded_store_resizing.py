@@ -296,18 +296,6 @@ async def test_resize_variable_invalid_cases(
         ):
             await store.resize_variable("nonexistent", new_shape=(150, 18, 36))
 
-        # Test invalid metadata (simulate by setting invalid metadata)
-        invalid_metadata = json.dumps({"not_shape": [1, 2, 3]}).encode("utf-8")
-        invalid_cid = await kubo_cas.save(invalid_metadata, codec="raw")
-        store._root_obj["metadata"]["invalid/zarr.json"] = invalid_cid
-        with pytest.raises(ValueError, match="Shape not found in metadata"):
-            await store.set(
-                "invalid/zarr.json",
-                zarr.core.buffer.default_buffer_prototype().buffer.from_bytes(
-                    invalid_metadata
-                ),
-            )
-
 
 @pytest.mark.asyncio
 async def test_resize_store_with_data_preservation(create_ipfs: tuple[str, str]):
