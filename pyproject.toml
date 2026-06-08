@@ -1,6 +1,6 @@
 [project]
 name = "py-hamt"
-version = "3.3.1"
+version = "3.3.2"
 description = "HAMT implementation for a content-addressed storage system."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -11,6 +11,7 @@ dependencies = [
     "multiformats[full]>=0.3.1.post4",
     "zarr==3.0.9",
     "pycryptodome>=3.21.0",
+    "opentelemetry-api>=1.30.0",
 ]
 
 [build-system]

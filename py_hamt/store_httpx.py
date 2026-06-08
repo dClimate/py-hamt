@@ -9,6 +9,8 @@ from dag_cbor.ipld import IPLDKind
 from multiformats import CID, multihash
 from multiformats.multihash import Multihash
 
+from . import instrumentation
+
 
 class ContentAddressedStore(ABC):
     """
@@ -469,39 +471,57 @@ class KuboCAS(ContentAddressedStore):
             # Standard HTTP Range: bytes=-N (last N bytes)
             headers["Range"] = f"bytes=-{suffix}"
 
-        async with self._sem:  # Throttle gateway
-            client = self._loop_client()
-            retry_count = 0
+        trace_started_at = instrumentation.begin_cas_load(cid, bool(headers))
+        response_bytes = 0
+        final_status = "ok"
+        final_retry_count = 0
+        try:
+            async with self._sem:  # Throttle gateway
+                client = self._loop_client()
+                retry_count = 0
 
-            while retry_count <= self.max_retries:
-                try:
-                    response = await client.get(
-                        url, headers=headers or None, timeout=60.0
-                    )
-                    response.raise_for_status()
-                    return response.content
-
-                except (httpx.TimeoutException, httpx.RequestError) as e:
-                    retry_count += 1
-                    if retry_count > self.max_retries:
-                        raise httpx.TimeoutException(
-                            f"Failed to load data after {self.max_retries} retries: {str(e)}",
-                            request=e.request
-                            if isinstance(e, httpx.RequestError)
-                            else None,
+                while retry_count <= self.max_retries:
+                    try:
+                        response = await client.get(
+                            url, headers=headers or None, timeout=60.0
                         )
+                        response.raise_for_status()
+                        content = response.content
+                        response_bytes = len(content)
+                        final_retry_count = retry_count
+                        return content
 
-                    # Calculate backoff delay with jitter
-                    delay = self.initial_delay * (
-                        self.backoff_factor ** (retry_count - 1)
-                    )
-                    jitter = delay * 0.1 * (random.random() - 0.5)
-                    await asyncio.sleep(delay + jitter)
+                    except (httpx.TimeoutException, httpx.RequestError) as e:
+                        retry_count += 1
+                        if retry_count > self.max_retries:
+                            final_status = "timeout"
+                            final_retry_count = retry_count
+                            raise httpx.TimeoutException(
+                                f"Failed to load data after {self.max_retries} retries: {str(e)}",
+                                request=e.request
+                                if isinstance(e, httpx.RequestError)
+                                else None,
+                            )
 
-                except httpx.HTTPStatusError:
-                    # Re-raise non-timeout HTTP errors immediately
-                    raise
+                        # Calculate backoff delay with jitter
+                        delay = self.initial_delay * (
+                            self.backoff_factor ** (retry_count - 1)
+                        )
+                        jitter = delay * 0.1 * (random.random() - 0.5)
+                        await asyncio.sleep(delay + jitter)
 
+                    except httpx.HTTPStatusError:
+                        # Re-raise non-timeout HTTP errors immediately
+                        final_status = "http_error"
+                        final_retry_count = retry_count
+                        raise
+        finally:
+            instrumentation.end_cas_load(
+                trace_started_at,
+                byte_count=response_bytes,
+                retries=final_retry_count,
+                status=final_status,
+            )
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     # --------------------------------------------------------------------- #

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections.abc import AsyncIterator, Iterable
 from typing import Optional, cast
 
@@ -7,6 +8,8 @@ import zarr.core.buffer
 from zarr.core.common import BytesLike
 
 from py_hamt.hamt import HAMT
+
+from . import instrumentation
 
 
 class ZarrHAMTStore(zarr.abc.store.Store):
@@ -148,33 +151,55 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         byte_range: zarr.abc.store.ByteRequest | None = None,
     ) -> zarr.core.buffer.Buffer | None:
         """@private"""
-        try:
-            val: bytes
-            # do len check to avoid indexing into overly short strings, 3.12 does not throw errors but we dont know if other versions will
-            is_metadata: bool = (
-                len(key) >= 9 and key[-9:] == "zarr.json"
-            )  # if path ends with zarr.json
+        with instrumentation.span(
+            "py_hamt.hamt_store.get",
+            {
+                "py_hamt.zarr.key": key,
+                "py_hamt.zarr.byte_range": byte_range is not None,
+            },
+        ):
+            started_at = time.perf_counter()
+            hit = False
+            is_metadata = len(key) >= 9 and key[-9:] == "zarr.json"
+            try:
+                val: bytes
+                # do len check to avoid indexing into overly short strings, 3.12 does not throw errors but we dont know if other versions will
+                # if path ends with zarr.json
 
-            if is_metadata and byte_range is None and key in self.metadata_read_cache:
-                val = self.metadata_read_cache[key]
-            else:
-                offset, length, suffix = self._map_byte_request(byte_range)
-                val = cast(
-                    bytes,
-                    await self.hamt.get(
-                        key, offset=offset, length=length, suffix=suffix
-                    ),
-                )  # We know values received will always be bytes since we only store bytes in the HAMT
-                if is_metadata and byte_range is None:
-                    self.metadata_read_cache[key] = val
+                if (
+                    is_metadata
+                    and byte_range is None
+                    and key in self.metadata_read_cache
+                ):
+                    val = self.metadata_read_cache[key]
+                else:
+                    offset, length, suffix = self._map_byte_request(byte_range)
+                    val = cast(
+                        bytes,
+                        await self.hamt.get(
+                            key, offset=offset, length=length, suffix=suffix
+                        ),
+                    )  # We know values received will always be bytes since we only store bytes in the HAMT
+                    if is_metadata and byte_range is None:
+                        self.metadata_read_cache[key] = val
 
-            return prototype.buffer.from_bytes(val)
-        except KeyError:
-            # Sometimes zarr queries keys that don't exist anymore, just return nothing on those cases
-            return None
-        except Exception as e:
-            print(f"Error getting key '{key}' with range {byte_range}: {e}")
-            raise
+                hit = True
+                return prototype.buffer.from_bytes(val)
+            except KeyError:
+                # Sometimes zarr queries keys that don't exist anymore, just return nothing on those cases
+                return None
+            except Exception as e:
+                print(f"Error getting key '{key}' with range {byte_range}: {e}")
+                raise
+            finally:
+                instrumentation.record_zarr_get(
+                    store="hamt_store",
+                    key=key,
+                    kind="metadata" if is_metadata else "chunk",
+                    hit=hit,
+                    seconds=time.perf_counter() - started_at,
+                    byte_range=byte_range is not None,
+                )
 
     async def get_partial_values(
         self,

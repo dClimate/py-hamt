@@ -1,4 +1,5 @@
 import asyncio
+import time
 import uuid
 from abc import ABC, abstractmethod
 from copy import deepcopy
@@ -16,6 +17,7 @@ import dag_cbor
 from dag_cbor.ipld import IPLDKind
 from multiformats import multihash
 
+from . import instrumentation
 from .store_httpx import ContentAddressedStore
 
 
@@ -159,12 +161,24 @@ class ReadCacheStore(NodeStore):
     async def load(self, id: IPLDKind) -> Node:
         # Cache Hit
         if id in self.cache:
+            start = time.perf_counter()
             node: Node = self.cache[id]
+            instrumentation.record_hamt_node_load(
+                cache_hit=True,
+                seconds=time.perf_counter() - start,
+            )
             return node
 
         # Cache Miss
-        node = Node.deserialize(await self.hamt.cas.load(id))
+        start = time.perf_counter()
+        node_bytes = await self.hamt.cas.load(id)
+        node = Node.deserialize(node_bytes)
         self.cache[id] = node
+        instrumentation.record_hamt_node_load(
+            cache_hit=False,
+            seconds=time.perf_counter() - start,
+            byte_count=len(node_bytes),
+        )
         return node
 
     def size(self) -> int:
@@ -625,41 +639,63 @@ class HAMT:
 
     # Callers MUST handle acquiring a lock
     async def _get_pointer(self, key: str) -> IPLDKind:
-        raw_hash: bytes = self.hash_fn(key.encode())
+        with instrumentation.span(
+            "py_hamt.hamt.lookup", {"py_hamt.hamt.lookup.key": key}
+        ):
+            lookup_started_at = time.perf_counter()
+            raw_hash: bytes = self.hash_fn(key.encode())
 
-        current_id: IPLDKind = self.root_node_id
-        current_depth: int = 0
+            current_id: IPLDKind = self.root_node_id
+            current_depth: int = 0
+            node_loads = 0
+            node_cache_hits = 0
 
-        # Don't check if result is none but use a boolean to indicate finding something, this is because None is a possible value of IPLDKind
-        result_ptr: IPLDKind = None
-        found_a_result: bool = False
-        while True:
-            top_id: IPLDKind = current_id
-            top_node: Node = await self.node_store.load(top_id)
-            map_key: int = extract_bits(raw_hash, current_depth, 8)
+            # Don't check if result is none but use a boolean to indicate finding something, this is because None is a possible value of IPLDKind
+            result_ptr: IPLDKind = None
+            found_a_result: bool = False
+            try:
+                while True:
+                    top_id: IPLDKind = current_id
+                    if (
+                        isinstance(self.node_store, ReadCacheStore)
+                        and top_id in self.node_store.cache
+                    ):
+                        node_cache_hits += 1
+                    node_loads += 1
+                    top_node: Node = await self.node_store.load(top_id)
+                    map_key: int = extract_bits(raw_hash, current_depth, 8)
 
-            # Check if this key is in one of the buckets
-            item = top_node.data[map_key]
-            if isinstance(item, dict):
-                bucket = item
-                if key in bucket:
-                    result_ptr = bucket[key]
-                    found_a_result = True
+                    # Check if this key is in one of the buckets
+                    item = top_node.data[map_key]
+                    if isinstance(item, dict):
+                        bucket = item
+                        if key in bucket:
+                            result_ptr = bucket[key]
+                            found_a_result = True
+                            break
+
+                    if isinstance(item, list):
+                        link: IPLDKind = item[0]
+                        current_id = link
+                        current_depth += 1
+                        continue
+
+                    # Nowhere left to go, stop walking down the tree
                     break
 
-            if isinstance(item, list):
-                link: IPLDKind = item[0]
-                current_id = link
-                current_depth += 1
-                continue
+                if not found_a_result:
+                    raise KeyError
 
-            # Nowhere left to go, stop walking down the tree
-            break
-
-        if not found_a_result:
-            raise KeyError
-
-        return result_ptr
+                return result_ptr
+            finally:
+                instrumentation.record_hamt_lookup(
+                    key,
+                    depth=current_depth,
+                    node_loads=node_loads,
+                    node_cache_hits=node_cache_hits,
+                    found=found_a_result,
+                    seconds=time.perf_counter() - lookup_started_at,
+                )
 
     # Callers MUST handle locking or not on their own
     async def _iter_nodes(self) -> AsyncIterator[tuple[IPLDKind, Node]]:
