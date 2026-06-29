@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import dag_cbor
@@ -6,12 +7,15 @@ import pytest
 import xarray as xr
 import zarr.core.buffer
 from dag_cbor.ipld import IPLDKind
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from multiformats import CID, multihash
 from zarr.abc.store import RangeByteRequest
 
 from py_hamt import HAMT
 from py_hamt.hamt_to_sharded_converter import (
     _is_zarr_chunk_key,
+    _normalize_zarr_chunk_key,
     convert_hamt_to_sharded,
 )
 from py_hamt.sharded_zarr_store import SHARDED_ZARR_V2, ArrayIndex, ShardedZarrStore
@@ -40,12 +44,12 @@ class LocalCIDCAS(ContentAddressedStore):
 
     async def load(
         self,
-        id: IPLDKind,
+        cid: IPLDKind,
         offset: int | None = None,
         length: int | None = None,
         suffix: int | None = None,
     ) -> bytes:
-        data = self.store[self._key(id)]
+        data = self.store[self._key(cid)]
         if offset is not None:
             if length is None:
                 return data[offset:]
@@ -125,6 +129,8 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
     assert {"0", "1", "2", "zarr.json"}.issubset(root_entries)
     level_entries = {entry async for entry in read_store.list_dir("0")}
     assert {"FPAR", "x", "y", "time", "zarr.json"}.issubset(level_entries)
+    array_entries = {entry async for entry in read_store.list_dir("0/FPAR")}
+    assert {"zarr.json", "c"}.issubset(array_entries)
 
     prefix_keys = {key async for key in read_store.list_prefix("0/FPAR/")}
     assert "0/FPAR/zarr.json" in prefix_keys
@@ -190,6 +196,407 @@ async def test_v2_resize_is_array_local() -> None:
 
     await store.resize_variable("0/FPAR", (4, 2))
     assert store.array_indices["0/FPAR"].array_shape == (4, 2)
+
+
+@pytest.mark.asyncio
+async def test_resize_clears_retained_and_dropped_shard_entries() -> None:
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [6],
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1]}},
+    }
+    v2_store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=4,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    await v2_store.set(
+        "a/zarr.json", proto.buffer.from_bytes(json.dumps(metadata).encode())
+    )
+    for idx in range(6):
+        await v2_store.set(f"a/c/{idx}", proto.buffer.from_bytes(f"v2-{idx}".encode()))
+
+    await v2_store.resize_store((2,), array_path="a")
+    await v2_store.resize_store((6,), array_path="a")
+
+    assert await v2_store.exists("a/c/0")
+    assert await v2_store.exists("a/c/1")
+    assert not await v2_store.exists("a/c/2")
+    assert not await v2_store.exists("a/c/5")
+
+    v1_store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(6,),
+        chunk_shape=(1,),
+        chunks_per_shard=4,
+    )
+    for idx in range(6):
+        await v1_store.set(f"a/c/{idx}", proto.buffer.from_bytes(f"v1-{idx}".encode()))
+
+    await v1_store.resize_store((2,))
+    await v1_store.resize_store((6,))
+
+    assert await v1_store.exists("a/c/0")
+    assert await v1_store.exists("a/c/1")
+    assert not await v1_store.exists("a/c/2")
+    assert not await v1_store.exists("a/c/5")
+
+
+@pytest.mark.asyncio
+async def test_resize_preserves_multidimensional_chunk_coordinates() -> None:
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [2, 3],
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 1]}},
+    }
+    v2_store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=2,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    await v2_store.set(
+        "a/zarr.json", proto.buffer.from_bytes(json.dumps(metadata).encode())
+    )
+    for y_idx in range(2):
+        for x_idx in range(3):
+            await v2_store.set(
+                f"a/c/{y_idx}/{x_idx}",
+                proto.buffer.from_bytes(f"v2-{y_idx}-{x_idx}".encode()),
+            )
+
+    await v2_store.resize_store((3, 2), array_path="a")
+
+    retained_v2 = await v2_store.get("a/c/1/0", proto)
+    assert retained_v2 is not None
+    assert retained_v2.to_bytes() == b"v2-1-0"
+    assert not await v2_store.exists("a/c/0/2")
+    assert not await v2_store.exists("a/c/1/2")
+    assert not await v2_store.exists("a/c/2/0")
+
+    v1_store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(2, 3),
+        chunk_shape=(1, 1),
+        chunks_per_shard=2,
+    )
+    for y_idx in range(2):
+        for x_idx in range(3):
+            await v1_store.set(
+                f"a/c/{y_idx}/{x_idx}",
+                proto.buffer.from_bytes(f"v1-{y_idx}-{x_idx}".encode()),
+            )
+
+    await v1_store.resize_store((3, 2))
+
+    retained_v1 = await v1_store.get("a/c/1/0", proto)
+    assert retained_v1 is not None
+    assert retained_v1.to_bytes() == b"v1-1-0"
+    assert not await v1_store.exists("a/c/0/2")
+    assert not await v1_store.exists("a/c/1/2")
+    assert not await v1_store.exists("a/c/2/0")
+
+
+@pytest.mark.asyncio
+async def test_v2_resize_blocks_interleaved_chunk_mutators(monkeypatch) -> None:
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+
+    async def paused_resize_store() -> tuple[
+        ShardedZarrStore,
+        asyncio.Task[None],
+        asyncio.Event,
+    ]:
+        store = await ShardedZarrStore.open(
+            cas=cas,
+            read_only=False,
+            chunks_per_shard=2,
+            manifest_version=SHARDED_ZARR_V2,
+        )
+        await store.set(
+            "a/zarr.json",
+            proto.buffer.from_bytes(
+                json.dumps({
+                    "zarr_format": 3,
+                    "node_type": "array",
+                    "shape": [2, 3],
+                    "chunk_grid": {
+                        "name": "regular",
+                        "configuration": {"chunk_shape": [1, 1]},
+                    },
+                }).encode()
+            ),
+        )
+        await store.set("a/c/1/0", proto.buffer.from_bytes(b"original"))
+
+        snapshot_done = asyncio.Event()
+        finish_resize = asyncio.Event()
+        original_snapshot = store._snapshot_shards_for_resize
+
+        async def gated_snapshot(
+            array_index: ArrayIndex,
+        ) -> dict[int, list[CID | None]]:
+            snapshot = await original_snapshot(array_index)
+            snapshot_done.set()
+            await finish_resize.wait()
+            return snapshot
+
+        monkeypatch.setattr(store, "_snapshot_shards_for_resize", gated_snapshot)
+        resize_task = asyncio.create_task(store.resize_store((3, 2), array_path="a"))
+        await snapshot_done.wait()
+        return store, resize_task, finish_resize
+
+    store, resize_task, finish_resize = await paused_resize_store()
+    write_task = asyncio.create_task(
+        store.set("a/c/1/0", proto.buffer.from_bytes(b"interleaved"))
+    )
+    await asyncio.sleep(0)
+
+    assert not write_task.done()
+    finish_resize.set()
+    await resize_task
+    await write_task
+
+    chunk = await store.get("a/c/1/0", proto)
+    assert chunk is not None
+    assert chunk.to_bytes() == b"interleaved"
+
+    pointer_cid = await cas.save(b"pointer", codec="raw")
+    store, resize_task, finish_resize = await paused_resize_store()
+    pointer_task = asyncio.create_task(store.set_pointer("a/c/1/0", str(pointer_cid)))
+    await asyncio.sleep(0)
+
+    assert not pointer_task.done()
+    finish_resize.set()
+    await resize_task
+    await pointer_task
+
+    pointer_chunk = await store.get("a/c/1/0", proto)
+    assert pointer_chunk is not None
+    assert pointer_chunk.to_bytes() == b"pointer"
+
+    store, resize_task, finish_resize = await paused_resize_store()
+    delete_task = asyncio.create_task(store.delete("a/c/1/0"))
+    await asyncio.sleep(0)
+
+    assert not delete_task.done()
+    finish_resize.set()
+    await resize_task
+    await delete_task
+
+    assert not await store.exists("a/c/1/0")
+
+
+@pytest.mark.asyncio
+async def test_v2_resize_waits_for_in_flight_chunk_set(monkeypatch) -> None:
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=2,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    await store.set(
+        "a/zarr.json",
+        proto.buffer.from_bytes(
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [2, 3],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1, 1]},
+                },
+            }).encode()
+        ),
+    )
+    await store.set("a/c/1/0", proto.buffer.from_bytes(b"original"))
+
+    save_started = asyncio.Event()
+    finish_save = asyncio.Event()
+    original_save = cas.save
+
+    async def gated_save(data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
+        if data == b"late-set":
+            save_started.set()
+            await finish_save.wait()
+        return await original_save(data, codec)
+
+    monkeypatch.setattr(cas, "save", gated_save)
+
+    set_task = asyncio.create_task(
+        store.set("a/c/1/0", proto.buffer.from_bytes(b"late-set"))
+    )
+    await save_started.wait()
+    resize_task = asyncio.create_task(store.resize_store((3, 2), array_path="a"))
+    await asyncio.sleep(0)
+
+    assert not resize_task.done()
+    finish_save.set()
+    await set_task
+    await resize_task
+
+    chunk = await store.get("a/c/1/0", proto)
+    assert chunk is not None
+    assert chunk.to_bytes() == b"late-set"
+
+
+@pytest.mark.asyncio
+async def test_v2_flush_waits_for_in_flight_resize(monkeypatch) -> None:
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=2,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    await store.set(
+        "a/zarr.json",
+        proto.buffer.from_bytes(
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [2, 3],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1, 1]},
+                },
+            }).encode()
+        ),
+    )
+    for y_idx in range(2):
+        for x_idx in range(3):
+            await store.set(
+                f"a/c/{y_idx}/{x_idx}",
+                proto.buffer.from_bytes(f"{y_idx},{x_idx}".encode()),
+            )
+
+    replace_started = asyncio.Event()
+    finish_replace = asyncio.Event()
+    original_replace = store._replace_shards_after_resize
+
+    async def gated_replace(
+        array_index: ArrayIndex,
+        old_num_shards: int,
+        old_shard_cids: list[CID | None],
+        old_shards_by_index: dict[int, list[CID | None]],
+        new_shards_by_index: dict[int, list[CID | None]],
+    ) -> None:
+        replace_started.set()
+        await finish_replace.wait()
+        await original_replace(
+            array_index,
+            old_num_shards,
+            old_shard_cids,
+            old_shards_by_index,
+            new_shards_by_index,
+        )
+
+    monkeypatch.setattr(store, "_replace_shards_after_resize", gated_replace)
+
+    resize_task = asyncio.create_task(store.resize_store((3, 2), array_path="a"))
+    await replace_started.wait()
+    flush_task = asyncio.create_task(store.flush())
+    await asyncio.sleep(0)
+
+    assert not flush_task.done()
+    finish_replace.set()
+    await resize_task
+    root_cid = await flush_task
+
+    read_store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
+    chunk = await read_store.get("a/c/1/0", proto)
+    assert chunk is not None
+    assert chunk.to_bytes() == b"1,0"
+
+
+@pytest.mark.asyncio
+async def test_set_pointer_read_only_and_metadata_cache_invalidation() -> None:
+    cas = LocalCIDCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=1,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    proto = zarr.core.buffer.default_buffer_prototype()
+    first_cid = await cas.save(b"first", codec="raw")
+    second_cid = await cas.save(b"second", codec="raw")
+
+    await store.set_pointer("attrs", str(first_cid))
+    first = await store.get("attrs", proto)
+    assert first is not None
+    assert first.to_bytes() == b"first"
+
+    await store.set_pointer("attrs", str(second_cid))
+    second = await store.get("attrs", proto)
+    assert second is not None
+    assert second.to_bytes() == b"second"
+
+    with pytest.raises(PermissionError, match="read-only"):
+        await store.with_read_only(True).set_pointer("attrs", str(first_cid))
+
+
+@pytest.mark.asyncio
+async def test_v2_rejects_chunk_shape_change_for_existing_index() -> None:
+    cas = LocalCIDCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=1,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    proto = zarr.core.buffer.default_buffer_prototype()
+    await store.set(
+        "a/zarr.json",
+        proto.buffer.from_bytes(
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [2],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1]},
+                },
+            }).encode()
+        ),
+    )
+
+    updated_index = store._register_or_update_array_index(
+        array_path="a", array_shape=(3,), chunk_shape=(1,)
+    )
+    assert updated_index.array_shape == (3,)
+
+    with pytest.raises(ValueError, match="Cannot change chunk_shape"):
+        await store.set(
+            "a/zarr.json",
+            proto.buffer.from_bytes(
+                json.dumps({
+                    "zarr_format": 3,
+                    "node_type": "array",
+                    "shape": [2],
+                    "chunk_grid": {
+                        "name": "regular",
+                        "configuration": {"chunk_shape": [2]},
+                    },
+                }).encode()
+            ),
+        )
+    with pytest.raises(ValueError, match="Cannot change chunk_shape"):
+        store._register_or_update_array_index(
+            array_path="a", array_shape=(2,), chunk_shape=(2,)
+        )
 
 
 @pytest.mark.asyncio
@@ -625,6 +1032,37 @@ def test_converter_chunk_key_classifier_keeps_c_named_metadata_first() -> None:
     assert not _is_zarr_chunk_key("c/zarr.json")
     assert not _is_zarr_chunk_key("0/c/zarr.json")
     assert _is_zarr_chunk_key("0/c/c/0")
+    assert _is_zarr_chunk_key("0.0")
+    assert _is_zarr_chunk_key("0/FPAR/0.0")
+    assert not _is_zarr_chunk_key("plain-metadata")
+    assert not _is_zarr_chunk_key("not.a.chunk")
+    assert (
+        _normalize_zarr_chunk_key("a/0", {"a": ArrayIndex.new("a", (2,), (1,), 1)})
+        == "a/c/0"
+    )
+    assert (
+        _normalize_zarr_chunk_key(
+            "c/FPAR/0", {"c/FPAR": ArrayIndex.new("c/FPAR", (2,), (1,), 1)}
+        )
+        == "c/FPAR/c/0"
+    )
+    assert (
+        _normalize_zarr_chunk_key(
+            "c/FPAR/c/0", {"c/FPAR": ArrayIndex.new("c/FPAR", (2,), (1,), 1)}
+        )
+        == "c/FPAR/c/0"
+    )
+    assert (
+        _normalize_zarr_chunk_key("0", {"": ArrayIndex.new("", (2,), (1,), 1)}) == "c/0"
+    )
+    assert (
+        _normalize_zarr_chunk_key("b/0", {"a": ArrayIndex.new("a", (2,), (1,), 1)})
+        is None
+    )
+    assert (
+        _normalize_zarr_chunk_key("a/0/0", {"a": ArrayIndex.new("a", (2,), (1,), 1)})
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -673,6 +1111,130 @@ async def test_converter_discovers_grouped_arrays() -> None:
     xr.testing.assert_identical(
         level_1,
         xr.open_zarr(store=converted_store, group="1", consolidated=False).compute(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_converter_translates_classic_zarr_v2_chunks() -> None:
+    cas = LocalCIDCAS()
+    hamt = await HAMT.build(cas=cas, values_are_bytes=True)
+    root_metadata = {
+        "zarr_format": 2,
+        "shape": [2, 2],
+        "chunks": [1, 1],
+        "dtype": "|u1",
+        "compressor": None,
+        "fill_value": 0,
+        "order": "C",
+        "filters": None,
+    }
+    variable_metadata = {
+        "zarr_format": 2,
+        "shape": [2],
+        "chunks": [1],
+        "dtype": "|u1",
+        "compressor": None,
+        "fill_value": 0,
+        "order": "C",
+        "filters": None,
+    }
+
+    await hamt.set(".zarray", json.dumps(root_metadata).encode())
+    await hamt.set("0.0", b"root-chunk")
+    await hamt.set("var/.zarray", json.dumps(variable_metadata).encode())
+    await hamt.set("var/0", b"var-zero")
+    await hamt.make_read_only()
+
+    sharded_root = await convert_hamt_to_sharded(cas, str(hamt.root_node_id), 2)
+    converted_store = await ShardedZarrStore.open(
+        cas=cas, read_only=True, root_cid=sharded_root
+    )
+    proto = zarr.core.buffer.default_buffer_prototype()
+
+    root_chunk = await converted_store.get("c/0/0", proto)
+    assert root_chunk is not None
+    assert root_chunk.to_bytes() == b"root-chunk"
+    variable_chunk = await converted_store.get("var/c/0", proto)
+    assert variable_chunk is not None
+    assert variable_chunk.to_bytes() == b"var-zero"
+    assert "0.0" not in converted_store._root_obj["metadata"]
+    assert "var/0" not in converted_store._root_obj["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_converter_rejects_unclassified_keys() -> None:
+    cas = LocalCIDCAS()
+    hamt = await HAMT.build(cas=cas, values_are_bytes=True)
+    await hamt.set("not-a-zarr-key", b"unknown")
+    await hamt.make_read_only()
+
+    with pytest.raises(ValueError, match="Cannot classify Zarr key"):
+        await convert_hamt_to_sharded(cas, str(hamt.root_node_id), 2)
+
+
+@given(
+    data=st.data(),
+    rank=st.integers(min_value=1, max_value=3),
+    chunks_per_shard=st.integers(min_value=1, max_value=5),
+    path_segments=st.lists(
+        st.text(alphabet="abc012", min_size=1, max_size=4),
+        min_size=0,
+        max_size=3,
+    ),
+)
+@settings(max_examples=25)
+def test_v2_chunk_key_linear_mapping_invariant(
+    data: st.DataObject,
+    rank: int,
+    chunks_per_shard: int,
+    path_segments: list[str],
+) -> None:
+    chunks_per_dim = tuple(
+        data.draw(st.integers(min_value=1, max_value=4), label=f"chunks_dim_{idx}")
+        for idx in range(rank)
+    )
+    chunk_shape = tuple(
+        data.draw(st.integers(min_value=1, max_value=3), label=f"chunk_shape_{idx}")
+        for idx in range(rank)
+    )
+    coords = tuple(
+        data.draw(
+            st.integers(min_value=0, max_value=chunks_per_dim[idx] - 1),
+            label=f"coord_{idx}",
+        )
+        for idx in range(rank)
+    )
+    array_shape = tuple(
+        chunks * chunk
+        for chunks, chunk in zip(chunks_per_dim, chunk_shape, strict=True)
+    )
+    array_path = "/".join(path_segments)
+    array_index = ArrayIndex.new(
+        array_path,
+        array_shape,
+        chunk_shape,
+        chunks_per_shard,
+    )
+    store = ShardedZarrStore(cas=LocalCIDCAS(), read_only=False)
+    store._manifest_version = SHARDED_ZARR_V2
+    store.array_indices = {array_index.array_path: array_index}
+
+    chunk_key = ShardedZarrStore._format_chunk_key(array_path, coords)
+    parsed = store._parse_chunk_key(chunk_key)
+
+    assert parsed is not None
+    assert parsed.array_path == array_index.array_path
+    assert parsed.coords == coords
+    linear_index = store._get_linear_chunk_index_for_index(coords, array_index)
+    shard_idx, index_in_shard = store._get_shard_info_for_index(
+        linear_index, array_index
+    )
+    assert shard_idx * chunks_per_shard + index_in_shard == linear_index
+    assert (
+        ShardedZarrStore._coords_from_linear_index(
+            linear_index, array_index.chunks_per_dim
+        )
+        == coords
     )
 
 
@@ -884,6 +1446,32 @@ async def test_v2_invalid_root_and_shard_validation() -> None:
     store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=str(root_cid))
     with pytest.raises(TypeError, match="non-CID"):
         await store.get("a/c/0", zarr.core.buffer.default_buffer_prototype())
+
+    short_shard_cid = await cas.save(dag_cbor.encode([None]), codec="dag-cbor")
+    root_obj = {
+        "manifest_version": SHARDED_ZARR_V2,
+        "metadata": {},
+        "arrays": {
+            "a": {
+                "array_shape": [2],
+                "chunk_shape": [1],
+                "sharding_config": {"chunks_per_shard": 2},
+                "shard_cids": [short_shard_cid],
+            }
+        },
+    }
+    root_cid = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+    store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=str(root_cid))
+    with pytest.raises(ValueError, match="expected 2"):
+        await store.get("a/c/0", zarr.core.buffer.default_buffer_prototype())
+
+    stale_tail_cid = await cas.save(b"stale", codec="raw")
+    assert ShardedZarrStore._remap_shards_for_resize(
+        {0: [None, stale_tail_cid]},
+        old_chunks_per_dim=(1,),
+        old_total_chunks=1,
+        new_array_index=ArrayIndex.new("a", (1,), (1,), 2),
+    ) == {0: [None, None]}
 
     extra_chunk_cid = await cas.save(b"extra", codec="raw")
     sparse_shard_cid = await cas.save(
