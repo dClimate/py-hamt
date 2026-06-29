@@ -6,7 +6,7 @@ from multiformats import CID
 
 from .hamt import HAMT
 from .sharded_zarr_store import SHARDED_ZARR_V2, ShardedZarrStore
-from .store_httpx import KuboCAS
+from .store_httpx import ContentAddressedStore, KuboCAS
 
 
 def _is_zarr_chunk_key(key: str) -> bool:
@@ -16,7 +16,7 @@ def _is_zarr_chunk_key(key: str) -> bool:
 
 
 async def convert_hamt_to_sharded(
-    cas: KuboCAS, hamt_root_cid: str, chunks_per_shard: int
+    cas: ContentAddressedStore, hamt_root_cid: str, chunks_per_shard: int
 ) -> str:
     """
     Converts a Zarr dataset from a HAMT-based store to a ShardedZarrStore.

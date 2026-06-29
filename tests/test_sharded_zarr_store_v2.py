@@ -76,15 +76,21 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
         manifest_version=SHARDED_ZARR_V2,
     )
 
-    level_0 = _pyramid_level(np.arange(16).reshape(2, 2, 4)).chunk(
-        {"time": 1, "y": 1, "x": 2}
-    )
-    level_1 = _pyramid_level(np.arange(8).reshape(2, 2, 2) + 100).chunk(
-        {"time": 1, "y": 2, "x": 1}
-    )
-    level_2 = _pyramid_level(np.arange(4).reshape(2, 1, 2) + 200).chunk(
-        {"time": 1, "y": 1, "x": 1}
-    )
+    level_0 = _pyramid_level(np.arange(16).reshape(2, 2, 4)).chunk({
+        "time": 1,
+        "y": 1,
+        "x": 2,
+    })
+    level_1 = _pyramid_level(np.arange(8).reshape(2, 2, 2) + 100).chunk({
+        "time": 1,
+        "y": 2,
+        "x": 1,
+    })
+    level_2 = _pyramid_level(np.arange(4).reshape(2, 1, 2) + 200).chunk({
+        "time": 1,
+        "y": 1,
+        "x": 1,
+    })
 
     level_0.to_zarr(store=store, group="0", mode="w", zarr_format=3)
     level_1.to_zarr(store=store, group="1", mode="a", zarr_format=3)
@@ -103,9 +109,7 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
     assert await store.exists("0/time/c/0")
 
     root_cid = await store.flush()
-    read_store = await ShardedZarrStore.open(
-        cas=cas, read_only=True, root_cid=root_cid
-    )
+    read_store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
 
     xr.testing.assert_identical(
         level_0, xr.open_zarr(store=read_store, group="0").compute()
@@ -289,17 +293,15 @@ async def test_v1_root_metadata_chunks_migrate_to_primary_path() -> None:
     await store.set(
         "zarr.json",
         proto.buffer.from_bytes(
-            json.dumps(
-                {
-                    "zarr_format": 3,
-                    "node_type": "array",
-                    "shape": [1],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {"chunk_shape": [1]},
-                    },
-                }
-            ).encode()
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [1],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1]},
+                },
+            }).encode()
         ),
     )
     await store.set("c/0", proto.buffer.from_bytes(b"root-array-chunk"))
@@ -352,17 +354,15 @@ async def test_migrated_v1_coordinate_chunks_remain_readable() -> None:
     await store.set(
         "lat/zarr.json",
         proto.buffer.from_bytes(
-            json.dumps(
-                {
-                    "zarr_format": 3,
-                    "node_type": "array",
-                    "shape": [2],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {"chunk_shape": [2]},
-                    },
-                }
-            ).encode()
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [2],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [2]},
+                },
+            }).encode()
         ),
     )
     await store.set("lat/c/0", proto.buffer.from_bytes(b"coordinate-chunk"))
@@ -399,25 +399,21 @@ async def test_empty_v2_root_reopen_retains_default_sharding_config() -> None:
         manifest_version=SHARDED_ZARR_V2,
     )
     root_cid = await store.flush()
-    reopened = await ShardedZarrStore.open(
-        cas=cas, read_only=False, root_cid=root_cid
-    )
+    reopened = await ShardedZarrStore.open(cas=cas, read_only=False, root_cid=root_cid)
     proto = zarr.core.buffer.default_buffer_prototype()
 
     await reopened.set(
         "a/zarr.json",
         proto.buffer.from_bytes(
-            json.dumps(
-                {
-                    "zarr_format": 3,
-                    "node_type": "array",
-                    "shape": [2],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {"chunk_shape": [1]},
-                    },
-                }
-            ).encode()
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [2],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1]},
+                },
+            }).encode()
         ),
     )
     await reopened.set("a/c/0", proto.buffer.from_bytes(b"chunk"))
@@ -439,17 +435,15 @@ async def test_v2_c_named_arrays_groups_and_metadata_suffixes() -> None:
     await array_store.set(
         "c/zarr.json",
         proto.buffer.from_bytes(
-            json.dumps(
-                {
-                    "zarr_format": 3,
-                    "node_type": "array",
-                    "shape": [1],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {"chunk_shape": [1]},
-                    },
-                }
-            ).encode()
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [1],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1]},
+                },
+            }).encode()
         ),
     )
     await array_store.set("c/c/0", proto.buffer.from_bytes(b"top-level-c"))
@@ -470,17 +464,15 @@ async def test_v2_c_named_arrays_groups_and_metadata_suffixes() -> None:
     await group_store.set(
         "c/FPAR/zarr.json",
         proto.buffer.from_bytes(
-            json.dumps(
-                {
-                    "zarr_format": 3,
-                    "node_type": "array",
-                    "shape": [1, 1, 1],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {"chunk_shape": [1, 1, 1]},
-                    },
-                }
-            ).encode()
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [1, 1, 1],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1, 1, 1]},
+                },
+            }).encode()
         ),
     )
     await group_store.set("c/FPAR/c/0/0/0", proto.buffer.from_bytes(b"group-c"))
@@ -502,34 +494,30 @@ async def test_v2_list_dir_can_walk_explicit_chunk_prefixes() -> None:
     await store.set(
         "a/zarr.json",
         proto.buffer.from_bytes(
-            json.dumps(
-                {
-                    "zarr_format": 3,
-                    "node_type": "array",
-                    "shape": [2, 1],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {"chunk_shape": [1, 1]},
-                    },
-                }
-            ).encode()
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [2, 1],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1, 1]},
+                },
+            }).encode()
         ),
     )
     await store.set("a/c/1/0", proto.buffer.from_bytes(b"chunk"))
     await store.set(
         "b/zarr.json",
         proto.buffer.from_bytes(
-            json.dumps(
-                {
-                    "zarr_format": 3,
-                    "node_type": "array",
-                    "shape": [1, 1],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {"chunk_shape": [1, 1]},
-                    },
-                }
-            ).encode()
+            json.dumps({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [1, 1],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": [1, 1]},
+                },
+            }).encode()
         ),
     )
     await store.set("b/c/0/0", proto.buffer.from_bytes(b"other-chunk"))
@@ -645,12 +633,16 @@ async def test_converter_discovers_grouped_arrays() -> None:
     hamt = await HAMT.build(cas=cas, values_are_bytes=True)
     source_store = ZarrHAMTStore(hamt)
 
-    level_0 = _pyramid_level(np.arange(4).reshape(1, 2, 2)).chunk(
-        {"time": 1, "y": 1, "x": 1}
-    )
-    level_1 = _pyramid_level(np.arange(2).reshape(1, 1, 2) + 10).chunk(
-        {"time": 1, "y": 1, "x": 1}
-    )
+    level_0 = _pyramid_level(np.arange(4).reshape(1, 2, 2)).chunk({
+        "time": 1,
+        "y": 1,
+        "x": 1,
+    })
+    level_1 = _pyramid_level(np.arange(2).reshape(1, 1, 2) + 10).chunk({
+        "time": 1,
+        "y": 1,
+        "x": 1,
+    })
     level_0.to_zarr(
         store=source_store,
         group="0",
@@ -867,7 +859,11 @@ async def test_v2_invalid_root_and_shard_validation() -> None:
             await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=str(root_cid))
 
     store = ShardedZarrStore(cas=cas, read_only=True)
-    store._root_obj = {"manifest_version": SHARDED_ZARR_V2, "metadata": {}, "arrays": {1: {}}}
+    store._root_obj = {
+        "manifest_version": SHARDED_ZARR_V2,
+        "metadata": {},
+        "arrays": {1: {}},
+    }
     with pytest.raises(ValueError, match="arrays must map"):
         store._load_v2_root()
 
