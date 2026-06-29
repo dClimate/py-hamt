@@ -782,11 +782,8 @@ async def test_listing_and_metadata(
 
         # Test listing with a prefix
         prefix = "temp/"
-        with pytest.raises(
-            NotImplementedError, match="Listing with a prefix is not implemented yet."
-        ):
-            async for key in store_read.list_dir(prefix):
-                print(f"Key with prefix '{prefix}': {key}")
+        prefixed_dir_keys = {key async for key in store_read.list_dir(prefix)}
+        assert {"zarr.json"}.issubset(prefixed_dir_keys)
 
         with pytest.raises(
             ValueError, match="Byte range requests are not supported for metadata keys."

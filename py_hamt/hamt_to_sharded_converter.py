@@ -2,13 +2,17 @@ import argparse
 import asyncio
 import time
 
-import xarray as xr
 from multiformats import CID
 
 from .hamt import HAMT
-from .sharded_zarr_store import ShardedZarrStore
+from .sharded_zarr_store import SHARDED_ZARR_V2, ShardedZarrStore
 from .store_httpx import KuboCAS
-from .zarr_hamt_store import ZarrHAMTStore
+
+
+def _is_zarr_chunk_key(key: str) -> bool:
+    if key.endswith(("zarr.json", ".zarray", ".zattrs", ".zgroup")):
+        return False
+    return key.startswith("c/") or "/c/" in key
 
 
 async def convert_hamt_to_sharded(
@@ -32,43 +36,44 @@ async def convert_hamt_to_sharded(
     hamt_ro = await HAMT.build(
         cas=cas, root_node_id=hamt_root_cid, values_are_bytes=True, read_only=True
     )
-    source_store = ZarrHAMTStore(hamt_ro, read_only=True)
-    source_dataset = xr.open_zarr(store=source_store, consolidated=True)
-    # 2. Introspect the source array to get its configuration
-    print("Reading metadata from source store...")
 
-    # Read the stores metadata to get array shape and chunk shape
-    data_var_name = next(iter(source_dataset.data_vars))
-    ordered_dims = list(source_dataset[data_var_name].dims)
-    array_shape_tuple = tuple(source_dataset.sizes[dim] for dim in ordered_dims)
-    chunk_shape_tuple = tuple(source_dataset.chunks[dim][0] for dim in ordered_dims)
-    array_shape = array_shape_tuple
-    chunk_shape = chunk_shape_tuple
-
-    # 3. Create the destination ShardedZarrStore for writing
+    # 2. Create the destination ShardedZarrStore for writing.
     print(
-        f"Initializing new ShardedZarrStore with {chunks_per_shard} chunks per shard..."
+        f"Initializing new ShardedZarrStore v2 with {chunks_per_shard} chunks per shard..."
     )
     dest_store = await ShardedZarrStore.open(
         cas=cas,
         read_only=False,
-        array_shape=array_shape,
-        chunk_shape=chunk_shape,
         chunks_per_shard=chunks_per_shard,
+        manifest_version=SHARDED_ZARR_V2,
     )
 
     print("Destination store initialized.")
 
-    # 4. Iterate and copy all data from source to destination
+    # 3. Copy metadata first so each chunked array path registers its own shard
+    # index before chunk pointers are inserted.
     print("Starting data migration...")
     count = 0
     async for key in hamt_ro.keys():
+        if _is_zarr_chunk_key(key):
+            continue
         count += 1
-        # Read the raw data (metadata or chunk) from the source
-        cid: CID = await hamt_ro.get_pointer(key)
+        cid = await hamt_ro.get_pointer(key)
+        if not isinstance(cid, CID):  # pragma: no cover
+            raise TypeError(f"Expected CID pointer for key {key!r}.")
         cid_base32_str = str(cid.encode("base32"))
+        await dest_store.set_pointer(key, cid_base32_str)
+        if count % 200 == 0:  # pragma: no cover
+            print(f"Migrated {count} keys...")  # pragma: no cover
 
-        # Write the exact same key-value pair to the destination.
+    async for key in hamt_ro.keys():
+        if not _is_zarr_chunk_key(key):
+            continue
+        count += 1
+        cid = await hamt_ro.get_pointer(key)
+        if not isinstance(cid, CID):  # pragma: no cover
+            raise TypeError(f"Expected CID pointer for key {key!r}.")
+        cid_base32_str = str(cid.encode("base32"))
         await dest_store.set_pointer(key, cid_base32_str)
         if count % 200 == 0:  # pragma: no cover
             print(f"Migrated {count} keys...")  # pragma: no cover

@@ -280,7 +280,7 @@ async def test_graft_store_invalid_cases(create_ipfs: tuple[str, str]):
         proto = zarr.core.buffer.default_buffer_prototype()
         await source_store.set("temp/c/0/0", proto.buffer.from_bytes(b"data"))
         source_root_cid = await source_store.flush()
-        with pytest.raises(ValueError, match="Shard index 10 out of bounds."):
+        with pytest.raises(ValueError, match="out of bounds"):
             await target_store.graft_store(
                 source_root_cid, chunk_offset=(10, 0)
             )  # Out of bounds for target (4x4 chunks)
