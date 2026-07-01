@@ -307,7 +307,9 @@ async def test_resize_preserves_multidimensional_chunk_coordinates() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_resize_blocks_interleaved_chunk_mutators(monkeypatch) -> None:
+async def test_v2_resize_blocks_interleaved_chunk_mutators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     cas = LocalCIDCAS()
     proto = zarr.core.buffer.default_buffer_prototype()
 
@@ -397,7 +399,9 @@ async def test_v2_resize_blocks_interleaved_chunk_mutators(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_resize_waits_for_in_flight_chunk_set(monkeypatch) -> None:
+async def test_v2_resize_waits_for_in_flight_chunk_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     cas = LocalCIDCAS()
     proto = zarr.core.buffer.default_buffer_prototype()
     store = await ShardedZarrStore.open(
@@ -452,7 +456,9 @@ async def test_v2_resize_waits_for_in_flight_chunk_set(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_flush_waits_for_in_flight_resize(monkeypatch) -> None:
+async def test_v2_flush_waits_for_in_flight_resize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     cas = LocalCIDCAS()
     proto = zarr.core.buffer.default_buffer_prototype()
     store = await ShardedZarrStore.open(
