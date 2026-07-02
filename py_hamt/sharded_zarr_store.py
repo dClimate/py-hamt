@@ -4,6 +4,7 @@ import json
 import math
 import sys
 import time
+import warnings
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
@@ -25,6 +26,10 @@ SHARDED_ZARR_V2 = "sharded_zarr_v2"
 ZARR_METADATA_SUFFIXES = ("zarr.json", ".zarray", ".zattrs", ".zgroup")
 
 ShardCacheKey = int | tuple[str, int]
+
+
+class ShardedZarrV1DeprecationWarning(FutureWarning):
+    """Warning emitted when using deprecated sharded_zarr_v1 roots."""
 
 
 @dataclass(frozen=True)
@@ -311,6 +316,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
         "forecast_reference_time",
         "step",
     })
+    _V1_DEPRECATION_MESSAGE: ClassVar[str] = (
+        "sharded_zarr_v1 is deprecated and will be removed in a future py-hamt "
+        "release. Prefer sharded_zarr_v2 for new stores; pyramid Zarr readers "
+        "should open the desired group explicitly, for example group='0'."
+    )
 
     def __init__(
         self,
@@ -405,6 +415,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._num_shards = index.num_shards
 
     @classmethod
+    def _warn_v1_deprecated(cls, *, stacklevel: int) -> None:
+        warnings.warn(
+            cls._V1_DEPRECATION_MESSAGE,
+            ShardedZarrV1DeprecationWarning,
+            stacklevel=stacklevel,
+        )
+
+    @classmethod
     async def open(
         cls,
         cas: ContentAddressedStore,
@@ -489,6 +507,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         chunk_shape: Tuple[int, ...],
         chunks_per_shard: int,
     ) -> None:
+        self._warn_v1_deprecated(stacklevel=4)
         self._manifest_version = SHARDED_ZARR_V1
         self._array_shape = tuple(array_shape)
         self._chunk_shape = tuple(chunk_shape)
@@ -581,6 +600,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             )
 
     def _load_v1_root(self) -> None:
+        self._warn_v1_deprecated(stacklevel=5)
         if "chunks" not in self._root_obj:
             raise ValueError("Root object is not a valid dictionary with 'chunks' key.")
         chunk_info = self._root_obj["chunks"]

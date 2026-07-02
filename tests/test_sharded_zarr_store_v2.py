@@ -1,5 +1,6 @@
 import asyncio
 import json
+import warnings
 from collections.abc import AsyncIterator
 
 import dag_cbor
@@ -19,7 +20,13 @@ from py_hamt.hamt_to_sharded_converter import (
     _normalize_zarr_chunk_key,
     convert_hamt_to_sharded,
 )
-from py_hamt.sharded_zarr_store import SHARDED_ZARR_V2, ArrayIndex, ShardedZarrStore
+from py_hamt.sharded_zarr_store import (
+    SHARDED_ZARR_V1,
+    SHARDED_ZARR_V2,
+    ArrayIndex,
+    ShardedZarrStore,
+    ShardedZarrV1DeprecationWarning,
+)
 from py_hamt.store_httpx import ContentAddressedStore
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
@@ -1635,6 +1642,57 @@ def test_array_index_validation_paths() -> None:
     index.resize((1,))
     assert index.num_shards == 1
     assert len(index.shard_cids) == 1
+
+
+@pytest.mark.asyncio
+async def test_v1_create_and_open_emit_deprecation_warning() -> None:
+    cas = LocalCIDCAS()
+
+    with pytest.warns(
+        ShardedZarrV1DeprecationWarning,
+        match="sharded_zarr_v1 is deprecated",
+    ) as create_warnings:
+        store = await ShardedZarrStore.open(
+            cas=cas,
+            read_only=False,
+            array_shape=(1,),
+            chunk_shape=(1,),
+            chunks_per_shard=1,
+        )
+
+    assert store._root_obj["manifest_version"] == SHARDED_ZARR_V1
+    assert "group='0'" in str(create_warnings[0].message)
+
+    root_cid = await store.flush()
+    with pytest.warns(
+        ShardedZarrV1DeprecationWarning,
+        match="Prefer sharded_zarr_v2",
+    ):
+        reopened = await ShardedZarrStore.open(
+            cas=cas, read_only=True, root_cid=root_cid
+        )
+    assert reopened._manifest_version == SHARDED_ZARR_V1
+
+
+@pytest.mark.asyncio
+async def test_v2_create_and_open_do_not_emit_v1_deprecation_warning() -> None:
+    cas = LocalCIDCAS()
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        store = await ShardedZarrStore.open(
+            cas=cas,
+            read_only=False,
+            chunks_per_shard=1,
+            manifest_version=SHARDED_ZARR_V2,
+        )
+        root_cid = await store.flush()
+        await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
+
+    assert not any(
+        issubclass(warning.category, ShardedZarrV1DeprecationWarning)
+        for warning in caught_warnings
+    )
 
 
 @pytest.mark.asyncio
