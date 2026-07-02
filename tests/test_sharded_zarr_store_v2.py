@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import AsyncIterator
 
 import dag_cbor
 import numpy as np
@@ -652,7 +653,9 @@ async def test_v2_rejects_chunk_shape_change_for_existing_index() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_delete_dir_prunes_array_indices_and_allows_overwrite() -> None:
+async def test_v2_delete_dir_prunes_array_indices_and_allows_overwrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     cas = LocalCIDCAS()
     store = await ShardedZarrStore.open(
         cas=cas,
@@ -693,6 +696,13 @@ async def test_v2_delete_dir_prunes_array_indices_and_allows_overwrite() -> None
     pending_load = asyncio.Event()
     store._pending_shard_loads[store._cache_key("a", 0)] = pending_load
     assert "a" in {entry async for entry in store.list_dir("")}
+
+    async def fail_list_prefix(prefix: str) -> AsyncIterator[str]:
+        raise AssertionError(f"delete_dir should not scan list_prefix({prefix!r})")
+        if False:
+            yield prefix
+
+    monkeypatch.setattr(store, "list_prefix", fail_list_prefix)
 
     await store.delete_dir("a")
 
@@ -1727,6 +1737,13 @@ async def test_v2_validation_paths() -> None:
     assert "zarr.json" not in v1_store._root_obj["metadata"]
     await v1_store._clear_v2_unlocked()
     await v1_store._prune_v2_array_indices_for_prefix("")
+    with pytest.raises(ValueError, match="invalid literal"):
+        await v1_store.get("temp/c/invalid", proto)
+    with pytest.raises(ValueError, match="invalid literal"):
+        await v1_store.set("temp/c/invalid", proto.buffer.from_bytes(b"invalid"))
+    invalid_v1_pointer = await cas.save(b"invalid", codec="raw")
+    with pytest.raises(ValueError, match="invalid literal"):
+        await v1_store.set_pointer("temp/c/invalid", str(invalid_v1_pointer))
 
     classic_store = await ShardedZarrStore.open(
         cas=cas,
@@ -1758,6 +1775,13 @@ async def test_v2_validation_paths() -> None:
     assert await classic_store.exists("c/FPAR/0")
     assert not await classic_store.exists("0.0")
     assert not await classic_store.exists("0/0")
+    assert not await classic_store.exists("c/FPAR/not-a-chunk")
+    assert await classic_store.get("c/FPAR/not-a-chunk", proto) is None
+    await classic_store.delete("c/FPAR/not-a-chunk")
+    invalid_pointer = await cas.save(b"ignored", codec="raw")
+    await classic_store.set_pointer("c/FPAR/not-a-chunk", str(invalid_pointer))
+    assert not await classic_store.exists("c/FPAR/not-a-chunk")
+    await classic_store.set("c/FPAR/not-a-chunk", proto.buffer.from_bytes(b"ignored"))
     assert not await classic_store.exists("c/FPAR/not-a-chunk")
     assert not await classic_store.exists("missing.0")
 

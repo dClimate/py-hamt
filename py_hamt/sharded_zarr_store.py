@@ -1490,7 +1490,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
             hit = False
             kind = "metadata"
             shard_idx_for_trace: int | None = None
-            parsed_chunk = self._parse_chunk_key(key)
+            try:
+                parsed_chunk = self._parse_chunk_key(key)
+            except (ValueError, IndexError):
+                if self._manifest_version != SHARDED_ZARR_V2:
+                    raise
+                return None
             try:
                 if parsed_chunk is None:
                     metadata_cid_obj = self._root_obj["metadata"].get(key)
@@ -1574,9 +1579,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
         await self._ensure_v2_parent_group_metadata(key)
 
         try:
+            parsed_chunk = self._parse_chunk_key(key)
+        except (ValueError, IndexError):
+            if self._manifest_version != SHARDED_ZARR_V2:
+                raise
+            return None
+
+        try:
             data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
             await self._set_pointer(key, str(data_cid_obj), register_metadata=False)
-            if self._parse_chunk_key(key) is None:
+            if parsed_chunk is None:
                 self._metadata_read_cache[key] = raw_data_bytes
         except Exception as e:
             raise RuntimeError(f"Failed to save data for key {key}: {e}") from e
@@ -1592,7 +1604,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
     async def _set_pointer(
         self, key: str, pointer: str, *, register_metadata: bool
     ) -> None:
-        parsed_chunk = self._parse_chunk_key(key)
+        try:
+            parsed_chunk = self._parse_chunk_key(key)
+        except (ValueError, IndexError):
+            if self._manifest_version != SHARDED_ZARR_V2:
+                raise
+            return None
         pointer_cid_obj = CID.decode(pointer)
 
         if parsed_chunk is None:
@@ -1674,7 +1691,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
     async def _delete_unlocked(self, key: str) -> None:
         await self._resize_complete.wait()
 
-        parsed_chunk = self._parse_chunk_key(key)
+        try:
+            parsed_chunk = self._parse_chunk_key(key)
+        except (ValueError, IndexError):
+            if self._manifest_version != SHARDED_ZARR_V2:
+                raise
+            return None
         if parsed_chunk is None:
             if self._root_obj["metadata"].pop(key, None) is not None:
                 self._metadata_read_cache.pop(key, None)
@@ -1723,8 +1745,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 return
 
             match_prefix = f"{normalized_prefix}/"
-            keys_to_delete = [key async for key in self.list_prefix(match_prefix)]
-            for key in keys_to_delete:
+            metadata_keys_to_delete = [
+                key
+                for key in self._root_obj.get("metadata", {})
+                if key.startswith(match_prefix)
+            ]
+            for key in metadata_keys_to_delete:
                 await self._delete_unlocked(key)
             await self._prune_v2_array_indices_for_prefix(normalized_prefix)
 
