@@ -374,6 +374,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return f"c/{coord_path}"
 
     @staticmethod
+    def _v2_group_metadata_key(group_path: str) -> str:
+        return ".zgroup" if group_path == "" else f"{group_path}/.zgroup"
+
+    @staticmethod
+    def _v3_group_metadata_key(group_path: str) -> str:
+        return "zarr.json" if group_path == "" else f"{group_path}/zarr.json"
+
+    @staticmethod
     def _coords_from_linear_index(
         linear_index: int, chunks_per_dim: tuple[int, ...]
     ) -> tuple[int, ...]:
@@ -922,17 +930,42 @@ class ShardedZarrStore(zarr.abc.store.Store):
     ) -> None:
         parts = array_path.split("/")
         group_paths = ["/".join(parts[:idx]) for idx in range(len(parts))]
-        group_metadata = json.dumps({
-            "zarr_format": 3,
-            "node_type": "group",
-            "attributes": {},
-        }).encode("utf-8")
+        uses_zarr_v2_metadata = f"{array_path}/.zarray" in metadata
+        if uses_zarr_v2_metadata:
+            group_metadata_key = self._v2_group_metadata_key
+            group_metadata = json.dumps({"zarr_format": 2}).encode("utf-8")
+        else:
+            group_metadata_key = self._v3_group_metadata_key
+            group_metadata = json.dumps({
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {},
+            }).encode("utf-8")
 
         for group_path in group_paths:
-            metadata_key = (
-                "zarr.json" if group_path == "" else f"{group_path}/zarr.json"
-            )
+            metadata_key = group_metadata_key(group_path)
+            if metadata_key in metadata:
+                if not uses_zarr_v2_metadata:
+                    await self._strip_consolidated_metadata(metadata, metadata_key)
+                continue
             metadata[metadata_key] = await self.cas.save(group_metadata, codec="raw")
+
+    async def _strip_consolidated_metadata(
+        self, metadata: dict[str, IPLDKind], metadata_key: str
+    ) -> None:
+        raw_metadata = await self.cas.load(str(metadata[metadata_key]))
+        metadata_json = self._decode_metadata_json(raw_metadata)
+        if (
+            metadata_json is None
+            or metadata_json.get("node_type") != "group"
+            or "consolidated_metadata" not in metadata_json
+        ):
+            return
+
+        metadata_json.pop("consolidated_metadata")
+        metadata[metadata_key] = await self.cas.save(
+            json.dumps(metadata_json).encode("utf-8"), codec="raw"
+        )
 
     async def _register_array_metadata_from_bytes(
         self, key: str, raw_data: bytes
@@ -989,6 +1022,17 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if metadata_path is None:
             return
 
+        if key == ".zarray" or key.endswith("/.zarray"):
+            group_metadata_key = self._v2_group_metadata_key
+            group_metadata = json.dumps({"zarr_format": 2}).encode("utf-8")
+        else:
+            group_metadata_key = self._v3_group_metadata_key
+            group_metadata = json.dumps({
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {},
+            }).encode("utf-8")
+
         normalized_path = self._normalize_array_path(metadata_path)
         parent_paths = [""]
         if normalized_path:
@@ -996,16 +1040,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
             parent_paths.extend("/".join(parts[:idx]) for idx in range(1, len(parts)))
 
         for parent_path in parent_paths:
-            metadata_key = (
-                "zarr.json" if parent_path == "" else f"{parent_path}/zarr.json"
-            )
+            metadata_key = group_metadata_key(parent_path)
             if metadata_key in self._root_obj["metadata"]:
                 continue
-            group_metadata = json.dumps({
-                "zarr_format": 3,
-                "node_type": "group",
-                "attributes": {},
-            }).encode("utf-8")
             metadata_cid = await self.cas.save(group_metadata, codec="raw")
             self._root_obj["metadata"][metadata_key] = metadata_cid
             self._metadata_read_cache[metadata_key] = group_metadata
@@ -1066,7 +1103,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             array_path = ""
             coord_part = key[len("c/") :]
         else:
-            return None
+            return self._parse_classic_v2_chunk_key(key)
 
         normalized_path = self._normalize_array_path(array_path)
         if self._manifest_version == SHARDED_ZARR_V1:
@@ -1077,13 +1114,66 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 return None
 
         parts = coord_part.split("/")
-        coords = tuple(map(int, parts))
+        try:
+            coords = tuple(map(int, parts))
+        except ValueError:
+            classic_chunk = self._parse_classic_v2_chunk_key(key)
+            if classic_chunk is not None:
+                return classic_chunk
+            raise
 
         if self._manifest_version == SHARDED_ZARR_V1:
             self._validate_chunk_coords(coords, self.array_indices[""])
         elif normalized_path in self.array_indices:
             self._validate_chunk_coords(coords, self.array_indices[normalized_path])
 
+        return ChunkKey(array_path=normalized_path, coords=coords)
+
+    def _parse_classic_v2_chunk_key(self, key: str) -> Optional[ChunkKey]:
+        if self._manifest_version != SHARDED_ZARR_V2 or not self.array_indices:
+            return None
+
+        dotted_chunk = self._parse_classic_dotted_v2_chunk_key(key)
+        if dotted_chunk is not None:
+            return dotted_chunk
+
+        for array_path, array_index in sorted(
+            self.array_indices.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            prefix = f"{array_path}/" if array_path else ""
+            if prefix:
+                if not key.startswith(prefix):
+                    continue
+                coord_part = key[len(prefix) :]
+            else:
+                coord_part = key
+
+            parts = coord_part.split("/")
+            if len(parts) != len(array_index.chunks_per_dim):
+                continue
+            if not all(part.isdecimal() for part in parts):
+                continue
+            coords = tuple(int(part) for part in parts)
+            self._validate_chunk_coords(coords, array_index)
+            return ChunkKey(array_path=array_path, coords=coords)
+        return None
+
+    def _parse_classic_dotted_v2_chunk_key(self, key: str) -> Optional[ChunkKey]:
+        array_path, _, coord_part = key.rpartition("/")
+        if "." not in coord_part:
+            return None
+
+        parts = coord_part.split(".")
+        if not parts or not all(part.isdecimal() for part in parts):
+            return None
+
+        normalized_path = self._normalize_array_path(array_path)
+        array_index = self.array_indices.get(normalized_path)
+        if array_index is None or len(parts) != len(array_index.chunks_per_dim):
+            return None
+
+        coords = tuple(int(part) for part in parts)
+        self._validate_chunk_coords(coords, array_index)
         return ChunkKey(array_path=normalized_path, coords=coords)
 
     @staticmethod
@@ -1480,8 +1570,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
         await self._resize_complete.wait()
 
         raw_data_bytes = value.to_bytes()
-        await self._ensure_v2_parent_group_metadata(key)
         await self._register_array_metadata_from_bytes(key, raw_data_bytes)
+        await self._ensure_v2_parent_group_metadata(key)
 
         try:
             data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
@@ -1506,17 +1596,17 @@ class ShardedZarrStore(zarr.abc.store.Store):
         pointer_cid_obj = CID.decode(pointer)
 
         if parsed_chunk is None:
-            if register_metadata:
-                await self._ensure_v2_parent_group_metadata(key)
-            self._root_obj["metadata"][key] = pointer_cid_obj
-            self._metadata_read_cache.pop(key, None)
-            self._dirty_root = True
             if (
                 register_metadata
                 and self._array_path_from_metadata_key(key) is not None
             ):
                 raw_metadata = await self.cas.load(str(pointer_cid_obj))
                 await self._register_array_metadata_from_bytes(key, raw_metadata)
+            if register_metadata:
+                await self._ensure_v2_parent_group_metadata(key)
+            self._root_obj["metadata"][key] = pointer_cid_obj
+            self._metadata_read_cache.pop(key, None)
+            self._dirty_root = True
             return None
 
         array_index = self._array_index_for_path(parsed_chunk.array_path)
@@ -1617,6 +1707,99 @@ class ShardedZarrStore(zarr.abc.store.Store):
             elif self._root_obj["metadata"].pop(key, None) is not None:
                 self._metadata_read_cache.pop(key, None)
                 self._dirty_root = True
+
+    async def delete_dir(self, prefix: str) -> None:
+        if self._manifest_version != SHARDED_ZARR_V2:
+            await zarr.abc.store.Store.delete_dir(self, prefix)
+            return
+        if self.read_only:
+            raise PermissionError("Cannot delete from a read-only store.")
+
+        async with self._write_lock:
+            await self._resize_complete.wait()
+            normalized_prefix = prefix.strip("/")
+            if normalized_prefix == "":
+                await self._clear_v2_unlocked()
+                return
+
+            match_prefix = f"{normalized_prefix}/"
+            keys_to_delete = [key async for key in self.list_prefix(match_prefix)]
+            for key in keys_to_delete:
+                await self._delete_unlocked(key)
+            await self._prune_v2_array_indices_for_prefix(normalized_prefix)
+
+    async def clear(self) -> None:
+        if self._manifest_version != SHARDED_ZARR_V2:
+            await zarr.abc.store.Store.clear(self)
+            return
+        if self.read_only:
+            raise PermissionError("Cannot clear a read-only store.")
+
+        async with self._write_lock:
+            await self._resize_complete.wait()
+            await self._clear_v2_unlocked()
+
+    async def _clear_v2_unlocked(self) -> None:
+        if self._manifest_version != SHARDED_ZARR_V2:
+            return
+        for pending_load in self._pending_shard_loads.values():
+            pending_load.set()
+        self._pending_shard_loads.clear()
+        await self._shard_data_cache.clear()
+        self._root_obj["metadata"] = {}
+        self._root_obj["arrays"] = {}
+        self.array_indices.clear()
+        self._primary_array_path = None
+        self._metadata_read_cache.clear()
+        self._array_shape = ()
+        self._chunk_shape = ()
+        self._chunks_per_dim = ()
+        self._chunks_per_shard = 0
+        self._num_shards = 0
+        self._total_chunks = 0
+        self._dirty_root = True
+
+    async def _prune_v2_array_indices_for_prefix(self, prefix: str) -> None:
+        if self._manifest_version != SHARDED_ZARR_V2:
+            return
+
+        normalized_prefix = self._normalize_array_path(prefix)
+        array_paths = [
+            array_path
+            for array_path in self.array_indices
+            if array_path == normalized_prefix
+            or array_path.startswith(f"{normalized_prefix}/")
+        ]
+        if not array_paths:
+            return
+
+        for array_path in array_paths:
+            array_index = self.array_indices.pop(array_path)
+            self._root_obj["arrays"].pop(array_path, None)
+            for shard_idx in range(array_index.num_shards):
+                cache_key = self._cache_key(array_path, shard_idx)
+                pending_load = self._pending_shard_loads.pop(cache_key, None)
+                if pending_load is not None:
+                    pending_load.set()
+                shard_lock = self._shard_locks[cache_key]
+                async with shard_lock:
+                    await self._shard_data_cache.discard(cache_key)
+
+        if self.array_indices:
+            self._primary_array_path = next(iter(self.array_indices))
+            self._set_legacy_geometry_from_index(
+                self.array_indices[self._primary_array_path]
+            )
+        else:
+            self._primary_array_path = None
+            self._array_shape = ()
+            self._chunk_shape = ()
+            self._chunks_per_dim = ()
+            self._chunks_per_shard = 0
+            self._num_shards = 0
+            self._total_chunks = 0
+        self._sync_arrays_to_root()
+        self._dirty_root = True
 
     @property
     def supports_listing(self) -> bool:
@@ -1870,6 +2053,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._dirty_root = True
 
     async def migrate_v1_to_v2(self, primary_array_path: str) -> str:
+        if self.read_only:
+            raise PermissionError("Cannot migrate a read-only store.")
         async with self._write_lock:
             return await self._migrate_v1_to_v2_unlocked(primary_array_path)
 
