@@ -67,13 +67,13 @@ class LocalCIDCAS(ContentAddressedStore):
         return data
 
 
-def _pyramid_level(data: np.ndarray) -> xr.Dataset:
+def _pyramid_level(data: np.ndarray, *, coord_offset: int = 0) -> xr.Dataset:
     return xr.Dataset(
         {"FPAR": (("time", "y", "x"), data)},
         coords={
-            "time": np.arange(data.shape[0]),
-            "y": np.arange(data.shape[1]),
-            "x": np.arange(data.shape[2]),
+            "time": coord_offset + np.arange(data.shape[0]),
+            "y": coord_offset + np.arange(data.shape[1]),
+            "x": coord_offset + np.arange(data.shape[2]),
         },
     )
 
@@ -93,16 +93,12 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
         "y": 1,
         "x": 2,
     })
-    level_1 = _pyramid_level(np.arange(8).reshape(2, 2, 2) + 100).chunk({
-        "time": 1,
-        "y": 2,
-        "x": 1,
-    })
-    level_2 = _pyramid_level(np.arange(4).reshape(2, 1, 2) + 200).chunk({
-        "time": 1,
-        "y": 1,
-        "x": 1,
-    })
+    level_1 = _pyramid_level(
+        np.arange(8).reshape(2, 2, 2) + 100, coord_offset=1_000
+    ).chunk({"time": 1, "y": 2, "x": 1})
+    level_2 = _pyramid_level(
+        np.arange(4).reshape(2, 1, 2) + 200, coord_offset=2_000
+    ).chunk({"time": 1, "y": 1, "x": 1})
 
     level_0.to_zarr(store=store, group="0", mode="w", zarr_format=3)
     level_1.to_zarr(store=store, group="1", mode="a", zarr_format=3)
@@ -116,9 +112,17 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
     assert await store.exists("0/FPAR/c/0/0/0")
     assert await store.exists("1/FPAR/c/0/0/0")
     assert await store.exists("2/FPAR/c/0/0/0")
-    assert await store.exists("0/x/c/0")
-    assert await store.exists("0/y/c/0")
-    assert await store.exists("0/time/c/0")
+    expected_levels = {"0": level_0, "1": level_1, "2": level_2}
+    for group, level in expected_levels.items():
+        for coord_name in ("x", "y", "time"):
+            coord_path = f"{group}/{coord_name}"
+            assert store.array_indices[coord_path].array_shape == (
+                level.sizes[coord_name],
+            )
+            assert await store.exists(f"{coord_path}/c/0")
+    assert not await store.exists("x/c/0")
+    assert not await store.exists("y/c/0")
+    assert not await store.exists("time/c/0")
 
     root_cid = await store.flush()
     read_store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
@@ -154,6 +158,15 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
     )
     assert partial_chunk is not None
     assert partial_chunk.to_bytes() == full_chunk.to_bytes()[:5]
+
+    isolation_store = await ShardedZarrStore.open(
+        cas=cas, read_only=False, root_cid=root_cid
+    )
+    for coord_name in ("x", "y", "time"):
+        await isolation_store.delete(f"0/{coord_name}/c/0")
+    xr.testing.assert_identical(
+        level_1, xr.open_zarr(store=isolation_store, group="1").compute()
+    )
 
     write_store = await ShardedZarrStore.open(
         cas=cas, read_only=False, root_cid=root_cid
