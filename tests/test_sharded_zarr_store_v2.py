@@ -78,6 +78,22 @@ def _pyramid_level(data: np.ndarray, *, coord_offset: int = 0) -> xr.Dataset:
     )
 
 
+def test_v2_group_metadata_helper_edges() -> None:
+    assert ShardedZarrStore._group_path_from_metadata_key("level/.zgroup") == "level"
+
+    store = ShardedZarrStore(cas=LocalCIDCAS(), read_only=False)
+    assert store._v2_top_level_groups() == set()
+
+    store._manifest_version = SHARDED_ZARR_V2
+    store.array_indices["0/FPAR"] = ArrayIndex.new("0/FPAR", (1,), (1,), 1)
+    root_group_metadata = json.dumps({"zarr_format": 3, "node_type": "group"}).encode()
+
+    assert (
+        store._strip_v2_root_consolidated_metadata("zarr.json", root_group_metadata)
+        == root_group_metadata
+    )
+
+
 @pytest.mark.asyncio
 async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
     cas = LocalCIDCAS()
