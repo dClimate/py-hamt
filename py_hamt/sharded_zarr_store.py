@@ -321,6 +321,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
         "release. Prefer sharded_zarr_v2 for new stores; pyramid Zarr readers "
         "should open the desired group explicitly, for example group='0'."
     )
+    _V2_ROOT_GROUP_MESSAGE: ClassVar[str] = (
+        "sharded_zarr_v2 grouped stores require an explicit Zarr group when "
+        "reading. Open the desired pyramid level with xr.open_zarr(..., "
+        "group='0') or another available group."
+    )
 
     def __init__(
         self,
@@ -731,6 +736,26 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._sync_arrays_to_root()
         self._dirty_root = True
         return array_index
+
+    def _v2_requires_explicit_group_for_root_read(self) -> bool:
+        if self._manifest_version != SHARDED_ZARR_V2 or not self.array_indices:
+            return False
+        return all("/" in array_path for array_path in self.array_indices)
+
+    def _strip_v2_root_consolidated_metadata(self, key: str, raw_data: bytes) -> bytes:
+        if key != "zarr.json" or not self._v2_requires_explicit_group_for_root_read():
+            return raw_data
+
+        metadata_json = self._decode_metadata_json(raw_data)
+        if (
+            metadata_json is None
+            or metadata_json.get("node_type") != "group"
+            or "consolidated_metadata" not in metadata_json
+        ):
+            return raw_data
+
+        metadata_json.pop("consolidated_metadata")
+        return json.dumps(metadata_json).encode("utf-8")
 
     async def _snapshot_shards_for_resize(
         self,
@@ -1594,7 +1619,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
     async def _set_unlocked(self, key: str, value: zarr.core.buffer.Buffer) -> None:
         await self._resize_complete.wait()
 
-        raw_data_bytes = value.to_bytes()
+        raw_data_bytes = self._strip_v2_root_consolidated_metadata(
+            key, value.to_bytes()
+        )
         await self._register_array_metadata_from_bytes(key, raw_data_bytes)
         await self._ensure_v2_parent_group_metadata(key)
 
@@ -1633,6 +1660,20 @@ class ShardedZarrStore(zarr.abc.store.Store):
         pointer_cid_obj = CID.decode(pointer)
 
         if parsed_chunk is None:
+            if register_metadata and self._manifest_version == SHARDED_ZARR_V2:
+                raw_metadata = await self.cas.load(str(pointer_cid_obj))
+                stripped_metadata = self._strip_v2_root_consolidated_metadata(
+                    key, raw_metadata
+                )
+                if stripped_metadata != raw_metadata:
+                    stripped_pointer = await self.cas.save(
+                        stripped_metadata, codec="raw"
+                    )
+                    if not isinstance(stripped_pointer, CID):  # pragma: no cover
+                        raise TypeError(
+                            "ShardedZarrStore requires CAS.save to return CIDs."
+                        )
+                    pointer_cid_obj = stripped_pointer
             if (
                 register_metadata
                 and self._array_path_from_metadata_key(key) is not None
@@ -2159,6 +2200,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
     async def list_dir(self, prefix: str) -> AsyncIterator[str]:
         seen: Set[str] = set()
         normalized_prefix = prefix.strip("/")
+        if (
+            self.read_only
+            and normalized_prefix == ""
+            and self._v2_requires_explicit_group_for_root_read()
+        ):
+            raise ValueError(self._V2_ROOT_GROUP_MESSAGE)
         match_prefix = f"{normalized_prefix}/" if normalized_prefix else ""
 
         if self._is_v2_chunk_listing_prefix(normalized_prefix):

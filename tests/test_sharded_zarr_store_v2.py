@@ -132,9 +132,11 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
     xr.testing.assert_identical(
         level_2, xr.open_zarr(store=read_store, group="2").compute()
     )
+    with pytest.raises(ValueError, match="group='0'"):
+        xr.open_zarr(store=read_store)
 
-    root_entries = {entry async for entry in read_store.list_dir("")}
-    assert {"0", "1", "2", "zarr.json"}.issubset(root_entries)
+    with pytest.raises(ValueError, match="group='0'"):
+        _ = {entry async for entry in read_store.list_dir("")}
     level_entries = {entry async for entry in read_store.list_dir("0")}
     assert {"FPAR", "x", "y", "time", "zarr.json"}.issubset(level_entries)
     array_entries = {entry async for entry in read_store.list_dir("0/FPAR")}
@@ -949,11 +951,10 @@ async def test_v1_migrate_to_v2_preserves_existing_group_metadata() -> None:
     migrated_store = await ShardedZarrStore.open(
         cas=cas, read_only=True, root_cid=migrated_cid
     )
-    root_metadata = await migrated_store.get("zarr.json", proto)
+    root_metadata = await cas.load(migrated_store._root_obj["metadata"]["zarr.json"])
     level_metadata = await migrated_store.get("0/zarr.json", proto)
 
-    assert root_metadata is not None
-    assert json.loads(root_metadata.to_bytes()) == root_group_metadata
+    assert json.loads(root_metadata) == root_group_metadata
     assert level_metadata is not None
     assert json.loads(level_metadata.to_bytes()) == level_group_metadata
 
