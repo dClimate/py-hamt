@@ -164,6 +164,51 @@ async def test_v2_grouped_pyramid_arrays_are_path_aware() -> None:
 
 
 @pytest.mark.asyncio
+async def test_v2_write_requires_explicit_group() -> None:
+    cas = LocalCIDCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=2,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    ds = _pyramid_level(np.arange(4).reshape(1, 2, 2)).chunk({
+        "time": 1,
+        "y": 1,
+        "x": 1,
+    })
+
+    with pytest.raises(ValueError, match="group='0'"):
+        ds.to_zarr(store=store, mode="w", zarr_format=3)
+
+
+@pytest.mark.asyncio
+async def test_v2_single_group_root_read_defaults_to_only_group() -> None:
+    cas = LocalCIDCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=2,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    level_0 = _pyramid_level(np.arange(4).reshape(1, 2, 2)).chunk({
+        "time": 1,
+        "y": 1,
+        "x": 1,
+    })
+
+    level_0.to_zarr(store=store, group="0", mode="w", zarr_format=3)
+    root_cid = await store.flush()
+    read_store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
+
+    xr.testing.assert_identical(level_0, xr.open_zarr(store=read_store).compute())
+    root_entries = {entry async for entry in read_store.list_dir("")}
+    assert {"FPAR", "x", "y", "time", "zarr.json"}.issubset(root_entries)
+    array_entries = {entry async for entry in read_store.list_dir("FPAR")}
+    assert {"zarr.json", "c"}.issubset(array_entries)
+
+
+@pytest.mark.asyncio
 async def test_v2_resize_is_array_local() -> None:
     cas = LocalCIDCAS()
     store = await ShardedZarrStore.open(
@@ -841,7 +886,9 @@ async def test_v1_migrate_to_v2_reuses_shards() -> None:
     migrated_chunk = await migrated_store.get("0/FPAR/c/0/0", proto)
     assert migrated_chunk is not None
     assert migrated_chunk.to_bytes() == b"legacy"
-    assert await migrated_store.get("FPAR/c/0/0", proto) is None
+    default_group_chunk = await migrated_store.get("FPAR/c/0/0", proto)
+    assert default_group_chunk is not None
+    assert default_group_chunk.to_bytes() == b"legacy"
 
 
 @pytest.mark.asyncio

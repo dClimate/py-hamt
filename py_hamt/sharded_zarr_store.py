@@ -321,10 +321,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         "release. Prefer sharded_zarr_v2 for new stores; pyramid Zarr readers "
         "should open the desired group explicitly, for example group='0'."
     )
-    _V2_ROOT_GROUP_MESSAGE: ClassVar[str] = (
-        "sharded_zarr_v2 grouped stores require an explicit Zarr group when "
-        "reading. Open the desired pyramid level with xr.open_zarr(..., "
-        "group='0') or another available group."
+    _V2_MULTI_GROUP_READ_MESSAGE: ClassVar[str] = (
+        "sharded_zarr_v2 stores with multiple top-level groups require an "
+        "explicit Zarr group when reading. Open the desired pyramid level with "
+        "xr.open_zarr(..., group='0') or another available group."
+    )
+    _V2_WRITE_GROUP_MESSAGE: ClassVar[str] = (
+        "sharded_zarr_v2 writes require an explicit Zarr group. Write the "
+        "dataset with ds.to_zarr(..., group='0') or another group name."
     )
 
     def __init__(
@@ -366,6 +370,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._total_chunks: int = 0
 
         self._dirty_root = False
+        self._v2_pending_root_group_write = False
 
     @staticmethod
     def _normalize_array_path(array_path: str) -> str:
@@ -379,6 +384,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
             return key[: -len("/zarr.json")]
         if key.endswith("/.zarray"):
             return key[: -len("/.zarray")]
+        return None
+
+    @staticmethod
+    def _group_path_from_metadata_key(key: str) -> Optional[str]:
+        if key in {"zarr.json", ".zgroup"}:
+            return ""
+        if key.endswith("/zarr.json"):
+            return key[: -len("/zarr.json")]
+        if key.endswith("/.zgroup"):
+            return key[: -len("/.zgroup")]
         return None
 
     @staticmethod
@@ -737,13 +752,59 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._dirty_root = True
         return array_index
 
-    def _v2_requires_explicit_group_for_root_read(self) -> bool:
+    def _v2_top_level_groups(self) -> set[str]:
+        if self._manifest_version != SHARDED_ZARR_V2:
+            return set()
+        return {
+            array_path.split("/", 1)[0]
+            for array_path in self.array_indices
+            if "/" in array_path
+        }
+
+    def _v2_is_grouped_only(self) -> bool:
         if self._manifest_version != SHARDED_ZARR_V2 or not self.array_indices:
             return False
         return all("/" in array_path for array_path in self.array_indices)
 
+    def _v2_default_group_for_root_read(self) -> Optional[str]:
+        if not self._v2_is_grouped_only():
+            return None
+        groups = self._v2_top_level_groups()
+        if len(groups) != 1:
+            return None
+        return next(iter(groups))
+
+    def _v2_requires_explicit_group_for_root_read(self) -> bool:
+        return self._v2_is_grouped_only() and len(self._v2_top_level_groups()) > 1
+
+    def _v2_effective_read_key(self, key: str) -> str:
+        default_group = self._v2_default_group_for_root_read()
+        if default_group is None:
+            return key
+
+        normalized_key = key.strip("/")
+        if normalized_key in {"zarr.json", ".zgroup", ".zattrs", ".zmetadata", ""}:
+            return key
+        if normalized_key == default_group or normalized_key.startswith(
+            f"{default_group}/"
+        ):
+            return key
+        return f"{default_group}/{normalized_key}"
+
+    def _v2_effective_list_dir_prefix(self, normalized_prefix: str) -> str:
+        default_group = self._v2_default_group_for_root_read()
+        if default_group is None:
+            return normalized_prefix
+        if normalized_prefix == "":
+            return default_group
+        if normalized_prefix == default_group or normalized_prefix.startswith(
+            f"{default_group}/"
+        ):
+            return normalized_prefix
+        return f"{default_group}/{normalized_prefix}"
+
     def _strip_v2_root_consolidated_metadata(self, key: str, raw_data: bytes) -> bytes:
-        if key != "zarr.json" or not self._v2_requires_explicit_group_for_root_read():
+        if key != "zarr.json" or not self._v2_is_grouped_only():
             return raw_data
 
         metadata_json = self._decode_metadata_json(raw_data)
@@ -756,6 +817,42 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         metadata_json.pop("consolidated_metadata")
         return json.dumps(metadata_json).encode("utf-8")
+
+    @staticmethod
+    def _v2_path_has_group(array_path: str) -> bool:
+        normalized_path = ShardedZarrStore._normalize_array_path(array_path)
+        return "/" in normalized_path
+
+    def _raise_if_v2_write_without_group(self, key: str, raw_data: bytes) -> None:
+        if self._manifest_version != SHARDED_ZARR_V2:
+            return
+
+        metadata_json = self._decode_metadata_json(raw_data)
+        if metadata_json is None:
+            return
+
+        group_path = self._group_path_from_metadata_key(key)
+        metadata_path = self._array_path_from_metadata_key(key)
+        array_metadata = self._extract_array_metadata(metadata_json)
+        is_group_metadata = group_path is not None and array_metadata is None
+
+        if is_group_metadata and group_path == "":
+            self._v2_pending_root_group_write = True
+            return
+        if is_group_metadata:
+            self._v2_pending_root_group_write = False
+            return
+
+        if metadata_path is None or array_metadata is None:
+            return
+
+        if self._v2_path_has_group(metadata_path):
+            self._v2_pending_root_group_write = False
+            return
+
+        if self._v2_pending_root_group_write:
+            self._v2_pending_root_group_write = False
+            raise ValueError(self._V2_WRITE_GROUP_MESSAGE)
 
     async def _snapshot_shards_for_resize(
         self,
@@ -1440,6 +1537,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         clone._total_chunks = self._total_chunks
 
         clone._dirty_root = self._dirty_root
+        clone._v2_pending_root_group_write = self._v2_pending_root_group_write
 
         zarr.abc.store.Store.__init__(clone, read_only=read_only)
         return clone
@@ -1535,25 +1633,26 @@ class ShardedZarrStore(zarr.abc.store.Store):
             hit = False
             kind = "metadata"
             shard_idx_for_trace: int | None = None
+            lookup_key = self._v2_effective_read_key(key)
             try:
-                parsed_chunk = self._parse_chunk_key(key)
+                parsed_chunk = self._parse_chunk_key(lookup_key)
             except (ValueError, IndexError):
                 if self._manifest_version != SHARDED_ZARR_V2:
                     raise
                 return None
             try:
                 if parsed_chunk is None:
-                    metadata_cid_obj = self._root_obj["metadata"].get(key)
+                    metadata_cid_obj = self._root_obj["metadata"].get(lookup_key)
                     if metadata_cid_obj is None:
                         return None
                     if byte_range is not None:
                         raise ValueError(
                             "Byte range requests are not supported for metadata keys."
                         )
-                    data = self._metadata_read_cache.get(key)
+                    data = self._metadata_read_cache.get(lookup_key)
                     if data is None:
                         data = await self.cas.load(str(metadata_cid_obj))
-                        self._metadata_read_cache[key] = data
+                        self._metadata_read_cache[lookup_key] = data
                     hit = True
                     return prototype.buffer.from_bytes(data)
 
@@ -1562,7 +1661,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     array_index = self._array_index_for_path(parsed_chunk.array_path)
                 except KeyError:
                     return await self._get_legacy_metadata_chunk(
-                        key, prototype, byte_range
+                        lookup_key, prototype, byte_range
                     )
                 linear_chunk_index = self._get_linear_chunk_index_for_index(
                     parsed_chunk.coords, array_index
@@ -1582,7 +1681,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 chunk_cid_obj = target_shard_list[index_in_shard]
                 if chunk_cid_obj is None:
                     legacy_buffer = await self._get_legacy_metadata_chunk(
-                        key, prototype, byte_range
+                        lookup_key, prototype, byte_range
                     )
                     hit = legacy_buffer is not None
                     return legacy_buffer
@@ -1622,6 +1721,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         raw_data_bytes = self._strip_v2_root_consolidated_metadata(
             key, value.to_bytes()
         )
+        self._raise_if_v2_write_without_group(key, raw_data_bytes)
         await self._register_array_metadata_from_bytes(key, raw_data_bytes)
         await self._ensure_v2_parent_group_metadata(key)
 
@@ -1708,14 +1808,15 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return None
 
     async def exists(self, key: str) -> bool:
+        lookup_key = self._v2_effective_read_key(key)
         try:
-            parsed_chunk = self._parse_chunk_key(key)
+            parsed_chunk = self._parse_chunk_key(lookup_key)
             if parsed_chunk is None:
-                return key in self._root_obj.get("metadata", {})
+                return lookup_key in self._root_obj.get("metadata", {})
             try:
                 array_index = self._array_index_for_path(parsed_chunk.array_path)
             except KeyError:
-                return key in self._root_obj.get("metadata", {})
+                return lookup_key in self._root_obj.get("metadata", {})
             linear_chunk_index = self._get_linear_chunk_index_for_index(
                 parsed_chunk.coords, array_index
             )
@@ -1727,7 +1828,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             )
             return target_shard_list[
                 index_in_shard
-            ] is not None or key in self._root_obj.get("metadata", {})
+            ] is not None or lookup_key in self._root_obj.get("metadata", {})
         except (ValueError, IndexError, KeyError):
             return False
 
@@ -2205,10 +2306,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
             and normalized_prefix == ""
             and self._v2_requires_explicit_group_for_root_read()
         ):
-            raise ValueError(self._V2_ROOT_GROUP_MESSAGE)
-        match_prefix = f"{normalized_prefix}/" if normalized_prefix else ""
+            raise ValueError(self._V2_MULTI_GROUP_READ_MESSAGE)
+        effective_prefix = self._v2_effective_list_dir_prefix(normalized_prefix)
+        match_prefix = f"{effective_prefix}/" if effective_prefix else ""
 
-        if self._is_v2_chunk_listing_prefix(normalized_prefix):
+        if self._is_v2_chunk_listing_prefix(effective_prefix):
             async for key in self._iter_chunk_keys():
                 if not key.startswith(match_prefix):
                     continue
