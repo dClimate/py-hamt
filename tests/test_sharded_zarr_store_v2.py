@@ -26,6 +26,7 @@ from py_hamt.sharded_zarr_store import (
     ArrayIndex,
     ShardedZarrStore,
     ShardedZarrV1DeprecationWarning,
+    decode_shard_entry,
 )
 from py_hamt.store_httpx import ContentAddressedStore
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
@@ -65,6 +66,156 @@ class LocalCIDCAS(ContentAddressedStore):
         if suffix is not None:
             return data[-suffix:]
         return data
+
+
+def _test_cid(label: bytes) -> CID:
+    return CID("base32", 1, "raw", multihash.digest(label, "sha2-256"))
+
+
+def test_decode_shard_entry_matches_full_decode() -> None:
+    shard_entries = [
+        _test_cid(b"first"),
+        _test_cid(b"middle-a"),
+        None,
+        _test_cid(b"middle-b"),
+        _test_cid(b"last"),
+    ]
+    raw = dag_cbor.encode(shard_entries)
+    decoded = dag_cbor.decode(raw)
+
+    assert decode_shard_entry(raw, 0) == decoded[0]
+    assert decode_shard_entry(raw, 3) == decoded[3]
+    assert decode_shard_entry(raw, 4) == decoded[4]
+    assert decode_shard_entry(raw, 2) is None
+
+
+def test_decode_shard_entry_rejects_invalid_index() -> None:
+    raw = dag_cbor.encode([_test_cid(b"only")])
+
+    with pytest.raises(IndexError):
+        decode_shard_entry(raw, -1)
+    with pytest.raises(IndexError):
+        decode_shard_entry(raw, 1)
+
+
+def test_decode_shard_entry_rejects_malformed_non_list_shard() -> None:
+    raw = dag_cbor.encode({"not": "a shard"})
+
+    with pytest.raises(ValueError, match="DAG-CBOR list"):
+        decode_shard_entry(raw, 0)
+
+
+def test_decode_shard_entry_rejects_malformed_cid_entry() -> None:
+    raw = dag_cbor.encode([123])
+
+    with pytest.raises(TypeError, match="non-CID"):
+        decode_shard_entry(raw, 0)
+
+
+def test_decode_shard_entry_rejects_truncated_entry() -> None:
+    raw = dag_cbor.encode([_test_cid(b"truncated")])[:-1]
+
+    with pytest.raises(ValueError):
+        decode_shard_entry(raw, 0)
+
+
+@pytest.mark.asyncio
+async def test_read_only_get_uses_sparse_shard_decode_on_cache_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=4,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [4],
+        "data_type": "uint8",
+        "chunk_grid": {
+            "name": "regular",
+            "configuration": {"chunk_shape": [1]},
+        },
+    }
+    await store.set(
+        "a/zarr.json", proto.buffer.from_bytes(json.dumps(metadata).encode())
+    )
+    expected_chunks = [b"zero", b"one", b"two", b"three"]
+    for idx, chunk in enumerate(expected_chunks):
+        await store.set(f"a/c/{idx}", proto.buffer.from_bytes(chunk))
+
+    root_cid = await store.flush()
+    full_decode_store = await ShardedZarrStore.open(
+        cas=cas, read_only=True, root_cid=root_cid
+    )
+    await full_decode_store._load_or_initialize_shard_cache(0, "a")
+    full_decode_buffer = await full_decode_store.get("a/c/2", proto)
+    assert full_decode_buffer is not None
+
+    sparse_store = await ShardedZarrStore.open(
+        cas=cas, read_only=True, root_cid=root_cid, shard_read_mode="sparse"
+    )
+    full_decode_calls = 0
+
+    async def fail_full_decode(*args: object, **kwargs: object) -> None:
+        nonlocal full_decode_calls
+        full_decode_calls += 1
+        raise AssertionError("full shard decode should not run")
+
+    monkeypatch.setattr(sparse_store, "_fetch_and_cache_full_shard", fail_full_decode)
+    sparse_buffer = await sparse_store.get("a/c/2", proto)
+
+    assert sparse_buffer is not None
+    assert sparse_buffer.to_bytes() == full_decode_buffer.to_bytes()
+    assert sparse_buffer.to_bytes() == expected_chunks[2]
+    assert full_decode_calls == 0
+    assert await sparse_store._shard_data_cache.get(("a", 0)) is None
+
+
+@pytest.mark.asyncio
+async def test_read_only_get_defaults_to_full_shard_decode() -> None:
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        chunks_per_shard=1,
+        manifest_version=SHARDED_ZARR_V2,
+    )
+    metadata = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [1],
+        "data_type": "uint8",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1]}},
+    }
+    await store.set(
+        "a/zarr.json", proto.buffer.from_bytes(json.dumps(metadata).encode())
+    )
+    await store.set("a/c/0", proto.buffer.from_bytes(b"value"))
+    root_cid = await store.flush()
+
+    read_store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
+    assert read_store.shard_read_mode == "full"
+    buffer = await read_store.get("a/c/0", proto)
+
+    assert buffer is not None
+    assert buffer.to_bytes() == b"value"
+    assert await read_store._shard_data_cache.get(("a", 0)) is not None
+
+
+@pytest.mark.asyncio
+async def test_shard_read_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="shard_read_mode"):
+        await ShardedZarrStore.open(
+            cas=LocalCIDCAS(),
+            read_only=True,
+            shard_read_mode="adaptive",  # type: ignore[arg-type]
+        )
 
 
 def _pyramid_level(data: np.ndarray, *, coord_offset: int = 0) -> xr.Dataset:

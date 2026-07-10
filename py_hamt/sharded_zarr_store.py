@@ -8,7 +8,17 @@ import warnings
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
-from typing import ClassVar, DefaultDict, Dict, List, Optional, Set, Tuple, cast
+from typing import (
+    ClassVar,
+    DefaultDict,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    cast,
+)
 
 import dag_cbor
 import zarr.abc.store
@@ -26,6 +36,94 @@ SHARDED_ZARR_V2 = "sharded_zarr_v2"
 ZARR_METADATA_SUFFIXES = ("zarr.json", ".zarray", ".zattrs", ".zgroup")
 
 ShardCacheKey = int | tuple[str, int]
+ShardReadMode = Literal["full", "sparse"]
+
+
+def _read_cbor_argument(
+    data: bytes, offset: int, additional_info: int
+) -> tuple[int, int]:
+    if additional_info < 24:
+        return additional_info, offset
+    if additional_info == 24:
+        length = 1
+    elif additional_info == 25:
+        length = 2
+    elif additional_info == 26:
+        length = 4
+    elif additional_info == 27:
+        length = 8
+    else:
+        raise ValueError("Indefinite or reserved CBOR item length is not supported.")
+
+    end = offset + length
+    if end > len(data):
+        raise ValueError("Truncated CBOR item.")
+    return int.from_bytes(data[offset:end], "big"), end
+
+
+def _skip_cbor_item(data: bytes, offset: int) -> int:
+    if offset >= len(data):
+        raise ValueError("Truncated CBOR item.")
+
+    initial_byte = data[offset]
+    offset += 1
+    major_type = initial_byte >> 5
+    additional_info = initial_byte & 0x1F
+    value, offset = _read_cbor_argument(data, offset, additional_info)
+
+    if major_type in {0, 1, 7}:
+        return offset
+    if major_type in {2, 3}:
+        end = offset + value
+        if end > len(data):
+            raise ValueError("Truncated CBOR byte or text string.")
+        return end
+    if major_type == 4:
+        for _ in range(value):
+            offset = _skip_cbor_item(data, offset)
+        return offset
+    if major_type == 5:
+        for _ in range(value * 2):
+            offset = _skip_cbor_item(data, offset)
+        return offset
+    if major_type == 6:
+        return _skip_cbor_item(data, offset)
+
+    raise ValueError(f"Unsupported CBOR major type: {major_type}.")
+
+
+def _read_cbor_list_header(shard_bytes: bytes) -> tuple[int, int]:
+    if not shard_bytes:
+        raise ValueError("Shard bytes are empty.")
+
+    initial_byte = shard_bytes[0]
+    major_type = initial_byte >> 5
+    if major_type != 4:
+        raise ValueError("Shard bytes do not start with a DAG-CBOR list.")
+
+    return _read_cbor_argument(shard_bytes, 1, initial_byte & 0x1F)
+
+
+def decode_shard_entry(shard_bytes: bytes, index: int) -> CID | None:
+    """
+    Decode one entry from a DAG-CBOR shard list without materializing the full list.
+    """
+    if index < 0:
+        raise IndexError("Shard entry index out of range.")
+
+    entry_count, offset = _read_cbor_list_header(shard_bytes)
+    if index >= entry_count:
+        raise IndexError("Shard entry index out of range.")
+
+    for _ in range(index):
+        offset = _skip_cbor_item(shard_bytes, offset)
+
+    entry_start = offset
+    entry_end = _skip_cbor_item(shard_bytes, offset)
+    entry = dag_cbor.decode(shard_bytes[entry_start:entry_end])
+    if entry is not None and not isinstance(entry, CID):
+        raise TypeError("Shard entry contains a non-CID value.")
+    return entry
 
 
 class ShardedZarrV1DeprecationWarning(FutureWarning):
@@ -338,11 +436,18 @@ class ShardedZarrStore(zarr.abc.store.Store):
         root_cid: Optional[str] = None,
         *,
         max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
+        shard_read_mode: ShardReadMode = "full",
     ):
         """Use the async `open()` classmethod to instantiate this class."""
         super().__init__(read_only=read_only)
+        if shard_read_mode not in {"full", "sparse"}:
+            raise ValueError(
+                f"Unsupported shard_read_mode: {shard_read_mode!r}. "
+                "Expected 'full' or 'sparse'."
+            )
         self.cas = cas
         self._root_cid = root_cid
+        self.shard_read_mode = shard_read_mode
         self._root_obj: dict = {}
         self._manifest_version = SHARDED_ZARR_V1
 
@@ -455,6 +560,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
         manifest_version: Optional[str] = None,
         primary_array_path: str = "",
+        shard_read_mode: ShardReadMode = "full",
     ) -> "ShardedZarrStore":
         """
         Asynchronously opens an existing ShardedZarrStore or initializes a new one.
@@ -464,7 +570,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
         ``array_shape``/``chunk_shape`` and provide ``chunks_per_shard``.
         """
         store = cls(
-            cas, read_only, root_cid, max_cache_memory_bytes=max_cache_memory_bytes
+            cas,
+            read_only,
+            root_cid,
+            max_cache_memory_bytes=max_cache_memory_bytes,
+            shard_read_mode=shard_read_mode,
         )
         if root_cid:
             await store._load_root_from_cid()
@@ -1230,6 +1340,25 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
                 ) from e
 
+    async def _load_sparse_shard_entry(
+        self,
+        cache_key: ShardCacheKey,
+        shard_idx: int,
+        shard_cid: str,
+        index_in_shard: int,
+        expected_entries: int,
+    ) -> Optional[CID]:
+        if await self._shard_data_cache.get(cache_key) is not None:
+            return None
+
+        shard_data_bytes = await self.cas.load(shard_cid)
+        entry_count, _ = _read_cbor_list_header(shard_data_bytes)
+        if entry_count != expected_entries:
+            raise ValueError(
+                f"Shard {shard_idx} contains {entry_count} entries; expected {expected_entries}."
+            )
+        return decode_shard_entry(shard_data_bytes, index_in_shard)
+
     def _parse_chunk_key(self, key: str) -> Optional[ChunkKey]:
         if key.endswith(ZARR_METADATA_SUFFIXES):
             return None
@@ -1515,6 +1644,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         clone._root_cid = self._root_cid
         clone._root_obj = self._root_obj
         clone._manifest_version = self._manifest_version
+        clone.shard_read_mode = self.shard_read_mode
 
         clone._resize_lock = self._resize_lock
         clone._resize_complete = self._resize_complete
@@ -1674,11 +1804,28 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 cache_key = self._cache_key(array_index.array_path, shard_idx)
                 shard_lock = self._shard_locks[cache_key]
                 async with shard_lock:
-                    target_shard_list = await self._load_or_initialize_shard_cache(
-                        shard_idx, array_index.array_path
-                    )
-
-                chunk_cid_obj = target_shard_list[index_in_shard]
+                    cached_shard = await self._shard_data_cache.get(cache_key)
+                    if (
+                        self.read_only
+                        and self.shard_read_mode == "sparse"
+                        and cached_shard is None
+                        and byte_range is None
+                        and 0 <= shard_idx < array_index.num_shards
+                        and array_index.shard_cids[shard_idx] is not None
+                    ):
+                        chunk_cid_obj = await self._load_sparse_shard_entry(
+                            cache_key,
+                            shard_idx,
+                            str(array_index.shard_cids[shard_idx]),
+                            index_in_shard,
+                            array_index.chunks_per_shard,
+                        )
+                    else:
+                        if cached_shard is None:
+                            cached_shard = await self._load_or_initialize_shard_cache(
+                                shard_idx, array_index.array_path
+                            )
+                        chunk_cid_obj = cached_shard[index_in_shard]
                 if chunk_cid_obj is None:
                     legacy_buffer = await self._get_legacy_metadata_chunk(
                         lookup_key, prototype, byte_range
