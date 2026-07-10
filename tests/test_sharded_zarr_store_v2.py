@@ -221,6 +221,13 @@ async def test_read_only_get_uses_sparse_shard_decode_on_cache_miss(
         await sparse_store._load_sparse_shard_entry(
             ("a", 0), 0, shard_cid, 2, expected_entries=3
         )
+    await sparse_store._shard_data_cache.put(("a", 0), [None])
+    assert (
+        await sparse_store._load_sparse_shard_entry(
+            ("a", 0), 0, shard_cid, 2, expected_entries=4
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
