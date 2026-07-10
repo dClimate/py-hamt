@@ -231,6 +231,21 @@ async def test_read_only_get_uses_sparse_shard_decode_on_cache_miss(
 
 
 @pytest.mark.asyncio
+async def test_full_shard_decode_rejects_unexpected_entry_count() -> None:
+    cas = LocalCIDCAS()
+    shard_cid = await cas.save(dag_cbor.encode([_test_cid(b"only")]), "dag-cbor")
+    store = ShardedZarrStore(cas=cas, read_only=True, shard_read_mode="full")
+
+    with pytest.raises(ValueError, match="Shard 0 contains 1 entries; expected 2"):
+        await store._fetch_and_cache_full_shard(
+            ("a", 0),
+            shard_idx=0,
+            shard_cid=str(shard_cid),
+            expected_entries=2,
+        )
+
+
+@pytest.mark.asyncio
 async def test_read_only_get_defaults_to_sparse_shard_decode() -> None:
     cas = LocalCIDCAS()
     proto = zarr.core.buffer.default_buffer_prototype()
