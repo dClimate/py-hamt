@@ -26,6 +26,9 @@ from py_hamt.sharded_zarr_store import (
     ArrayIndex,
     ShardedZarrStore,
     ShardedZarrV1DeprecationWarning,
+    _read_cbor_argument,
+    _read_cbor_list_header,
+    _skip_cbor_item,
     decode_shard_entry,
 )
 from py_hamt.store_httpx import ContentAddressedStore
@@ -119,6 +122,38 @@ def test_decode_shard_entry_rejects_truncated_entry() -> None:
         decode_shard_entry(raw, 0)
 
 
+def test_cbor_helpers_cover_extended_arguments_and_item_types() -> None:
+    assert _read_cbor_argument(b"\x01", 0, 24) == (1, 1)
+    assert _read_cbor_argument(b"\x01\x02", 0, 25) == (258, 2)
+    assert _read_cbor_argument(b"\x00\x00\x01\x02", 0, 26) == (258, 4)
+    assert _read_cbor_argument(b"\x00\x00\x00\x00\x00\x00\x01\x02", 0, 27) == (
+        258,
+        8,
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        _read_cbor_argument(b"", 0, 31)
+    with pytest.raises(ValueError, match="Truncated CBOR item"):
+        _read_cbor_argument(b"", 0, 24)
+
+    assert _skip_cbor_item(b"\x00", 0) == 1
+    assert _skip_cbor_item(b"\x20", 0) == 1
+    assert _skip_cbor_item(b"\x63abc", 0) == 4
+    assert _skip_cbor_item(b"\x82\x00\x01", 0) == 3
+    assert _skip_cbor_item(b"\xa1\x00\x01", 0) == 3
+    assert _skip_cbor_item(b"\xc0\x00", 0) == 2
+    assert _skip_cbor_item(b"\xf5", 0) == 1
+
+    with pytest.raises(ValueError, match="Truncated CBOR item"):
+        _skip_cbor_item(b"", 0)
+    with pytest.raises(ValueError, match="byte or text"):
+        _skip_cbor_item(b"\x63ab", 0)
+    with pytest.raises(ValueError, match="DAG-CBOR list"):
+        _read_cbor_list_header(dag_cbor.encode({}))
+    with pytest.raises(ValueError, match="empty"):
+        _read_cbor_list_header(b"")
+
+
 @pytest.mark.asyncio
 async def test_read_only_get_uses_sparse_shard_decode_on_cache_miss(
     monkeypatch: pytest.MonkeyPatch,
@@ -174,6 +209,18 @@ async def test_read_only_get_uses_sparse_shard_decode_on_cache_miss(
     assert sparse_buffer.to_bytes() == expected_chunks[2]
     assert full_decode_calls == 0
     assert await sparse_store._shard_data_cache.get(("a", 0)) is None
+
+    shard_cid = str(sparse_store.array_indices["a"].shard_cids[0])
+    assert (
+        await sparse_store._load_sparse_shard_entry(
+            ("a", 0), 0, shard_cid, 2, expected_entries=4
+        )
+        is not None
+    )
+    with pytest.raises(ValueError, match="expected 3"):
+        await sparse_store._load_sparse_shard_entry(
+            ("a", 0), 0, shard_cid, 2, expected_entries=3
+        )
 
 
 @pytest.mark.asyncio

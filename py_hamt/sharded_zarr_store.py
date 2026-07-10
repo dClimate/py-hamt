@@ -89,7 +89,9 @@ def _skip_cbor_item(data: bytes, offset: int) -> int:
     if major_type == 6:
         return _skip_cbor_item(data, offset)
 
-    raise ValueError(f"Unsupported CBOR major type: {major_type}.")
+    raise ValueError(  # pragma: no cover - all CBOR major types are handled above
+        f"Unsupported CBOR major type: {major_type}."
+    )
 
 
 def _read_cbor_list_header(shard_bytes: bytes) -> tuple[int, int]:
