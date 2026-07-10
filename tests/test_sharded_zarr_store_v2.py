@@ -231,7 +231,7 @@ async def test_read_only_get_uses_sparse_shard_decode_on_cache_miss(
 
 
 @pytest.mark.asyncio
-async def test_read_only_get_defaults_to_full_shard_decode() -> None:
+async def test_read_only_get_defaults_to_sparse_shard_decode() -> None:
     cas = LocalCIDCAS()
     proto = zarr.core.buffer.default_buffer_prototype()
     store = await ShardedZarrStore.open(
@@ -254,12 +254,12 @@ async def test_read_only_get_defaults_to_full_shard_decode() -> None:
     root_cid = await store.flush()
 
     read_store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
-    assert read_store.shard_read_mode == "full"
+    assert read_store.shard_read_mode == "sparse"
     buffer = await read_store.get("a/c/0", proto)
 
     assert buffer is not None
     assert buffer.to_bytes() == b"value"
-    assert await read_store._shard_data_cache.get(("a", 0)) is not None
+    assert await read_store._shard_data_cache.get(("a", 0)) is None
 
 
 @pytest.mark.asyncio

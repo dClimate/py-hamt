@@ -438,7 +438,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         root_cid: Optional[str] = None,
         *,
         max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
-        shard_read_mode: ShardReadMode = "full",
+        shard_read_mode: ShardReadMode = "sparse",
     ):
         """Use the async `open()` classmethod to instantiate this class."""
         super().__init__(read_only=read_only)
@@ -562,7 +562,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
         manifest_version: Optional[str] = None,
         primary_array_path: str = "",
-        shard_read_mode: ShardReadMode = "full",
+        shard_read_mode: ShardReadMode = "sparse",
     ) -> "ShardedZarrStore":
         """
         Asynchronously opens an existing ShardedZarrStore or initializes a new one.
