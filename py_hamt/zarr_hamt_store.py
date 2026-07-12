@@ -234,13 +234,14 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         return False
 
     async def set(self, key: str, value: zarr.core.buffer.Buffer) -> None:
-        """@private"""
+        """Store a value and update any existing metadata cache entry."""
         if self.read_only:
             raise Exception("Cannot write to a read-only store.")
 
+        raw_bytes = value.to_bytes()
+        await self.hamt.set(key, raw_bytes)
         if key in self.metadata_read_cache:
-            self.metadata_read_cache[key] = value.to_bytes()
-        await self.hamt.set(key, value.to_bytes())
+            self.metadata_read_cache[key] = raw_bytes
 
     async def set_if_not_exists(self, key: str, value: zarr.core.buffer.Buffer) -> None:
         """@private"""
@@ -259,18 +260,16 @@ class ZarrHAMTStore(zarr.abc.store.Store):
         return not self.hamt.read_only
 
     async def delete(self, key: str) -> None:
-        """@private"""
+        """Delete a key and evict any cached metadata for it."""
         if self.read_only:
             raise Exception("Cannot write to a read-only store.")
         try:
             await self.hamt.delete(key)
-            # In practice these lines never seem to be needed, creating and appending data are the only operations most zarrs actually undergo
-            # if key in self.metadata_read_cache:
-            #     del self.metadata_read_cache[key]
         # It's fine if the key was not in the HAMT
         # Sometimes zarr v3 calls deletes on keys that don't exist (or have already been deleted) for some reason, probably concurrency issues
         except KeyError:
-            return
+            pass
+        self.metadata_read_cache.pop(key, None)
 
     @property
     def supports_listing(self) -> bool:
