@@ -489,6 +489,18 @@ class ShardedZarrStore(zarr.abc.store.Store):
             multiplier *= self._chunks_per_dim[i]
         return linear_index
 
+    @staticmethod
+    def _get_chunk_coords(
+        linear_chunk_index: int, chunks_per_dim: Tuple[int, ...]
+    ) -> Tuple[int, ...]:
+        """Decode a row-major linear index using the supplied chunk grid."""
+        remaining_index = linear_chunk_index
+        reversed_coords: list[int] = []
+        for dimension_size in reversed(chunks_per_dim):
+            remaining_index, coordinate = divmod(remaining_index, dimension_size)
+            reversed_coords.append(coordinate)
+        return tuple(reversed(reversed_coords))
+
     def _get_shard_info(self, linear_chunk_index: int) -> Tuple[int, int]:
         shard_idx = linear_chunk_index // self._chunks_per_shard
         index_in_shard = linear_chunk_index % self._chunks_per_shard
@@ -945,11 +957,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     target_shard_list[index_in_global_shard] = pointer_cid_obj
                     await self._shard_data_cache.mark_dirty(global_shard_idx)
 
-    async def resize_store(self, new_shape: Tuple[int, ...]):
+    async def resize_store(self, new_shape: Tuple[int, ...]) -> None:
         """
-        Resizes the store's main shard index to accommodate a new overall array shape.
-        This is a metadata-only operation on the store's root object.
-        Used when doing skeleton writes or appends via xarray where the array shape changes.
+        Resize the primary array's shard index while preserving chunk coordinates.
+
+        Occupied slots are decoded using the old row-major chunk grid and encoded
+        using the new grid. Chunks outside a shrunken grid are discarded.
         """
         if self.read_only:
             raise PermissionError("Cannot resize a read-only store.")
@@ -965,27 +978,68 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 "New shape must have the same number of dimensions as the old shape."
             )
 
-        self._array_shape = tuple(new_shape)
-        self._chunks_per_dim = tuple(
+        old_chunks_per_dim = self._chunks_per_dim
+        old_total_chunks = self._total_chunks
+        old_num_shards = self._num_shards
+        new_chunks_per_dim = tuple(
             math.ceil(a / c) if c > 0 else 0
-            for a, c in zip(self._array_shape, self._chunk_shape)
+            for a, c in zip(new_shape, self._chunk_shape)
         )
-        self._total_chunks = math.prod(self._chunks_per_dim)
-        old_num_shards = self._num_shards if self._num_shards is not None else 0
-        self._num_shards = (
-            (self._total_chunks + self._chunks_per_shard - 1) // self._chunks_per_shard
-            if self._total_chunks > 0
+
+        if new_chunks_per_dim == old_chunks_per_dim:
+            self._array_shape = tuple(new_shape)
+            self._root_obj["chunks"]["array_shape"] = list(self._array_shape)
+            self._dirty_root = True
+            return
+
+        old_shards = [
+            await self._load_or_initialize_shard_cache(shard_idx)
+            for shard_idx in range(old_num_shards)
+        ]
+
+        new_total_chunks = math.prod(new_chunks_per_dim)
+        new_num_shards = (
+            (new_total_chunks + self._chunks_per_shard - 1) // self._chunks_per_shard
+            if new_total_chunks > 0
             else 0
         )
-        self._root_obj["chunks"]["array_shape"] = list(self._array_shape)
-        if self._num_shards > old_num_shards:
-            self._root_obj["chunks"]["shard_cids"].extend(
-                [None] * (self._num_shards - old_num_shards)
+        remapped_shards: Dict[int, List[Optional[CID]]] = {}
+        for old_linear_index in range(old_total_chunks):
+            old_shard_idx, old_index_in_shard = self._get_shard_info(old_linear_index)
+            chunk_cid = old_shards[old_shard_idx][old_index_in_shard]
+            if chunk_cid is None:
+                continue
+
+            chunk_coords = self._get_chunk_coords(old_linear_index, old_chunks_per_dim)
+            if any(
+                coordinate >= dimension_size
+                for coordinate, dimension_size in zip(
+                    chunk_coords, new_chunks_per_dim, strict=True
+                )
+            ):
+                continue
+
+            new_linear_index = 0
+            for coordinate, dimension_size in zip(
+                chunk_coords, new_chunks_per_dim, strict=True
+            ):
+                new_linear_index = new_linear_index * dimension_size + coordinate
+            new_shard_idx, new_index_in_shard = self._get_shard_info(new_linear_index)
+            new_shard = remapped_shards.setdefault(
+                new_shard_idx, [None] * self._chunks_per_shard
             )
-        elif self._num_shards < old_num_shards:
-            self._root_obj["chunks"]["shard_cids"] = self._root_obj["chunks"][
-                "shard_cids"
-            ][: self._num_shards]
+            new_shard[new_index_in_shard] = chunk_cid
+
+        self._array_shape = tuple(new_shape)
+        self._chunks_per_dim = new_chunks_per_dim
+        self._total_chunks = new_total_chunks
+        self._num_shards = new_num_shards
+        self._root_obj["chunks"]["array_shape"] = list(self._array_shape)
+        self._root_obj["chunks"]["shard_cids"] = [None] * self._num_shards
+
+        await self._shard_data_cache.clear()
+        for shard_idx, shard_data in remapped_shards.items():
+            await self._shard_data_cache.put(shard_idx, shard_data, is_dirty=True)
 
         self._dirty_root = True
 
