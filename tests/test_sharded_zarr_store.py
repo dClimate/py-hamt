@@ -986,10 +986,17 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert store._parse_chunk_key("zarr.json") is None
         assert store._parse_chunk_key("group1/zarr.json") is None
 
-        # Test excluded array prefixes
+        store._primary_array_path = "temp"
+
+        # Test chunks from non-primary arrays
         assert store._parse_chunk_key("time/c/0") is None
         assert store._parse_chunk_key("lat/c/0/0") is None
         assert store._parse_chunk_key("lon/c/0/0") is None
+        assert store._parse_chunk_key("x/c/0") is None
+
+        # Root-level and named primary-array chunks are parsed.
+        assert store._parse_chunk_key("c/0/0") == (0, 0)
+        assert store._parse_chunk_key("temp/c/0/0") == (0, 0)
 
         # Test dimensionality mismatch
         with pytest.raises(IndexError, match="tuple index out of range"):

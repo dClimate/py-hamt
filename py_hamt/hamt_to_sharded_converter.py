@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import time
+from typing import cast
 
 import xarray as xr
 from multiformats import CID
@@ -61,9 +62,16 @@ async def convert_hamt_to_sharded(
 
     # 4. Iterate and copy all data from source to destination
     print("Starting data migration...")
+    primary_metadata_key = f"{data_var_name}/zarr.json"
+    primary_metadata_cid = cast(CID, await hamt_ro.get_pointer(primary_metadata_key))
+    await dest_store.set_pointer(
+        primary_metadata_key, str(primary_metadata_cid.encode("base32"))
+    )
     count = 0
     async for key in hamt_ro.keys():
         count += 1
+        if key == primary_metadata_key:
+            continue
         # Read the raw data (metadata or chunk) from the source
         cid: CID = await hamt_ro.get_pointer(key)
         cid_base32_str = str(cid.encode("base32"))

@@ -153,7 +153,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
     The store's root object contains:
     1.  A dictionary mapping metadata keys (like 'zarr.json') to their CIDs.
     2.  A list of CIDs, where each CID points to a shard object.
-    3.  Sharding configuration details (e.g., chunks_per_shard).
+    3.  Sharding configuration details and the primary array path.
     """
 
     def __init__(
@@ -184,6 +184,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._array_shape: Tuple[int, ...]
         self._chunk_shape: Tuple[int, ...]
         self._chunks_per_dim: Tuple[int, ...]
+        self._primary_array_path: Optional[str] = None
         self._chunks_per_shard: int
         self._num_shards: int = 0
         self._total_chunks: int = 0
@@ -254,6 +255,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._chunks_per_shard = chunks_per_shard
 
         self.__update_geometry()
+        self._primary_array_path = None
 
         self._root_obj = {
             "manifest_version": "sharded_zarr_v1",
@@ -293,6 +295,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._chunks_per_shard = chunk_info["sharding_config"]["chunks_per_shard"]
 
         self.__update_geometry()
+        primary_array_path = chunk_info.get("primary_array_path")
+        if isinstance(primary_array_path, str):
+            self._primary_array_path = primary_array_path
+        else:
+            await self._derive_primary_array_path()
 
         if len(chunk_info["shard_cids"]) != self._num_shards:
             raise ValueError(
@@ -339,44 +346,76 @@ class ShardedZarrStore(zarr.abc.store.Store):
                         f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
                     )
 
+    @staticmethod
+    def _array_path_from_metadata_key(key: str) -> Optional[str]:
+        """Return the array path represented by a Zarr array metadata key."""
+        if key == "zarr.json":
+            return ""
+        metadata_suffix = "/zarr.json"
+        if key.endswith(metadata_suffix):
+            return key[: -len(metadata_suffix)]
+        return None
+
+    def _record_primary_array_path(
+        self, key: str, metadata: object, *, persist: bool = True
+    ) -> bool:
+        """Record the first array whose dimensionality matches the shard geometry."""
+        array_path = self._array_path_from_metadata_key(key)
+        if array_path is None or not isinstance(metadata, dict):
+            return False
+
+        shape = metadata.get("shape")
+        if not isinstance(shape, list) or len(shape) != len(self._array_shape):
+            return False
+
+        if self._primary_array_path is None:
+            self._primary_array_path = array_path
+            if persist:
+                self._root_obj["chunks"]["primary_array_path"] = array_path
+                self._dirty_root = True
+        return self._primary_array_path == array_path
+
+    def _record_primary_chunk_path(self, key: str) -> None:
+        """Record a primary path for legacy callers that write chunks directly."""
+        if self._primary_array_path is not None or "/c/" not in key:
+            return
+        array_path, _, coord_part = key.rpartition("/c/")
+        if array_path and len(coord_part.split("/")) == len(self._array_shape):
+            self._primary_array_path = array_path
+            self._root_obj["chunks"]["primary_array_path"] = array_path
+            self._dirty_root = True
+
+    async def _derive_primary_array_path(self) -> None:
+        """Derive the primary array path when opening a legacy manifest."""
+        for key, metadata_cid in self._root_obj.get("metadata", {}).items():
+            if self._array_path_from_metadata_key(key) is None:
+                continue
+            try:
+                metadata_bytes = await self.cas.load(str(metadata_cid))
+                metadata = json.loads(metadata_bytes)
+            except (TypeError, ValueError):
+                continue
+            if self._record_primary_array_path(key, metadata, persist=False):
+                return
+
     def _parse_chunk_key(self, key: str) -> Optional[Tuple[int, ...]]:
-        # 1. Exclude .json files immediately (metadata)
+        """Parse chunk coordinates only for the store's primary array."""
         if key.endswith(".json"):
             return None
-        excluded_array_prefixes = {
-            "time",
-            "lat",
-            "lon",
-            "latitude",
-            "longitude",
-            "forecast_reference_time",
-            "step",
-        }
 
-        chunk_marker = "/c/"
-        marker_idx = key.rfind(chunk_marker)  # Use rfind for robustness
-        if marker_idx == -1:
-            # Key does not contain "/c/", so it's not a chunk data key
-            # in the expected format (e.g., could be .zattrs, .zgroup at various levels).
+        if key.startswith("c/"):
+            array_path = ""
+            coord_part = key[len("c/") :]
+        elif "/c/" in key:
+            array_path, _, coord_part = key.rpartition("/c/")
+        else:
             return None
 
-        # Extract the part of the key before "/c/", which might represent the array/group path
-        # e.g., "temp" from "temp/c/0/0/0"
-        # e.g., "group1/lat" from "group1/lat/c/0"
-        # e.g., "" if key is "c/0/0/0" (root array)
-        path_before_c = key[:marker_idx]
-
-        # Determine the actual array name (the last component of the path before "/c/")
-        actual_array_name = ""
-        if path_before_c:
-            actual_array_name = path_before_c.split("/")[-1]
-
-        # If the determined array name is in our exclusion list, return None.
-        if actual_array_name in excluded_array_prefixes:
+        # Root-level arrays have no name to discover. Named chunks must exactly match
+        # the array path identified from their zarr.json metadata.
+        if array_path and array_path != self._primary_array_path:
             return None
 
-        # The part after "/c/" contains the chunk coordinates
-        coord_part = key[marker_idx + len(chunk_marker) :]
         parts = coord_part.split("/")
 
         coords = tuple(map(int, parts))
@@ -520,6 +559,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         clone._array_shape = self._array_shape
         clone._chunk_shape = self._chunk_shape
         clone._chunks_per_dim = self._chunks_per_dim
+        clone._primary_array_path = self._primary_array_path
         clone._chunks_per_shard = self._chunks_per_shard
         clone._num_shards = self._num_shards
         clone._total_chunks = self._total_chunks
@@ -678,11 +718,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise PermissionError("Cannot write to a read-only store.")
         await self._resize_complete.wait()
 
-        if key.endswith("zarr.json") and not key == "zarr.json":
+        if key.endswith("zarr.json"):
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
             new_array_shape = metadata_json.get("shape")
+            is_primary_array = self._record_primary_array_path(key, metadata_json)
             # Some metadata entries (e.g., group metadata) do not have a shape field.
-            if new_array_shape:
+            if new_array_shape and is_primary_array:
                 # Only resize when the metadata shape represents the primary array.
                 if (
                     len(new_array_shape) == len(self._array_shape)
@@ -718,6 +759,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return None  # type: ignore[return-value]
 
     async def set_pointer(self, key: str, pointer: str) -> None:
+        if key.endswith("zarr.json") and self._primary_array_path is None:
+            metadata_bytes = await self.cas.load(pointer)
+            metadata_json = json.loads(metadata_bytes)
+            self._record_primary_array_path(key, metadata_json)
+        else:
+            self._record_primary_chunk_path(key)
+
         chunk_coords = self._parse_chunk_key(key)
 
         pointer_cid_obj = CID.decode(pointer)  # Convert string to CID object
@@ -806,6 +854,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
         store_to_graft = await ShardedZarrStore.open(
             cas=self.cas, read_only=True, root_cid=store_to_graft_cid
         )
+        if self._primary_array_path is None and store_to_graft._primary_array_path:
+            self._primary_array_path = store_to_graft._primary_array_path
+            self._root_obj["chunks"]["primary_array_path"] = self._primary_array_path
+            self._dirty_root = True
         source_chunk_grid = store_to_graft._chunks_per_dim
         for local_coords in itertools.product(*[range(s) for s in source_chunk_grid]):
             linear_local_index = store_to_graft._get_linear_chunk_index(local_coords)
