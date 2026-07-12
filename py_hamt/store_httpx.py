@@ -238,6 +238,9 @@ class KuboCAS(ContentAddressedStore):
         self._owns_client: bool = False
         self._closed: bool = True
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+        self._semaphore_per_loop: Dict[
+            asyncio.AbstractEventLoop, asyncio.Semaphore
+        ] = {}
         self._default_headers = headers
         self._default_auth = auth
 
@@ -283,7 +286,9 @@ class KuboCAS(ContentAddressedStore):
         self._default_headers = headers
         self._default_auth = auth
 
-        self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
+        if concurrency < 0:
+            raise ValueError("Semaphore initial value must be >= 0")
+        self._concurrency: int = concurrency
         self._closed = False
 
         # Validate retry parameters
@@ -301,6 +306,27 @@ class KuboCAS(ContentAddressedStore):
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #
     # --------------------------------------------------------------------- #
+    def _loop_semaphore(self) -> asyncio.Semaphore:
+        """Get or create the concurrency semaphore for the running event loop.
+
+        Semaphores cannot be shared safely across event loops once contended,
+        so their lifecycle mirrors the per-loop HTTP clients.
+        """
+        if self._closed:
+            if not self._owns_client:
+                raise RuntimeError("KuboCAS is closed; create a new instance")
+            self._closed = False
+            self._client_per_loop = {}
+            self._semaphore_per_loop = {}
+
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        try:
+            return self._semaphore_per_loop[loop]
+        except KeyError:
+            semaphore = asyncio.Semaphore(self._concurrency)
+            self._semaphore_per_loop[loop] = semaphore
+            return semaphore
+
     def _loop_client(self) -> httpx.AsyncClient:
         """Get or create a client for the current event loop.
 
@@ -317,6 +343,7 @@ class KuboCAS(ContentAddressedStore):
             # state so that new clients can be created lazily.
             self._closed = False
             self._client_per_loop = {}
+            self._semaphore_per_loop = {}
 
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
@@ -359,6 +386,7 @@ class KuboCAS(ContentAddressedStore):
                     pass  # best-effort cleanup
 
         self._client_per_loop.clear()
+        self._semaphore_per_loop.clear()
         self._closed = True
 
     # At this point, _client_per_loop should be empty or only contain
@@ -387,6 +415,7 @@ class KuboCAS(ContentAddressedStore):
                 # We can't await client.aclose() without a loop,
                 # so just clear the references
                 self._client_per_loop.clear()
+                self._semaphore_per_loop.clear()
                 self._closed = True
             return
 
@@ -408,13 +437,14 @@ class KuboCAS(ContentAddressedStore):
             # If all else fails, just clear references
             if hasattr(self, "_client_per_loop"):
                 self._client_per_loop.clear()
+                self._semaphore_per_loop.clear()
                 self._closed = True
 
     # --------------------------------------------------------------------- #
     # save() – now uses the per-loop client                                 #
     # --------------------------------------------------------------------- #
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
-        async with self._sem:
+        async with self._loop_semaphore():
             files = {"file": data}
             client = self._loop_client()
             retry_count = 0
@@ -485,7 +515,7 @@ class KuboCAS(ContentAddressedStore):
         final_status = "ok"
         final_retry_count = 0
         try:
-            async with self._sem:  # Throttle gateway
+            async with self._loop_semaphore():  # Throttle gateway
                 client = self._loop_client()
                 retry_count = 0
 
@@ -553,7 +583,7 @@ class KuboCAS(ContentAddressedStore):
         params = {"arg": str(cid), "recursive": "true"}
         pin_add_url_base: str = f"{target_rpc}/api/v0/pin/add"
 
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(pin_add_url_base, params=params)
             response.raise_for_status()
@@ -569,7 +599,7 @@ class KuboCAS(ContentAddressedStore):
         """
         params = {"arg": str(cid), "recursive": "true"}
         unpin_url_base: str = f"{target_rpc}/api/v0/pin/rm"
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(unpin_url_base, params=params)
             response.raise_for_status()
@@ -589,7 +619,7 @@ class KuboCAS(ContentAddressedStore):
         """
         params = {"arg": [str(old_id), str(new_id)]}
         pin_update_url_base: str = f"{target_rpc}/api/v0/pin/update"
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(pin_update_url_base, params=params)
             response.raise_for_status()
@@ -607,7 +637,7 @@ class KuboCAS(ContentAddressedStore):
             List[CID]: A list of pinned CIDs.
         """
         pin_ls_url_base: str = f"{target_rpc}/api/v0/pin/ls"
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(pin_ls_url_base)
             response.raise_for_status()
