@@ -543,6 +543,53 @@ class HAMT:
                 _, prev_node = node_stack[stack_index - 1]
                 prev_node.replace_link(old_id, new_store_id)
 
+    async def _collect_subtree_entries(
+        self, node: Node, limit: int
+    ) -> dict[str, IPLDKind] | None:
+        """Collect a subtree's entries when they fit in a single bucket."""
+        entries: dict[str, IPLDKind] = {}
+
+        for bucket in node.iter_buckets():
+            if len(entries) + len(bucket) > limit:
+                return None
+            entries.update(bucket)
+
+        for link in node.iter_links():
+            child = await self.node_store.load(link)
+            child_entries = await self._collect_subtree_entries(
+                child, limit - len(entries)
+            )
+            if child_entries is None:
+                return None
+            entries.update(child_entries)
+
+        return entries
+
+    async def _collapse_delete_path(
+        self,
+        node_stack: list[tuple[IPLDKind, Node]],
+        link_indices: list[int],
+    ) -> None:
+        """Collapse small subtrees into parent buckets after a deletion.
+
+        Applying this bottom-up restores the same shape produced by a fresh build:
+        every linked subtree contains more entries than ``max_bucket_size``. This
+        can change CIDs only for trees that previously retained a non-canonical
+        post-delete shape.
+        """
+        node_store = cast(InMemoryTreeStore, self.node_store)
+        for stack_index in range(len(node_stack) - 1, 0, -1):
+            old_id, node = node_stack[stack_index]
+            entries = await self._collect_subtree_entries(node, self.max_bucket_size)
+            if entries is None:
+                continue
+
+            _, parent = node_stack[stack_index - 1]
+            parent.data[link_indices[stack_index - 1]] = entries
+            node_store.remove_clean_node(old_id)
+            node_stack.pop(stack_index)
+            link_indices.pop(stack_index - 1)
+
     # automatically skip encoding if the value provided is of the bytes variety
     async def set(self, key: str, val: IPLDKind) -> None:
         """Write a key-value mapping."""
@@ -644,6 +691,7 @@ class HAMT:
             raw_hash: bytes = self.hash_fn(key.encode())
 
             node_stack: list[tuple[IPLDKind, Node]] = []
+            link_indices: list[int] = []
             root_node: Node = await self.node_store.load(self.root_node_id)
             node_stack.append((self.root_node_id, root_node))
 
@@ -663,10 +711,12 @@ class HAMT:
                 elif isinstance(item, list):
                     link: IPLDKind = item[0]
                     next_node: Node = await self.node_store.load(link)
+                    link_indices.append(map_key)
                     node_stack.append((link, next_node))
 
-            # Finally, reserialize and fix all links, deleting empty nodes as needed
+            # Finally, restore the canonical shape and fix all remaining links.
             if created_change:
+                await self._collapse_delete_path(node_stack, link_indices)
                 await self._reserialize_and_link(node_stack)
                 self.root_node_id = node_stack[0][0]
             else:
