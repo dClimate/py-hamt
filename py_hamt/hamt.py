@@ -424,9 +424,12 @@ class HAMT:
 
     async def enable_write(self) -> None:
         """
-        Enable both reads and writes. This creates an internal structure for performance optimizations which will result in the root node ID no longer being valid, in order to read that at the end of your operations you must first use `make_read_only`.
+        Enable both reads and writes. Calling this while writes are already enabled is a no-op that preserves any buffered changes. The read-only to writable transition creates an internal structure for performance optimizations which will result in the root node ID no longer being valid; to read it at the end of your operations, first use `make_read_only`.
         """
         async with self.lock:
+            if not self.read_only:
+                return
+
             # The read cache has no writes that need to be sent upstream so we can remove it without vacating
             self.read_only = False
             self.node_store = InMemoryTreeStore(self)
