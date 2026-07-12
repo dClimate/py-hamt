@@ -159,7 +159,8 @@ class KuboCAS(ContentAddressedStore):
     ### Parameters
     - **hasher** (str): multihash name (defaults to *blake3*).
     - **client** (`httpx.AsyncClient | None`): reuse an existing
-      client; if *None* KuboCAS will create one lazily.
+      client and its configured timeout; if *None* KuboCAS will create one
+      lazily with a 60-second timeout.
     - **headers** (dict[str, str] | None): default headers for the
       internally-created client.
     - **auth** (`tuple[str, str] | None`): authentication tuple (username, password)
@@ -205,6 +206,8 @@ class KuboCAS(ContentAddressedStore):
 
         A supplied client is associated with the running event loop lazily on
         first use, so constructing ``KuboCAS`` does not require an async context.
+        Its configured timeout is respected. Clients created internally by
+        ``KuboCAS`` use a 60-second timeout.
 
         If you are using the `KuboCAS` instance in an `async with` block, it will automatically close the client when the block is exited which is what we suggest below:
         ```python
@@ -478,9 +481,7 @@ class KuboCAS(ContentAddressedStore):
 
             while retry_count <= self.max_retries:
                 try:
-                    response = await client.post(
-                        self.rpc_url, files=files, timeout=60.0
-                    )
+                    response = await client.post(self.rpc_url, files=files)
                     response.raise_for_status()
                     cid_str: str = response.json()["Hash"]
                     cid: CID = CID.decode(cid_str)
@@ -548,9 +549,7 @@ class KuboCAS(ContentAddressedStore):
 
                 while retry_count <= self.max_retries:
                     try:
-                        response = await client.get(
-                            url, headers=headers or None, timeout=60.0
-                        )
+                        response = await client.get(url, headers=headers or None)
                         response.raise_for_status()
                         content = response.content
                         response_bytes = len(content)
