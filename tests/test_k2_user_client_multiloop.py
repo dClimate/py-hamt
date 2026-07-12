@@ -12,6 +12,21 @@ from py_hamt import KuboCAS
 RecordedHeaders: TypeAlias = dict[str, dict[str, str]]
 
 
+@pytest.fixture(autouse=True)
+def preserve_current_event_loop() -> Iterator[None]:
+    """Restore the current loop after tests that use ``asyncio.run``."""
+    try:
+        previous_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        previous_loop = None
+
+    try:
+        yield
+    finally:
+        if previous_loop is not None:
+            asyncio.set_event_loop(previous_loop)
+
+
 @pytest.fixture
 def recording_gateway() -> Iterator[tuple[str, RecordedHeaders]]:
     """Run an offline HTTP gateway that records headers by requested CID."""

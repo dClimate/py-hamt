@@ -238,11 +238,10 @@ class KuboCAS(ContentAddressedStore):
         self._owns_client: bool = False
         self._closed: bool = True
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+        self._internally_created_clients: set[httpx.AsyncClient] = set()
         self._semaphore_per_loop: Dict[
             asyncio.AbstractEventLoop, asyncio.Semaphore
         ] = {}
-        self._default_headers = headers
-        self._default_auth = auth
 
         # Now, perform validation that might raise an exception
         chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
@@ -277,14 +276,24 @@ class KuboCAS(ContentAddressedStore):
             # Bind the user-supplied client lazily on first async use.
             self._owns_client = False
             self._supplied_client: httpx.AsyncClient | None = client
+            self._user_client: httpx.AsyncClient | None = client
+            self._default_headers: httpx.Headers | dict[str, str] | None = (
+                httpx.Headers(client.headers)
+            )
+            self._default_auth: httpx.Auth | Tuple[str, str] | None = client.auth
+            self._default_timeout: httpx.Timeout | float = client.timeout
+            self._default_limits = self._copy_client_limits(client)
         else:
             # No client supplied. We will own any clients we create.
             self._owns_client = True
             self._supplied_client = None
-
-        # store for later use by _loop_client()
-        self._default_headers = headers
-        self._default_auth = auth
+            self._user_client = None
+            self._default_headers = headers
+            self._default_auth = auth
+            self._default_timeout = 60.0
+            self._default_limits = httpx.Limits(
+                max_connections=64, max_keepalive_connections=32
+            )
 
         if concurrency < 0:
             raise ValueError("Semaphore initial value must be >= 0")
@@ -303,6 +312,21 @@ class KuboCAS(ContentAddressedStore):
         self.initial_delay = initial_delay
         self.backoff_factor = backoff_factor
 
+    @staticmethod
+    def _copy_client_limits(client: httpx.AsyncClient) -> httpx.Limits:
+        """Copy connection limits from a standard HTTPX async transport.
+
+        HTTPX does not expose client limits publicly, so custom transports fall
+        back to the limits KuboCAS uses for its own clients.
+        """
+        transport: Any = client._transport
+        pool: Any = getattr(transport, "_pool", None)
+        return httpx.Limits(
+            max_connections=getattr(pool, "_max_connections", 64),
+            max_keepalive_connections=getattr(pool, "_max_keepalive_connections", 32),
+            keepalive_expiry=getattr(pool, "_keepalive_expiry", 5.0),
+        )
+
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #
     # --------------------------------------------------------------------- #
@@ -317,6 +341,7 @@ class KuboCAS(ContentAddressedStore):
                 raise RuntimeError("KuboCAS is closed; create a new instance")
             self._closed = False
             self._client_per_loop = {}
+            self._internally_created_clients = set()
             self._semaphore_per_loop = {}
 
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
@@ -354,15 +379,14 @@ class KuboCAS(ContentAddressedStore):
                 self._supplied_client = None
             else:
                 client = httpx.AsyncClient(
-                    timeout=60.0,
+                    timeout=self._default_timeout,
                     headers=self._default_headers,
                     auth=self._default_auth,
-                    limits=httpx.Limits(
-                        max_connections=64, max_keepalive_connections=32
-                    ),
+                    limits=self._default_limits,
                     # Uncomment when they finally support Robust HTTP/2 GOAWAY responses
                     # http2=True,
                 )
+                self._internally_created_clients.add(client)
             self._client_per_loop[loop] = client
             return client
 
@@ -371,14 +395,13 @@ class KuboCAS(ContentAddressedStore):
     # --------------------------------------------------------------------- #
     async def aclose(self) -> None:
         """
-        Closes all internally-created clients. Must be called from an async context.
-        """
-        if self._owns_client is False:  # external client → caller closes
-            return
+        Close every internally-created client, leaving a supplied client open.
 
+        Must be called from an async context.
+        """
         # This method is async, so we can reliably await the async close method.
         # The complex sync/async logic is handled by __del__.
-        for client in list(self._client_per_loop.values()):
+        for client in list(self._internally_created_clients):
             if not client.is_closed:
                 try:
                     await client.aclose()
@@ -386,6 +409,7 @@ class KuboCAS(ContentAddressedStore):
                     pass  # best-effort cleanup
 
         self._client_per_loop.clear()
+        self._internally_created_clients.clear()
         self._semaphore_per_loop.clear()
         self._closed = True
 
@@ -402,7 +426,10 @@ class KuboCAS(ContentAddressedStore):
         if not hasattr(self, "_owns_client") or not hasattr(self, "_closed"):
             return
 
-        if not self._owns_client or self._closed:
+        if (
+            not self._owns_client
+            and not getattr(self, "_internally_created_clients", set())
+        ) or self._closed:
             return
 
         # Attempt proper cleanup if possible
