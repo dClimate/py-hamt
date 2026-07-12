@@ -6,6 +6,11 @@ from py_hamt import KuboCAS
 
 
 def test_contended_loads_work_across_sequential_event_loops() -> None:
+    try:
+        previous_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        previous_loop = None
+
     expected_body = b"loaded from the mock gateway"
     request_started = threading.Event()
     release_response = threading.Event()
@@ -54,3 +59,5 @@ def test_contended_loads_work_across_sequential_event_loops() -> None:
         server.shutdown()
         server.server_close()
         server_thread.join()
+        if previous_loop is not None:
+            asyncio.set_event_loop(previous_loop)
