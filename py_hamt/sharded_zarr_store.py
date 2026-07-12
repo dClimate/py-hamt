@@ -385,18 +385,71 @@ class ShardedZarrStore(zarr.abc.store.Store):
             self._root_obj["chunks"]["primary_array_path"] = array_path
             self._dirty_root = True
 
+    def _metadata_matches_store_geometry(self, metadata: dict) -> bool:
+        """Return whether array metadata exactly matches the sharded geometry."""
+        chunk_grid = metadata.get("chunk_grid")
+        if not isinstance(chunk_grid, dict) or chunk_grid.get("name") != "regular":
+            return False
+
+        configuration = chunk_grid.get("configuration")
+        if not isinstance(configuration, dict):
+            return False
+
+        shape = metadata.get("shape")
+        chunk_shape = configuration.get("chunk_shape")
+        return (
+            isinstance(shape, list)
+            and tuple(shape) == self._array_shape
+            and isinstance(chunk_shape, list)
+            and tuple(chunk_shape) == self._chunk_shape
+        )
+
     async def _derive_primary_array_path(self) -> None:
         """Derive the primary array path when opening a legacy manifest."""
-        for key, metadata_cid in self._root_obj.get("metadata", {}).items():
-            if self._array_path_from_metadata_key(key) is None:
+        root_metadata = self._root_obj.get("metadata", {})
+        if not isinstance(root_metadata, dict):
+            return
+
+        candidate_paths: list[str] = []
+        exact_candidate_paths: list[str] = []
+        metadata_keys = tuple(root_metadata)
+
+        for key, metadata_cid in root_metadata.items():
+            if not isinstance(key, str):
                 continue
+            array_path = self._array_path_from_metadata_key(key)
+            if array_path is None:
+                continue
+
+            chunk_prefix = f"{array_path}/c/" if array_path else "c/"
+            if any(
+                isinstance(metadata_key, str) and metadata_key.startswith(chunk_prefix)
+                for metadata_key in metadata_keys
+            ):
+                # Legacy manifests stored auxiliary chunks in this dictionary;
+                # primary chunks live in the shard index instead.
+                continue
+
             try:
                 metadata_bytes = await self.cas.load(str(metadata_cid))
                 metadata = json.loads(metadata_bytes)
             except (TypeError, ValueError):
                 continue
-            if self._record_primary_array_path(key, metadata, persist=False):
-                return
+            if not isinstance(metadata, dict):
+                continue
+
+            shape = metadata.get("shape")
+            if not isinstance(shape, list) or len(shape) != len(self._array_shape):
+                continue
+
+            candidate_paths.append(array_path)
+            if self._metadata_matches_store_geometry(metadata):
+                exact_candidate_paths.append(array_path)
+
+        if len(exact_candidate_paths) == 1:
+            self._primary_array_path = exact_candidate_paths[0]
+        elif not exact_candidate_paths and len(candidate_paths) == 1:
+            self._primary_array_path = candidate_paths[0]
 
     def _parse_chunk_key(self, key: str) -> Optional[Tuple[int, ...]]:
         """Parse chunk coordinates only for the store's primary array."""
