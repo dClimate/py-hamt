@@ -739,7 +739,10 @@ class HAMT:
         """
         AsyncIterator returning all keys in the HAMT.
 
-        If the HAMT is write enabled, to maintain strong consistency this will obtain an async lock and not allow any other operations to proceed.
+        If the HAMT is write enabled, the keys present when iteration starts are
+        copied while holding the async lock. The lock is released before any key
+        is yielded, so reads and mutations are safe between iterations and do not
+        affect the keys returned by an iteration already in progress.
 
         When the HAMT is in read only mode however, this can be run concurrently with get operations.
         """
@@ -747,9 +750,12 @@ class HAMT:
             async for k in self._keys_no_locking():
                 yield k
         else:
+            # Buffered nodes are mutable, so copying only the root ID would not
+            # isolate iteration from mutations made after a caller-visible yield.
             async with self.lock:
-                async for k in self._keys_no_locking():
-                    yield k
+                keys_snapshot = [key async for key in self._keys_no_locking()]
+            for key in keys_snapshot:
+                yield key
 
     async def _keys_no_locking(self) -> AsyncIterator[str]:
         async for _, node in self._iter_nodes():
@@ -761,7 +767,10 @@ class HAMT:
         """
         Return the number of key value mappings in this HAMT.
 
-        When the HAMT is write enabled, to maintain strong consistency it will acquire a lock and thus not allow any other operations to proceed until the length is fully done being calculated. If read only, then this can be run concurrently with other operations.
+        When the HAMT is write enabled, this counts a snapshot of the keys taken
+        under the async lock. The lock is released before counting, so concurrent
+        mutations do not affect this result. If read only, then this can be run
+        concurrently with other operations.
         """
         count: int = 0
         async for _ in self.keys():
