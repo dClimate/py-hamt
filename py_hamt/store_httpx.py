@@ -203,6 +203,9 @@ class KuboCAS(ContentAddressedStore):
         If `client` is not provided, it will be automatically initialized. It is the responsibility of the user to close this at an appropriate time, using `await cas.aclose()`
         as a class instance cannot know when it will no longer be in use, unless explicitly told to do so.
 
+        A supplied client is associated with the running event loop lazily on
+        first use, so constructing ``KuboCAS`` does not require an async context.
+
         If you are using the `KuboCAS` instance in an `async with` block, it will automatically close the client when the block is exited which is what we suggest below:
         ```python
         async with httpx.AsyncClient() as client, KuboCAS(
@@ -268,13 +271,13 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
 
         if client is not None:
-            # A client was supplied by the user. We don't own it.
+            # Bind the user-supplied client lazily on first async use.
             self._owns_client = False
-            self._client_per_loop = {asyncio.get_running_loop(): client}
+            self._supplied_client: httpx.AsyncClient | None = client
         else:
             # No client supplied. We will own any clients we create.
             self._owns_client = True
-            self._client_per_loop = {}
+            self._supplied_client = None
 
         # store for later use by _loop_client()
         self._default_headers = headers
@@ -301,8 +304,9 @@ class KuboCAS(ContentAddressedStore):
     def _loop_client(self) -> httpx.AsyncClient:
         """Get or create a client for the current event loop.
 
+        A user-supplied client is bound to the first loop that requests it.
         If the instance was previously closed but owns its clients, a fresh
-        client mapping is lazily created on demand.  Users that supplied their
+        client mapping is lazily created on demand. Users that supplied their
         own ``httpx.AsyncClient`` still receive an error when the instance has
         been closed, as we cannot safely recreate their client.
         """
@@ -318,15 +322,20 @@ class KuboCAS(ContentAddressedStore):
         try:
             return self._client_per_loop[loop]
         except KeyError:
-            # Create a new client
-            client = httpx.AsyncClient(
-                timeout=60.0,
-                headers=self._default_headers,
-                auth=self._default_auth,
-                limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
-                # Uncomment when they finally support Robust HTTP/2 GOAWAY responses
-                # http2=True,
-            )
+            if self._supplied_client is not None:
+                client = self._supplied_client
+                self._supplied_client = None
+            else:
+                client = httpx.AsyncClient(
+                    timeout=60.0,
+                    headers=self._default_headers,
+                    auth=self._default_auth,
+                    limits=httpx.Limits(
+                        max_connections=64, max_keepalive_connections=32
+                    ),
+                    # Uncomment when they finally support Robust HTTP/2 GOAWAY responses
+                    # http2=True,
+                )
             self._client_per_loop[loop] = client
             return client
 

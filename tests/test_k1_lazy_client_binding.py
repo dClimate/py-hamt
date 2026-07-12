@@ -16,6 +16,7 @@ def test_supplied_client_is_bound_lazily_outside_event_loop() -> None:
         return httpx.Response(200, content=expected_body, request=request)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handle_request))
+    loop = asyncio.new_event_loop()
     try:
         cas = KuboCAS(
             client=client,
@@ -32,10 +33,11 @@ def test_supplied_client_is_bound_lazily_outside_event_loop() -> None:
             finally:
                 await client.aclose()
 
-        loaded = asyncio.run(load_and_close())
+        loaded = loop.run_until_complete(load_and_close())
     finally:
         if not client.is_closed:
-            asyncio.run(client.aclose())
+            loop.run_until_complete(client.aclose())
+        loop.close()
 
     assert loaded == expected_body
     assert len(requests) == 1
