@@ -197,6 +197,32 @@ class InMemoryTreeStore(NodeStore):
         self.hamt: HAMT = hamt
         # The integer key is a uuidv4 128-bit integer, for (almost perfectly) guaranteeing uniqueness
         self.buffer: dict[int, Node] = {}
+        # CAS IDs identify immutable data, so clean nodes can be reused until the
+        # cache is explicitly vacated. Dirty nodes remain exclusively in buffer.
+        self.clean_cache: dict[IPLDKind, Node] = {}
+
+    def get_clean_node(self, id: IPLDKind) -> Node | None:
+        """Return a cached CAS node, or None for misses and unhashable IDs."""
+        try:
+            return self.clean_cache.get(id)
+        except TypeError:
+            return None
+
+    def cache_clean_node(self, id: IPLDKind, node: Node) -> None:
+        """Cache a CAS node when its IPLD identifier is hashable."""
+        try:
+            self.clean_cache[id] = node
+        except TypeError:
+            # CAS implementations normally use bytes or CID objects. Gracefully
+            # skip caching for a custom store that returns another IPLD kind.
+            pass
+
+    def remove_clean_node(self, id: IPLDKind) -> None:
+        """Stop serving a clean node once that object becomes dirty."""
+        try:
+            self.clean_cache.pop(id, None)
+        except TypeError:
+            pass
 
     def is_buffer_id(self, id: IPLDKind) -> bool:
         return id in self.buffer
@@ -222,6 +248,11 @@ class InMemoryTreeStore(NodeStore):
                 if self.is_buffer_id(copied.get_link(link_index)):
                     copied.set_link(link_index, InMemoryTreeStore._replaced_id_marker)
             total += len(copied.serialize())
+
+        # Clean cached nodes contain only serializable CAS links and therefore do
+        # not need the buffer-ID substitution used for dirty nodes above.
+        for node in self.clean_cache.values():
+            total += len(node.serialize())
 
         return total
 
@@ -271,6 +302,7 @@ class InMemoryTreeStore(NodeStore):
         # 2. A bunch of empty nodes leftover if the key values they contain are deleted, these would normally be consolidated by a content addressed system but will be leftover in the buffer
         # So we can just clear out everything since these nodes are not used by the rest of the tree
         self.buffer = {}
+        self.clean_cache = {}
 
     async def add_to_buffer(self, node: Node) -> IPLDKind:
         # This buffer_id is IPLDKind type since technically it's an int, but it's not dag_cbor serializable since that library can only do up to 64-bit ints. Thus this will throw errors early if a node is written with buffer_ids still in there
@@ -283,6 +315,10 @@ class InMemoryTreeStore(NodeStore):
         if self.is_buffer_id(original_id):
             return original_id
 
+        # The caller may have modified a node returned by load(). Do not leave
+        # that object cached under the CID of its original immutable contents.
+        self.remove_clean_node(original_id)
+
         # This node was not in the buffer, don't save it to the backing store but rather add to it to the in memory buffer
         buffer_id: IPLDKind = await self.add_to_buffer(node)
         return buffer_id
@@ -293,9 +329,13 @@ class InMemoryTreeStore(NodeStore):
             node: Node = self.buffer[cast(int, id)]  # we know all buffer ids are ints
             return node
 
-        # Something that isn't in the in memory tree, add it
+        clean_node = self.get_clean_node(id)
+        if clean_node is not None:
+            return clean_node
+
+        # CAS-loaded nodes are clean and keyed by their immutable content ID.
         node = Node.deserialize(await self.hamt.cas.load(id))
-        await self.add_to_buffer(node)
+        self.cache_clean_node(id, node)
         return node
 
 
