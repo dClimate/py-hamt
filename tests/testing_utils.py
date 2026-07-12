@@ -5,9 +5,55 @@ import time
 from urllib.parse import urlparse
 
 import pytest
+from dag_cbor.ipld import IPLDKind
 from hypothesis import strategies as st
 from hypothesis.strategies import SearchStrategy
-from multiformats import CID
+from multiformats import CID, multihash
+
+from py_hamt import ContentAddressedStore
+
+
+def _normalize_cid(identifier: IPLDKind) -> str:
+    """Normalize a CID object or string to a stable base32 key."""
+    if isinstance(identifier, CID):
+        cid = identifier
+    elif isinstance(identifier, str):
+        cid = CID.decode(identifier)
+    else:
+        raise TypeError(
+            f"Expected a CID or CID string, got {type(identifier).__name__}"
+        )
+    return cid.set(base="base32").encode("base32")
+
+
+class CIDInMemoryCAS(ContentAddressedStore):
+    """Offline in-memory CAS whose object identifiers are valid CIDs."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, bytes] = {}
+        self._hash_algorithm = multihash.get("blake3")
+
+    async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
+        digest = self._hash_algorithm.digest(data, size=32)
+        cid = CID("base32", 1, codec, digest)
+        self.store[_normalize_cid(cid)] = data
+        return cid
+
+    async def load(
+        self,
+        id: IPLDKind,
+        offset: int | None = None,
+        length: int | None = None,
+        suffix: int | None = None,
+    ) -> bytes:
+        data = self.store[_normalize_cid(id)]
+        if offset is not None:
+            if length is not None:
+                return data[offset : offset + length]
+            return data[offset:]
+        if suffix is not None:
+            return data[-suffix:]
+        return data
 
 
 def cid_strategy() -> SearchStrategy:
