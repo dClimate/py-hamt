@@ -521,51 +521,77 @@ class HAMT:
         await self._set_pointer(key, pointer)
 
     async def _set_pointer(self, key: str, val_ptr: IPLDKind) -> None:
+        """Set a value pointer without exposing partial tree mutations on failure."""
         async with self.lock:
-            node_stack: list[tuple[IPLDKind, Node]] = []
-            root_node: Node = await self.node_store.load(self.root_node_id)
-            node_stack.append((self.root_node_id, root_node))
+            node_store = cast(InMemoryTreeStore, self.node_store)
+            original_buffer_ids: set[int] = set(node_store.buffer)
+            original_node_data: dict[int, tuple[Node, list[IPLDKind]]] = {}
 
-            # FIFO queue to keep track of all the KVs we need to insert
-            # This is needed if any buckets overflow and so we need to reinsert all those KVs
-            kvs_queue: list[tuple[str, IPLDKind]] = []
-            kvs_queue.append((key, val_ptr))
+            def preserve_node(node: Node) -> None:
+                node_identity = id(node)
+                if node_identity not in original_node_data:
+                    original_node_data[node_identity] = (node, deepcopy(node.data))
 
-            while len(kvs_queue) > 0:
-                _, top_node = node_stack[-1]
-                curr_key, curr_val_ptr = kvs_queue[0]
+            try:
+                node_stack: list[tuple[IPLDKind, Node]] = []
+                root_node: Node = await self.node_store.load(self.root_node_id)
+                node_stack.append((self.root_node_id, root_node))
 
-                raw_hash: bytes = self.hash_fn(curr_key.encode())
-                map_key: int = extract_bits(raw_hash, len(node_stack) - 1, 8)
+                # FIFO queue to keep track of all the KVs we need to insert
+                # This is needed if any buckets overflow and so we need to reinsert all those KVs
+                kvs_queue: list[tuple[str, IPLDKind]] = []
+                kvs_queue.append((key, val_ptr))
 
-                item = top_node.data[map_key]
-                if isinstance(item, list):
-                    next_node_id: IPLDKind = item[0]
-                    next_node: Node = await self.node_store.load(next_node_id)
-                    node_stack.append((next_node_id, next_node))
-                elif isinstance(item, dict):
-                    bucket: dict[str, IPLDKind] = item
+                while len(kvs_queue) > 0:
+                    _, top_node = node_stack[-1]
+                    curr_key, curr_val_ptr = kvs_queue[0]
 
-                    # If this bucket already has this same key, or has space, just rewrite the value and then go work on the others in the queue
-                    if curr_key in bucket or len(bucket) < self.max_bucket_size:
-                        bucket[curr_key] = curr_val_ptr
-                        kvs_queue.pop(0)
-                        continue
+                    raw_hash: bytes = self.hash_fn(curr_key.encode())
+                    map_key: int = extract_bits(raw_hash, len(node_stack) - 1, 8)
 
-                    # The current key is not in the bucket and the bucket is too full, so empty KVs from the bucket and restart insertion
-                    for k in bucket:
-                        v_ptr = bucket[k]
-                        kvs_queue.append((k, v_ptr))
+                    item = top_node.data[map_key]
+                    if isinstance(item, list):
+                        next_node_id: IPLDKind = item[0]
+                        next_node: Node = await self.node_store.load(next_node_id)
+                        node_stack.append((next_node_id, next_node))
+                    elif isinstance(item, dict):
+                        bucket: dict[str, IPLDKind] = item
 
-                    # Create a new link to a new node so that we can reflow these KVs into a new subtree
-                    new_node = Node()
-                    new_node_id: IPLDKind = await self.node_store.save(None, new_node)
-                    link: list[IPLDKind] = [new_node_id]
-                    top_node.data[map_key] = link
+                        # If this bucket already has this same key, or has space, just rewrite the value and then go work on the others in the queue
+                        if curr_key in bucket or len(bucket) < self.max_bucket_size:
+                            preserve_node(top_node)
+                            bucket[curr_key] = curr_val_ptr
+                            kvs_queue.pop(0)
+                            continue
 
-            # Finally, reserialize and fix all links, deleting empty nodes as needed
-            await self._reserialize_and_link(node_stack)
-            self.root_node_id = node_stack[0][0]
+                        # The current key is not in the bucket and the bucket is too full, so empty KVs from the bucket and restart insertion
+                        for k in bucket:
+                            v_ptr = bucket[k]
+                            kvs_queue.append((k, v_ptr))
+
+                        # Create a new link to a new node so that we can reflow these KVs into a new subtree
+                        new_node = Node()
+                        new_node_id: IPLDKind = await self.node_store.save(
+                            None, new_node
+                        )
+                        link: list[IPLDKind] = [new_node_id]
+                        preserve_node(top_node)
+                        top_node.data[map_key] = link
+
+                # Relinking can mutate any ancestor, so retain every traversed node
+                # until serialization has completed successfully.
+                for _, node in node_stack:
+                    preserve_node(node)
+
+                # Finally, reserialize and fix all links, deleting empty nodes as needed
+                await self._reserialize_and_link(node_stack)
+                self.root_node_id = node_stack[0][0]
+            except BaseException:
+                for node, original_data in original_node_data.values():
+                    node.data = original_data
+                for buffer_id in set(node_store.buffer) - original_buffer_ids:
+                    del node_store.buffer[buffer_id]
+                raise
 
     async def delete(self, key: str) -> None:
         """Delete a key-value mapping."""
