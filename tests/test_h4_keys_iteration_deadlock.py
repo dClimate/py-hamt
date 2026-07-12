@@ -51,3 +51,29 @@ async def test_get_inside_keys_iteration_does_not_deadlock() -> None:
         )
 
     assert values_seen == expected_values
+
+
+@pytest.mark.asyncio
+async def test_keys_iteration_uses_snapshot_when_mutated_between_yields() -> None:
+    hamt = await HAMT.build(cas=InMemoryCAS(), max_bucket_size=1)
+    original_values = {f"key-{index}": f"value-{index}".encode() for index in range(20)}
+    for key, value in original_values.items():
+        await hamt.set(key, value)
+
+    keys_iterator = hamt.keys()
+    first_key = await anext(keys_iterator)
+
+    deleted_key = next(key for key in original_values if key != first_key)
+    await asyncio.gather(
+        hamt.delete(deleted_key),
+        hamt.set("added", b"new value"),
+    )
+    iterated_keys = {first_key, *[key async for key in keys_iterator]}
+
+    assert iterated_keys == set(original_values)
+
+    expected_values = original_values | {"added": b"new value"}
+    del expected_values[deleted_key]
+    assert set([key async for key in hamt.keys()]) == set(expected_values)
+    for key, expected_value in expected_values.items():
+        assert await hamt.get(key) == expected_value
