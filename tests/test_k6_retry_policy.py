@@ -1,0 +1,170 @@
+import socket
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import httpx
+import pytest
+from multiformats import CID
+
+from py_hamt import KuboCAS
+
+EXPECTED_BODY = b"gateway response after transient failures"
+TEST_CID = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
+
+
+@pytest.fixture
+def retrying_kubo_server() -> Iterator[tuple[str, dict[str, int]]]:
+    """Serve deterministic transient and permanent Kubo HTTP responses."""
+    hit_counts: dict[str, int] = {}
+
+    class RetryHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def _record_hit(self, key: str) -> int:
+            hit_counts[key] = hit_counts.get(key, 0) + 1
+            return hit_counts[key]
+
+        def _send_response(
+            self,
+            status: int,
+            body: bytes = b"",
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            self.send_response(status)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            cid = self.path.rsplit("/", 1)[-1].split("?", 1)[0]
+            attempt = self._record_hit(cid)
+
+            if cid == "transient-500" and attempt <= 2:
+                self._send_response(500)
+                return
+            if cid == "rate-limited" and attempt == 1:
+                self._send_response(429, headers={"Retry-After": "0"})
+                return
+            if cid == "missing":
+                self._send_response(404)
+                return
+            self._send_response(200, EXPECTED_BODY)
+
+        def do_POST(self) -> None:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(content_length)
+            attempt = self._record_hit("POST")
+            if attempt <= 2:
+                self._send_response(500)
+                return
+
+            response_body = ('{"Hash":"' + str(TEST_CID) + '"}').encode()
+            self._send_response(
+                200,
+                response_body,
+                headers={"Content-Type": "application/json"},
+            )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RetryHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        yield url, hit_counts
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+
+def make_cas(url: str, *, max_retries: int = 3) -> KuboCAS:
+    return KuboCAS(
+        gateway_base_url=url,
+        rpc_base_url=url,
+        max_retries=max_retries,
+        initial_delay=0.01,
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_retries_transient_500_responses(
+    retrying_kubo_server: tuple[str, dict[str, int]],
+) -> None:
+    url, hit_counts = retrying_kubo_server
+    cas = make_cas(url)
+    try:
+        result = await cas.load("transient-500")
+    finally:
+        await cas.aclose()
+
+    assert result == EXPECTED_BODY
+    assert hit_counts["transient-500"] == 3
+
+
+@pytest.mark.asyncio
+async def test_load_retries_429_with_retry_after(
+    retrying_kubo_server: tuple[str, dict[str, int]],
+) -> None:
+    url, hit_counts = retrying_kubo_server
+    cas = make_cas(url)
+    try:
+        result = await cas.load("rate-limited")
+    finally:
+        await cas.aclose()
+
+    assert result == EXPECTED_BODY
+    assert hit_counts["rate-limited"] == 2
+
+
+@pytest.mark.asyncio
+async def test_load_preserves_connect_error_after_retries() -> None:
+    with socket.socket() as ephemeral_socket:
+        ephemeral_socket.bind(("127.0.0.1", 0))
+        dead_port = ephemeral_socket.getsockname()[1]
+
+    dead_url = f"http://127.0.0.1:{dead_port}"
+    cas = make_cas(dead_url, max_retries=2)
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await cas.load("unreachable")
+    finally:
+        await cas.aclose()
+
+
+@pytest.mark.asyncio
+async def test_load_does_not_retry_404(
+    retrying_kubo_server: tuple[str, dict[str, int]],
+) -> None:
+    url, hit_counts = retrying_kubo_server
+    cas = make_cas(url)
+    try:
+        with pytest.raises(httpx.HTTPStatusError) as error:
+            await cas.load("missing")
+    finally:
+        await cas.aclose()
+
+    assert error.value.response.status_code == 404
+    assert hit_counts["missing"] == 1
+
+
+@pytest.mark.asyncio
+async def test_save_retries_transient_500_responses(
+    retrying_kubo_server: tuple[str, dict[str, int]],
+) -> None:
+    url, hit_counts = retrying_kubo_server
+    cas = make_cas(url)
+    try:
+        result = await cas.save(b"content-addressed upload", codec="raw")
+    finally:
+        await cas.aclose()
+
+    assert isinstance(result, CID)
+    assert hit_counts["POST"] == 3
