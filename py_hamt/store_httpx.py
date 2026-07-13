@@ -3,6 +3,8 @@ import logging
 import random
 import re
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Literal, Optional, Tuple, cast
 
 import httpx
@@ -13,6 +15,38 @@ from multiformats.multihash import Multihash
 from . import instrumentation
 
 logger = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _retry_delay(
+    initial_delay: float,
+    backoff_factor: float,
+    retry_number: int,
+    response: Optional[httpx.Response] = None,
+) -> float:
+    """Return a jittered backoff, capped by a valid ``Retry-After`` value."""
+    backoff_delay = initial_delay * (backoff_factor ** (retry_number - 1))
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after is not None:
+        try:
+            retry_after_seconds = float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                retry_after_seconds = (
+                    retry_at - datetime.now(timezone.utc)
+                ).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                retry_after_seconds = -1
+
+        if retry_after_seconds >= 0:
+            return min(retry_after_seconds, backoff_delay)
+
+    jitter = backoff_delay * 0.1 * (random.random() - 0.5)
+    return backoff_delay + jitter
 
 
 def _slice_requested_range(
@@ -495,6 +529,12 @@ class KuboCAS(ContentAddressedStore):
     # save() – now uses the per-loop client                                 #
     # --------------------------------------------------------------------- #
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
+        """Add data to Kubo and return its CID.
+
+        Transient request failures and gateway statuses are retried. Retrying
+        the ``/api/v0/add`` POST is safe because the uploaded content is
+        content-addressed, making repeated additions idempotent.
+        """
         async with self._loop_semaphore():
             files = {"file": data}
             client = self._loop_client()
@@ -510,27 +550,30 @@ class KuboCAS(ContentAddressedStore):
                         cid = cid.set(codec=codec)
                     return cid
 
-                except (httpx.TimeoutException, httpx.RequestError) as e:
+                except httpx.RequestError:
+                    if retry_count >= self.max_retries:
+                        raise
                     retry_count += 1
-                    if retry_count > self.max_retries:
-                        raise httpx.TimeoutException(
-                            f"Failed to save data after {self.max_retries} retries: {str(e)}",
-                            request=e.request
-                            if isinstance(e, httpx.RequestError)
-                            else None,
+                    await asyncio.sleep(
+                        _retry_delay(
+                            self.initial_delay, self.backoff_factor, retry_count
                         )
-
-                    # Calculate backoff delay
-                    delay = self.initial_delay * (
-                        self.backoff_factor ** (retry_count - 1)
                     )
-                    # Add some jitter to prevent thundering herd
-                    jitter = delay * 0.1 * (random.random() - 0.5)
-                    await asyncio.sleep(delay + jitter)
 
-                except httpx.HTTPStatusError:
-                    # Re-raise non-timeout HTTP errors immediately
-                    raise
+                except httpx.HTTPStatusError as error:
+                    if error.response.status_code not in _RETRYABLE_STATUS_CODES:
+                        raise
+                    if retry_count >= self.max_retries:
+                        raise
+                    retry_count += 1
+                    await asyncio.sleep(
+                        _retry_delay(
+                            self.initial_delay,
+                            self.backoff_factor,
+                            retry_count,
+                            error.response,
+                        )
+                    )
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     async def load(
@@ -543,8 +586,10 @@ class KuboCAS(ContentAddressedStore):
         """Load all or part of a CID using the IPFS gateway.
 
         Gateways that ignore a Range header and return a complete ``200`` body
-        are handled by applying the requested byte window locally. Zero-length
-        and zero-suffix reads return immediately without a gateway request.
+        are handled by applying the requested byte window locally. Transient
+        request failures, rate limits, and gateway server errors are retried;
+        other HTTP errors fail immediately. Zero-length and zero-suffix reads
+        return immediately without a gateway request.
         """
         if (offset is not None and length == 0) or (offset is None and suffix == 0):
             return b""
@@ -594,30 +639,35 @@ class KuboCAS(ContentAddressedStore):
                             )
                         return content
 
-                    except (httpx.TimeoutException, httpx.RequestError) as e:
-                        retry_count += 1
-                        if retry_count > self.max_retries:
-                            final_status = "timeout"
+                    except httpx.RequestError:
+                        if retry_count >= self.max_retries:
+                            final_status = "request_error"
                             final_retry_count = retry_count
-                            raise httpx.TimeoutException(
-                                f"Failed to load data after {self.max_retries} retries: {str(e)}",
-                                request=e.request
-                                if isinstance(e, httpx.RequestError)
-                                else None,
+                            raise
+                        retry_count += 1
+                        await asyncio.sleep(
+                            _retry_delay(
+                                self.initial_delay, self.backoff_factor, retry_count
                             )
-
-                        # Calculate backoff delay with jitter
-                        delay = self.initial_delay * (
-                            self.backoff_factor ** (retry_count - 1)
                         )
-                        jitter = delay * 0.1 * (random.random() - 0.5)
-                        await asyncio.sleep(delay + jitter)
 
-                    except httpx.HTTPStatusError:
-                        # Re-raise non-timeout HTTP errors immediately
-                        final_status = "http_error"
-                        final_retry_count = retry_count
-                        raise
+                    except httpx.HTTPStatusError as error:
+                        if (
+                            error.response.status_code not in _RETRYABLE_STATUS_CODES
+                            or retry_count >= self.max_retries
+                        ):
+                            final_status = "http_error"
+                            final_retry_count = retry_count
+                            raise
+                        retry_count += 1
+                        await asyncio.sleep(
+                            _retry_delay(
+                                self.initial_delay,
+                                self.backoff_factor,
+                                retry_count,
+                                error.response,
+                            )
+                        )
         finally:
             instrumentation.end_cas_load(
                 trace_started_at,
