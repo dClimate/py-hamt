@@ -495,12 +495,16 @@ class HAMT:
                 await self.node_store.vacate()
 
     async def _reserialize_and_link(
-        self, node_stack: list[tuple[IPLDKind, Node]]
+        self,
+        node_stack: list[tuple[IPLDKind, Node]],
+        link_path: list[int],
     ) -> None:
         """
         This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
         Takes a stack of nodes, we represent a stack with a list where the first element is the root element and the last element is the top of the stack
         Each element in the list is a tuple where the first element is the ID from the store and the second element is the Node in python
+        `link_path[i]` is the index in `node_stack[i - 1]` through which
+        `node_stack[i]` is linked. The root entry at index zero is a sentinel.
         If a node ends up being empty, then it is deleted entirely, unless it is the root node
         Modifies in place
         """
@@ -511,18 +515,13 @@ class HAMT:
             # If this node is empty, and it's not the root node, then we can delete it entirely from the list
             is_root: bool = stack_index == 0
             if node.is_empty() and not is_root:
-                # Unlink from the rest of the tree
+                # Unlink from the rest of the tree using the recorded parent slot.
                 _, prev_node = node_stack[stack_index - 1]
-                # When removing links, don't worry about two nodes having the same link since all nodes are guaranteed to be different by the removal of empty nodes after every single operation
-                for link_index in prev_node.iter_link_indices():
-                    link = prev_node.get_link(link_index)
-                    if link == old_id:
-                        # Delete the link by making it an empty bucket
-                        prev_node.data[link_index] = {}
-                        break
+                prev_node.data[link_path[stack_index]] = {}
 
                 # Remove from our stack, continue reserializing up the tree
                 node_stack.pop(stack_index)
+                link_path.pop(stack_index)
                 continue
 
             # If not an empty node, just reserialize like normal and replace this one
@@ -532,7 +531,7 @@ class HAMT:
             # If this is not the last i.e. root node, we need to change the linking of the node prior in the list since we just reserialized
             if not is_root:
                 _, prev_node = node_stack[stack_index - 1]
-                prev_node.replace_link(old_id, new_store_id)
+                prev_node.set_link(link_path[stack_index], new_store_id)
 
     async def _collect_subtree_entries(
         self, node: Node, limit: int
@@ -559,7 +558,7 @@ class HAMT:
     async def _collapse_delete_path(
         self,
         node_stack: list[tuple[IPLDKind, Node]],
-        link_indices: list[int],
+        link_path: list[int],
     ) -> None:
         """Collapse small subtrees into parent buckets after a deletion.
 
@@ -576,10 +575,10 @@ class HAMT:
                 continue
 
             _, parent = node_stack[stack_index - 1]
-            parent.data[link_indices[stack_index - 1]] = entries
+            parent.data[link_path[stack_index]] = entries
             node_store.remove_clean_node(old_id)
             node_stack.pop(stack_index)
-            link_indices.pop(stack_index - 1)
+            link_path.pop(stack_index)
 
     # automatically skip encoding if the value provided is of the bytes variety
     async def set(self, key: str, val: IPLDKind) -> None:
@@ -612,19 +611,20 @@ class HAMT:
 
             try:
                 node_stack: list[tuple[IPLDKind, Node]] = []
+                link_path: list[int] = [-1]
                 root_node: Node = await self.node_store.load(self.root_node_id)
                 node_stack.append((self.root_node_id, root_node))
 
                 # FIFO queue to keep track of all the KVs we need to insert
                 # This is needed if any buckets overflow and so we need to reinsert all those KVs
-                kvs_queue: list[tuple[str, IPLDKind]] = []
-                kvs_queue.append((key, val_ptr))
+                key_hashes: dict[str, bytes] = {key: self.hash_fn(key.encode())}
+                kvs_queue: list[tuple[str, IPLDKind, bytes]] = []
+                kvs_queue.append((key, val_ptr, key_hashes[key]))
 
                 while len(kvs_queue) > 0:
                     _, top_node = node_stack[-1]
-                    curr_key, curr_val_ptr = kvs_queue[0]
+                    curr_key, curr_val_ptr, raw_hash = kvs_queue[0]
 
-                    raw_hash: bytes = self.hash_fn(curr_key.encode())
                     map_key: int = extract_bits(raw_hash, len(node_stack) - 1, 8)
 
                     item = top_node.data[map_key]
@@ -632,6 +632,7 @@ class HAMT:
                         next_node_id: IPLDKind = item[0]
                         next_node: Node = await self.node_store.load(next_node_id)
                         node_stack.append((next_node_id, next_node))
+                        link_path.append(map_key)
                     elif isinstance(item, dict):
                         bucket: dict[str, IPLDKind] = item
 
@@ -645,7 +646,9 @@ class HAMT:
                         # The current key is not in the bucket and the bucket is too full, so empty KVs from the bucket and restart insertion
                         for k in bucket:
                             v_ptr = bucket[k]
-                            kvs_queue.append((k, v_ptr))
+                            if k not in key_hashes:
+                                key_hashes[k] = self.hash_fn(k.encode())
+                            kvs_queue.append((k, v_ptr, key_hashes[k]))
 
                         # Create a new link to a new node so that we can reflow these KVs into a new subtree
                         new_node = Node()
@@ -662,7 +665,7 @@ class HAMT:
                     preserve_node(node)
 
                 # Finally, reserialize and fix all links, deleting empty nodes as needed
-                await self._reserialize_and_link(node_stack)
+                await self._reserialize_and_link(node_stack, link_path)
                 self.root_node_id = node_stack[0][0]
             except BaseException:
                 for node, original_data in original_node_data.values():
@@ -682,7 +685,7 @@ class HAMT:
             raw_hash: bytes = self.hash_fn(key.encode())
 
             node_stack: list[tuple[IPLDKind, Node]] = []
-            link_indices: list[int] = []
+            link_path: list[int] = [-1]
             root_node: Node = await self.node_store.load(self.root_node_id)
             node_stack.append((self.root_node_id, root_node))
 
@@ -702,13 +705,13 @@ class HAMT:
                 elif isinstance(item, list):
                     link: IPLDKind = item[0]
                     next_node: Node = await self.node_store.load(link)
-                    link_indices.append(map_key)
                     node_stack.append((link, next_node))
+                    link_path.append(map_key)
 
             # Finally, restore the canonical shape and fix all remaining links.
             if created_change:
-                await self._collapse_delete_path(node_stack, link_indices)
-                await self._reserialize_and_link(node_stack)
+                await self._collapse_delete_path(node_stack, link_path)
+                await self._reserialize_and_link(node_stack, link_path)
                 self.root_node_id = node_stack[0][0]
             else:
                 # If we didn't make a change, then this key must not exist within the HAMT
