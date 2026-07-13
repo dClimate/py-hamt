@@ -194,6 +194,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
     1.  A dictionary mapping metadata keys (like 'zarr.json') to their CIDs.
     2.  A list of CIDs, where each CID points to a shard object.
     3.  Sharding configuration details and the primary array path.
+
+    A manifest has one primary array shard index. Root-level chunk keys are
+    supported when that primary array is at the root; they are rejected when
+    a named primary array owns the index so the two key spaces cannot alias.
     """
 
     def __init__(
@@ -417,10 +421,16 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
     def _record_primary_chunk_path(self, key: str) -> None:
         """Record a primary path for legacy callers that write chunks directly."""
-        if self._primary_array_path is not None or "/c/" not in key:
+        if self._primary_array_path is not None:
             return
-        array_path, _, coord_part = key.rpartition("/c/")
-        if array_path and len(coord_part.split("/")) == len(self._array_shape):
+        if key.startswith("c/"):
+            array_path = ""
+            coord_part = key[len("c/") :]
+        elif "/c/" in key:
+            array_path, _, coord_part = key.rpartition("/c/")
+        else:
+            return
+        if len(coord_part.split("/")) == len(self._array_shape):
             self._primary_array_path = array_path
             self._root_obj["chunks"]["primary_array_path"] = array_path
             self._dirty_root = True
@@ -504,9 +514,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
         else:
             return None
 
-        # Root-level arrays have no name to discover. Named chunks must exactly match
-        # the array path identified from their zarr.json metadata.
+        # Once discovered, only the primary array owns the shard index. In particular,
+        # a root key must not read through a named array's coordinate slot.
         if array_path and array_path != self._primary_array_path:
+            return None
+        if not array_path and self._primary_array_path not in (None, ""):
             return None
 
         parts = coord_part.split("/")
@@ -545,6 +557,38 @@ class ShardedZarrStore(zarr.abc.store.Store):
         shard_idx = linear_chunk_index // self._chunks_per_shard
         index_in_shard = linear_chunk_index % self._chunks_per_shard
         return shard_idx, index_in_shard
+
+    @staticmethod
+    def _byte_request_parameters(
+        byte_range: Optional[zarr.abc.store.ByteRequest],
+    ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        """Translate a Zarr byte request into CAS range parameters."""
+        req_offset = None
+        req_length = None
+        req_suffix = None
+
+        if isinstance(byte_range, RangeByteRequest):
+            req_offset = byte_range.start
+            if byte_range.end is not None:
+                if byte_range.start > byte_range.end:
+                    raise ValueError(
+                        f"Byte range start ({byte_range.start}) cannot be greater than end ({byte_range.end})"
+                    )
+                req_length = byte_range.end - byte_range.start
+        elif isinstance(byte_range, OffsetByteRequest):
+            req_offset = byte_range.offset
+        elif isinstance(byte_range, SuffixByteRequest):
+            req_suffix = byte_range.suffix
+
+        return req_offset, req_length, req_suffix
+
+    def _validate_chunk_write_key(self, key: str) -> None:
+        """Reject root chunk keys that would alias a named primary array."""
+        if key.startswith("c/") and self._primary_array_path not in (None, ""):
+            raise ValueError(
+                "Root-level chunk keys cannot be written when the shard index "
+                f"belongs to named array {self._primary_array_path!r}."
+            )
 
     async def _load_or_initialize_shard_cache(
         self, shard_idx: int
@@ -767,13 +811,21 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     metadata_cid_obj = self._root_obj["metadata"].get(key)
                     if metadata_cid_obj is None:
                         return None
-                    if byte_range is not None:
-                        raise ValueError(
-                            "Byte range requests are not supported for metadata keys."
-                        )
-                    data = self._metadata_read_cache.get(key)
+                    if byte_range is None:
+                        data = self._metadata_read_cache.get(key)
+                    else:
+                        data = None
                     if data is None:
-                        data = await self.cas.load(str(metadata_cid_obj))
+                        req_offset, req_length, req_suffix = (
+                            self._byte_request_parameters(byte_range)
+                        )
+                        data = await self.cas.load(
+                            str(metadata_cid_obj),
+                            offset=req_offset,
+                            length=req_length,
+                            suffix=req_suffix,
+                        )
+                    if byte_range is None:
                         self._metadata_read_cache[key] = data
                     hit = True
                     return prototype.buffer.from_bytes(data)
@@ -792,23 +844,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
                 chunk_cid_str = str(chunk_cid_obj)
 
-                req_offset = None
-                req_length = None
-                req_suffix = None
-
-                if byte_range:
-                    if isinstance(byte_range, RangeByteRequest):
-                        req_offset = byte_range.start
-                        if byte_range.end is not None:
-                            if byte_range.start > byte_range.end:
-                                raise ValueError(
-                                    f"Byte range start ({byte_range.start}) cannot be greater than end ({byte_range.end})"
-                                )
-                            req_length = byte_range.end - byte_range.start
-                    elif isinstance(byte_range, OffsetByteRequest):
-                        req_offset = byte_range.offset
-                    elif isinstance(byte_range, SuffixByteRequest):
-                        req_suffix = byte_range.suffix
+                req_offset, req_length, req_suffix = self._byte_request_parameters(
+                    byte_range
+                )
                 data = await self.cas.load(
                     chunk_cid_str,
                     offset=req_offset,
@@ -832,6 +870,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if self.read_only:
             raise PermissionError("Cannot write to a read-only store.")
         await self._resize_complete.wait()
+
+        self._validate_chunk_write_key(key)
 
         if key.endswith("zarr.json"):
             metadata_json = json.loads(value.to_bytes().decode("utf-8"))
@@ -874,6 +914,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return None  # type: ignore[return-value]
 
     async def set_pointer(self, key: str, pointer: str) -> None:
+        self._validate_chunk_write_key(key)
+
         if key.endswith("zarr.json") and self._primary_array_path is None:
             metadata_bytes = await self.cas.load(pointer)
             metadata_json = json.loads(metadata_bytes)
@@ -947,8 +989,27 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return True
 
     async def list(self) -> AsyncIterator[str]:
+        """Yield metadata and every occupied primary-array chunk key."""
         for key in list(self._root_obj.get("metadata", {})):
             yield key
+
+        chunk_prefix = (
+            f"{self._primary_array_path}/c/" if self._primary_array_path else "c/"
+        )
+        for shard_idx in range(self._num_shards):
+            async with self._use_shard(shard_idx) as shard:
+                occupied_indices = [
+                    shard_idx * self._chunks_per_shard + index_in_shard
+                    for index_in_shard, chunk_cid in enumerate(shard)
+                    if chunk_cid is not None
+                    and shard_idx * self._chunks_per_shard + index_in_shard
+                    < self._total_chunks
+                ]
+            for linear_chunk_index in occupied_indices:
+                coords = self._get_chunk_coords(
+                    linear_chunk_index, self._chunks_per_dim
+                )
+                yield chunk_prefix + "/".join(map(str, coords))
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
         async for key in self.list():
@@ -1113,14 +1174,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self._dirty_root = True
 
     async def list_dir(self, prefix: str) -> AsyncIterator[str]:
+        """Yield unique immediate children beneath ``prefix``."""
         seen: Set[str] = set()
-        if prefix == "":
-            async for key in self.list():  # Iterates metadata keys
-                # e.g., if key is "group1/.zgroup" or "array1/.json", first_component is "group1" or "array1"
-                # if key is ".zgroup", first_component is ".zgroup"
-                first_component = key.split("/", 1)[0]
-                if first_component not in seen:
-                    seen.add(first_component)
-                    yield first_component
-        else:
-            raise NotImplementedError("Listing with a prefix is not implemented yet.")
+        normalized_prefix = prefix.rstrip("/")
+        key_prefix = f"{normalized_prefix}/" if normalized_prefix else ""
+        async for key in self.list():
+            if not key.startswith(key_prefix) or key == normalized_prefix:
+                continue
+            child = key[len(key_prefix) :].split("/", 1)[0]
+            if child not in seen:
+                seen.add(child)
+                yield child
