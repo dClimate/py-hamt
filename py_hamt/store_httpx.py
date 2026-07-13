@@ -533,47 +533,47 @@ class KuboCAS(ContentAddressedStore):
 
         Transient request failures and gateway statuses are retried. Retrying
         the ``/api/v0/add`` POST is safe because the uploaded content is
-        content-addressed, making repeated additions idempotent.
+        content-addressed, making repeated additions idempotent. Concurrency
+        slots are held per HTTP attempt and released during retry backoff.
         """
-        async with self._loop_semaphore():
-            files = {"file": data}
-            client = self._loop_client()
-            retry_count = 0
+        files = {"file": data}
+        client = self._loop_client()
+        semaphore = self._loop_semaphore()
+        retry_count = 0
 
-            while retry_count <= self.max_retries:
-                try:
+        while retry_count <= self.max_retries:
+            try:
+                async with semaphore:
                     response = await client.post(self.rpc_url, files=files)
-                    response.raise_for_status()
-                    cid_str: str = response.json()["Hash"]
-                    cid: CID = CID.decode(cid_str)
-                    if cid.codec.code != self.DAG_PB_MARKER:
-                        cid = cid.set(codec=codec)
-                    return cid
+                response.raise_for_status()
+                cid_str: str = response.json()["Hash"]
+                cid: CID = CID.decode(cid_str)
+                if cid.codec.code != self.DAG_PB_MARKER:
+                    cid = cid.set(codec=codec)
+                return cid
 
-                except httpx.RequestError:
-                    if retry_count >= self.max_retries:
-                        raise
-                    retry_count += 1
-                    await asyncio.sleep(
-                        _retry_delay(
-                            self.initial_delay, self.backoff_factor, retry_count
-                        )
-                    )
+            except httpx.RequestError:
+                if retry_count >= self.max_retries:
+                    raise
+                retry_count += 1
+                await asyncio.sleep(
+                    _retry_delay(self.initial_delay, self.backoff_factor, retry_count)
+                )
 
-                except httpx.HTTPStatusError as error:
-                    if error.response.status_code not in _RETRYABLE_STATUS_CODES:
-                        raise
-                    if retry_count >= self.max_retries:
-                        raise
-                    retry_count += 1
-                    await asyncio.sleep(
-                        _retry_delay(
-                            self.initial_delay,
-                            self.backoff_factor,
-                            retry_count,
-                            error.response,
-                        )
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code not in _RETRYABLE_STATUS_CODES:
+                    raise
+                if retry_count >= self.max_retries:
+                    raise
+                retry_count += 1
+                await asyncio.sleep(
+                    _retry_delay(
+                        self.initial_delay,
+                        self.backoff_factor,
+                        retry_count,
+                        error.response,
                     )
+                )
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     async def load(
@@ -589,7 +589,8 @@ class KuboCAS(ContentAddressedStore):
         are handled by applying the requested byte window locally. Transient
         request failures, rate limits, and gateway server errors are retried;
         other HTTP errors fail immediately. Zero-length and zero-suffix reads
-        return immediately without a gateway request.
+        return immediately without a gateway request. Concurrency slots are
+        held per HTTP attempt and released during retry backoff.
         """
         if (offset is not None and length == 0) or (offset is None and suffix == 0):
             return b""
@@ -617,57 +618,56 @@ class KuboCAS(ContentAddressedStore):
         final_status = "ok"
         final_retry_count = 0
         try:
-            async with self._loop_semaphore():  # Throttle gateway
-                client = self._loop_client()
-                retry_count = 0
+            client = self._loop_client()
+            semaphore = self._loop_semaphore()
+            retry_count = 0
 
-                while retry_count <= self.max_retries:
-                    try:
+            while retry_count <= self.max_retries:
+                try:
+                    async with semaphore:  # Throttle each gateway attempt
                         response = await client.get(url, headers=headers or None)
-                        response.raise_for_status()
-                        content = response.content
-                        response_bytes = len(content)
+                    response.raise_for_status()
+                    content = response.content
+                    response_bytes = len(content)
+                    final_retry_count = retry_count
+                    if headers and response.status_code == httpx.codes.OK:
+                        logger.debug(
+                            "Gateway ignored Range request for CID %s; "
+                            "slicing the complete response locally",
+                            cid,
+                        )
+                        return _slice_requested_range(content, offset, length, suffix)
+                    return content
+
+                except httpx.RequestError:
+                    if retry_count >= self.max_retries:
+                        final_status = "request_error"
                         final_retry_count = retry_count
-                        if headers and response.status_code == httpx.codes.OK:
-                            logger.debug(
-                                "Gateway ignored Range request for CID %s; "
-                                "slicing the complete response locally",
-                                cid,
-                            )
-                            return _slice_requested_range(
-                                content, offset, length, suffix
-                            )
-                        return content
-
-                    except httpx.RequestError:
-                        if retry_count >= self.max_retries:
-                            final_status = "request_error"
-                            final_retry_count = retry_count
-                            raise
-                        retry_count += 1
-                        await asyncio.sleep(
-                            _retry_delay(
-                                self.initial_delay, self.backoff_factor, retry_count
-                            )
+                        raise
+                    retry_count += 1
+                    await asyncio.sleep(
+                        _retry_delay(
+                            self.initial_delay, self.backoff_factor, retry_count
                         )
+                    )
 
-                    except httpx.HTTPStatusError as error:
-                        if (
-                            error.response.status_code not in _RETRYABLE_STATUS_CODES
-                            or retry_count >= self.max_retries
-                        ):
-                            final_status = "http_error"
-                            final_retry_count = retry_count
-                            raise
-                        retry_count += 1
-                        await asyncio.sleep(
-                            _retry_delay(
-                                self.initial_delay,
-                                self.backoff_factor,
-                                retry_count,
-                                error.response,
-                            )
+                except httpx.HTTPStatusError as error:
+                    if (
+                        error.response.status_code not in _RETRYABLE_STATUS_CODES
+                        or retry_count >= self.max_retries
+                    ):
+                        final_status = "http_error"
+                        final_retry_count = retry_count
+                        raise
+                    retry_count += 1
+                    await asyncio.sleep(
+                        _retry_delay(
+                            self.initial_delay,
+                            self.backoff_factor,
+                            retry_count,
+                            error.response,
                         )
+                    )
         finally:
             instrumentation.end_cas_load(
                 trace_started_at,
