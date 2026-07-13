@@ -14,8 +14,8 @@ from typing import (
 )
 
 import dag_cbor
+from blake3 import blake3
 from dag_cbor.ipld import IPLDKind
-from multiformats import multihash
 
 from . import instrumentation
 from .store_httpx import ContentAddressedStore
@@ -48,18 +48,9 @@ def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
     return result
 
 
-b3 = multihash.get("blake3")
-
-
 def blake3_hashfn(input_bytes: bytes) -> bytes:
-    """
-    This is the default blake3 hash function used for the `HAMT`, with a 32 byte hash size.
-
-    """
-    # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
-    digest: bytes = b3.digest(input_bytes, size=32)
-    raw_bytes: bytes = b3.unwrap(digest)
-    return raw_bytes
+    """Return the HAMT's default raw 32-byte BLAKE3 digest."""
+    return blake3(input_bytes).digest(length=32)
 
 
 class Node:
