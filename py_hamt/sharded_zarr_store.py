@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from typing import DefaultDict, Dict, List, Optional, Set, Tuple
+from typing import DefaultDict, Dict, List, Optional, Set, Tuple, cast
 
 import dag_cbor
 import zarr.abc.store
@@ -353,7 +353,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
     async def _fetch_and_cache_full_shard(
         self,
         shard_idx: int,
-        shard_cid: str,
+        shard_cid: str | CID,
         max_retries: int = 3,
         retry_delay: float = 1.0,
     ) -> None:
@@ -650,8 +650,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         shard_cid_obj = self._root_obj["chunks"]["shard_cids"][shard_idx]
         if shard_cid_obj:
             self._pending_shard_loads[shard_idx] = asyncio.Event()
-            shard_cid_str = str(shard_cid_obj)
-            await self._fetch_and_cache_full_shard(shard_idx, shard_cid_str)
+            await self._fetch_and_cache_full_shard(shard_idx, shard_cid_obj)
         else:
             empty_shard = [None] * self._chunks_per_shard
             await self._shard_data_cache.put(shard_idx, empty_shard)
@@ -820,7 +819,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                             self._byte_request_parameters(byte_range)
                         )
                         data = await self.cas.load(
-                            str(metadata_cid_obj),
+                            metadata_cid_obj,
                             offset=req_offset,
                             length=req_length,
                             suffix=req_suffix,
@@ -842,13 +841,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 if chunk_cid_obj is None:
                     return None  # Chunk is empty/doesn't exist.
 
-                chunk_cid_str = str(chunk_cid_obj)
-
                 req_offset, req_length, req_suffix = self._byte_request_parameters(
                     byte_range
                 )
                 data = await self.cas.load(
-                    chunk_cid_str,
+                    chunk_cid_obj,
                     offset=req_offset,
                     length=req_length,
                     suffix=req_suffix,
@@ -906,7 +903,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # Metadata is often saved as 'raw', chunks as well unless compressed.
         try:
             data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
-            await self.set_pointer(key, str(data_cid_obj))
+            await self._set_pointer_cid(key, cast(CID, data_cid_obj))
             if self._parse_chunk_key(key) is None:
                 self._metadata_read_cache[key] = raw_data_bytes
         except Exception as e:
@@ -914,18 +911,21 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return None  # type: ignore[return-value]
 
     async def set_pointer(self, key: str, pointer: str) -> None:
+        """Set a key's pointer from its public string representation."""
+        await self._set_pointer_cid(key, CID.decode(pointer))
+
+    async def _set_pointer_cid(self, key: str, pointer_cid_obj: CID) -> None:
+        """Set a key's pointer while preserving an already-decoded CID object."""
         self._validate_chunk_write_key(key)
 
         if key.endswith("zarr.json") and self._primary_array_path is None:
-            metadata_bytes = await self.cas.load(pointer)
+            metadata_bytes = await self.cas.load(pointer_cid_obj)
             metadata_json = json.loads(metadata_bytes)
             self._record_primary_array_path(key, metadata_json)
         else:
             self._record_primary_chunk_path(key)
 
         chunk_coords = self._parse_chunk_key(key)
-
-        pointer_cid_obj = CID.decode(pointer)  # Convert string to CID object
 
         if chunk_coords is None:  # Metadata key
             self._root_obj["metadata"][key] = pointer_cid_obj
