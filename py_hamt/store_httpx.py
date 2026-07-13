@@ -169,7 +169,8 @@ class KuboCAS(ContentAddressedStore):
     - **auth** (`tuple[str, str] | None`): authentication tuple (username, password)
       for the internally-created client.
     - **rpc_base_url / gateway_base_url** (str | None): override daemon
-      endpoints (defaults match the local daemon ports).
+      endpoints (defaults match the local daemon ports). Gateway URLs may end
+      with `/ipfs` and may include a trailing slash.
     - **chunker** (str): chunking algorithm specification for Kubo's `add`
       RPC. Accepted formats are `"size-<positive int>"`, `"rabin"`, or
       `"rabin-<min>-<avg>-<max>"`.
@@ -265,14 +266,10 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
-        if "/ipfs/" in gateway_base_url:
-            gateway_base_url = gateway_base_url.split("/ipfs/")[0]
-
-        # Standard gateway URL construction with proper path handling
-        if gateway_base_url.endswith("/"):
-            gateway_base_url = f"{gateway_base_url}ipfs/"
-        else:
-            gateway_base_url = f"{gateway_base_url}/ipfs/"
+        gateway_base_url = gateway_base_url.rstrip("/")
+        if not gateway_base_url.endswith("/ipfs"):
+            gateway_base_url = f"{gateway_base_url}/ipfs"
+        gateway_base_url = f"{gateway_base_url}/"
 
         pin_string: str = "true" if pin_on_add else "false"
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pin_string}"
