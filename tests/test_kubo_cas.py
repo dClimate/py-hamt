@@ -248,13 +248,13 @@ async def test_kubo_timeout_retries():
                         ):
                             with pytest.raises(
                                 httpx.TimeoutException,
-                                match="Failed to save data after 3 retries",
+                                match="Simulated timeout",
                             ):
                                 await kubo_cas.save(test_data, codec="dag-cbor")
 
                             with pytest.raises(
                                 httpx.TimeoutException,
-                                match="Failed to load data after 3 retries",
+                                match="Simulated timeout",
                             ):
                                 await kubo_cas.load(cid)
 
@@ -305,9 +305,9 @@ async def test_kubo_backoff_timing():
 
 
 @pytest.mark.asyncio
-async def test_kubo_http_status_error_no_retry():
+async def test_kubo_http_status_error_retries_transient_status():
     """
-    Tests that KuboCAS immediately raises HTTPStatusError without retrying.
+    Tests that KuboCAS retries HTTP 500 before raising HTTPStatusError.
     """
 
     # This mock simulates a server error by returning a 500 status code.
@@ -321,7 +321,7 @@ async def test_kubo_http_status_error_no_retry():
     with patch.object(
         httpx.AsyncClient, "post", new=AsyncMock(side_effect=mock_post_server_error)
     ):
-        # Also patch asyncio.sleep to verify it's not called (i.e., no retries).
+        # Patch asyncio.sleep so retry backoff does not slow the test.
         with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
             async with httpx.AsyncClient() as client:
                 async with KuboCAS(client=client) as kubo_cas:
@@ -331,8 +331,8 @@ async def test_kubo_http_status_error_no_retry():
 
                     # Verify that the response in the exception has the correct status code.
                     assert exc_info.value.response.status_code == 500
-                    # Verify that no retry was attempted.
-                    mock_sleep.assert_not_called()
+                    # The initial attempt is followed by three retries.
+                    assert mock_sleep.await_count == kubo_cas.max_retries
 
 
 @pytest.mark.asyncio
