@@ -247,46 +247,53 @@ class InMemoryTreeStore(NodeStore):
 
         return total
 
-    # The HAMT must properly acquire a lock for this to run successfully! This is not async or thread safe
-    # This algorithm has an implicit assumption that the entire continuous line of branches up to an ancestor is in the memory buffer, which will happen because of the DFS style traversal in all HAMT operations
     async def vacate(self) -> None:
-        # node stack is a list of tuples that look like (parent_id, self_id, node)
-        node_stack: list[tuple[int | None, int, Node]] = []
+        """Flush the dirty tree in concurrent, bottom-up sibling waves.
+
+        The HAMT lock must be held by the caller. A node is not serialized until
+        every buffered child has been saved and relinked to its CAS ID, so only
+        independent subtrees overlap and the root is always saved last.
+        """
         # The root node may not be in the buffer, e.g. this is HAMT initialized with a specific root node id
         if self.is_buffer_id(self.hamt.root_node_id):
-            root_node: Node = self.buffer[cast(int, self.hamt.root_node_id)]
-            node_stack.append((None, cast(int, self.hamt.root_node_id), root_node))
+            root_buffer_id = cast(int, self.hamt.root_node_id)
+            parent_ids: dict[int, int | None] = {root_buffer_id: None}
+            buffered_children: dict[int, set[int]] = {}
+            traversal_order: list[int] = []
+            node_stack: list[int] = [root_buffer_id]
 
-        while len(node_stack) > 0:
-            parent_buffer_id, top_buffer_id, top_node = node_stack[-1]
-            new_nodes_on_stack: list[tuple[int, int, Node]] = []
-            for child_buffer_id in self.children_in_memory(top_node):
-                child_node: Node = self.buffer[child_buffer_id]
-                new_nodes_on_stack.append((top_buffer_id, child_buffer_id, child_node))
+            while node_stack:
+                buffer_id = node_stack.pop()
+                traversal_order.append(buffer_id)
+                child_ids = set(self.children_in_memory(self.buffer[buffer_id]))
+                buffered_children[buffer_id] = child_ids
+                for child_id in child_ids:
+                    parent_ids[child_id] = buffer_id
+                    node_stack.append(child_id)
 
-            no_children_in_memory: bool = len(new_nodes_on_stack) == 0
-            # Flush this node out and relink the rest of the tree
-            if no_children_in_memory:
-                is_root: bool = parent_buffer_id is None
-                old_id: int = top_buffer_id
-                new_id: IPLDKind = await self.hamt.cas.save(
-                    top_node.serialize(), codec="dag-cbor"
-                )
-                del self.buffer[old_id]
-                node_stack.pop()
+            remaining_ids = set(traversal_order)
+            while remaining_ids:
+                wave_ids = [
+                    buffer_id
+                    for buffer_id in traversal_order
+                    if buffer_id in remaining_ids
+                    and buffered_children[buffer_id].isdisjoint(remaining_ids)
+                ]
+                new_ids: list[IPLDKind] = await asyncio.gather(*[
+                    self.hamt.cas.save(
+                        self.buffer[buffer_id].serialize(), codec="dag-cbor"
+                    )
+                    for buffer_id in wave_ids
+                ])
 
-                # If it's the root, we need to set the hamt's root node id once this is done sending to the backing store
-                if is_root:
-                    self.hamt.root_node_id = new_id
-                # Edit and properly relink the parent if this is not the root
-                else:
-                    # parent_buffer_id is never None in this branch
-                    assert parent_buffer_id is not None
-                    parent_node: Node = self.buffer[parent_buffer_id]
-                    parent_node.replace_link(old_id, new_id)
-            # Continue recursing down the tree
-            else:
-                node_stack.extend(new_nodes_on_stack)
+                for old_id, new_id in zip(wave_ids, new_ids):
+                    parent_id = parent_ids[old_id]
+                    del self.buffer[old_id]
+                    remaining_ids.remove(old_id)
+                    if parent_id is None:
+                        self.hamt.root_node_id = new_id
+                    else:
+                        self.buffer[parent_id].replace_link(old_id, new_id)
 
         # There are only two types of nodes left in the buffer:
         # 1. A bunch of nodes that seem "unlinked" to anything else, since Links used within the Nodes will reference the real underlying CAS
