@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import random
 import re
 from abc import ABC, abstractmethod
@@ -10,6 +11,26 @@ from multiformats import CID, multihash
 from multiformats.multihash import Multihash
 
 from . import instrumentation
+
+logger = logging.getLogger(__name__)
+
+
+def _slice_requested_range(
+    data: bytes,
+    offset: Optional[int],
+    length: Optional[int],
+    suffix: Optional[int],
+) -> bytes:
+    """Apply content-store range arguments to a complete object body."""
+    if offset is not None:
+        if length is not None:
+            return data[offset : offset + length]
+        return data[offset:]
+    if suffix is not None:
+        if suffix == 0:
+            return b""
+        return data[-suffix:]
+    return data
 
 
 class ContentAddressedStore(ABC):
@@ -85,6 +106,10 @@ class InMemoryCAS(ContentAddressedStore):
         suffix: Optional[int] = None,
     ) -> bytes:
         """
+        Retrieve all or part of an object using Python slice semantics.
+
+        A zero ``length`` or ``suffix`` returns an empty byte string.
+
         `ContentAddressedStore` allows any IPLD scalar key.  For the in-memory
         backend we *require* a `bytes` hash; anything else is rejected at run
         time. In OO type-checking, a subclass may widen (make more general) argument types,
@@ -93,6 +118,9 @@ class InMemoryCAS(ContentAddressedStore):
         This is why we use `cast` here, to tell mypy that we know what we are doing.
         h/t https://stackoverflow.com/questions/75209249/overriding-a-method-mypy-throws-an-incompatible-with-super-type-error-when-ch
         """
+        if (offset is not None and length == 0) or (offset is None and suffix == 0):
+            return b""
+
         key = cast(bytes, id)
         if not isinstance(key, (bytes, bytearray)):  # defensive guard
             raise TypeError(
@@ -104,17 +132,7 @@ class InMemoryCAS(ContentAddressedStore):
         except KeyError as exc:
             raise KeyError("Object not found in in-memory store") from exc
 
-        if offset is not None:
-            start = offset
-            if length is not None:
-                end = start + length
-                return data[start:end]
-            else:
-                return data[start:]
-        elif suffix is not None:  # If only length is given, assume start from 0
-            return data[-suffix:]
-        else:  # Full load
-            return data
+        return _slice_requested_range(data, offset, length, suffix)
 
 
 class KuboCAS(ContentAddressedStore):
@@ -522,7 +540,15 @@ class KuboCAS(ContentAddressedStore):
         length: Optional[int] = None,
         suffix: Optional[int] = None,
     ) -> bytes:
-        """Load data from a CID using the IPFS gateway with optional Range requests."""
+        """Load all or part of a CID using the IPFS gateway.
+
+        Gateways that ignore a Range header and return a complete ``200`` body
+        are handled by applying the requested byte window locally. Zero-length
+        and zero-suffix reads return immediately without a gateway request.
+        """
+        if (offset is not None and length == 0) or (offset is None and suffix == 0):
+            return b""
+
         cid = cast(CID, id)
         url: str = f"{self.gateway_base_url + str(cid)}"
         headers: Dict[str, str] = {}
@@ -557,6 +583,15 @@ class KuboCAS(ContentAddressedStore):
                         content = response.content
                         response_bytes = len(content)
                         final_retry_count = retry_count
+                        if headers and response.status_code == httpx.codes.OK:
+                            logger.debug(
+                                "Gateway ignored Range request for CID %s; "
+                                "slicing the complete response locally",
+                                cid,
+                            )
+                            return _slice_requested_range(
+                                content, offset, length, suffix
+                            )
                         return content
 
                     except (httpx.TimeoutException, httpx.RequestError) as e:
