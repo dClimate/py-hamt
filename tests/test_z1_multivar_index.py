@@ -10,6 +10,7 @@ from testing_utils import CIDInMemoryCAS
 
 from py_hamt import HAMT, ShardedZarrStore
 from py_hamt.hamt_to_sharded_converter import convert_hamt_to_sharded
+from py_hamt.sharded_zarr_store import SHARDED_ZARR_V2
 from py_hamt.zarr_hamt_store import ZarrHAMTStore
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -62,19 +63,21 @@ async def _decode_root(cas: CIDInMemoryCAS, root_cid: str) -> dict[str, object]:
     return root
 
 
-def _assert_data_chunks_are_indexed(root_obj: dict[str, object]) -> None:
+def _assert_data_chunks_are_indexed(
+    root_obj: dict[str, object], array_paths: tuple[str, ...] = DATA_VARIABLES
+) -> None:
     metadata = root_obj["metadata"]
     assert isinstance(metadata, dict)
 
-    for variable_name in DATA_VARIABLES:
-        chunk_prefix = f"{variable_name}/c/"
+    for array_path in array_paths:
+        chunk_prefix = f"{array_path}/c/"
         offending_keys = sorted(
             key
             for key in metadata
             if isinstance(key, str) and key.startswith(chunk_prefix)
         )
         assert not offending_keys, (
-            f"data-variable chunks for {variable_name!r} must use a per-array "
+            f"data-variable chunks for {array_path!r} must use a per-array "
             f"shard index, not root metadata entries; offending keys: {offending_keys}"
         )
 
@@ -82,7 +85,7 @@ def _assert_data_chunks_are_indexed(root_obj: dict[str, object]) -> None:
         key
         for key in metadata
         if isinstance(key, str)
-        and any(key == name or key.startswith(f"{name}/") for name in DATA_VARIABLES)
+        and any(key == path or key.startswith(f"{path}/") for path in array_paths)
     )
     non_metadata_keys = [
         key for key in data_variable_keys if not key.endswith("zarr.json")
@@ -93,33 +96,35 @@ def _assert_data_chunks_are_indexed(root_obj: dict[str, object]) -> None:
     )
 
 
-async def _open_sharded_dataset(cas: CIDInMemoryCAS, root_cid: str) -> xr.Dataset:
+async def _open_sharded_dataset(
+    cas: CIDInMemoryCAS, root_cid: str, *, group: str | None = None
+) -> xr.Dataset:
     store = await ShardedZarrStore.open(cas=cas, read_only=True, root_cid=root_cid)
-    return xr.open_zarr(store=store)
+    return xr.open_zarr(store=store, group=group)
 
 
 @pytest.mark.asyncio
 async def test_multivar_chunks_have_per_array_indexes() -> None:
-    # Current HEAD rejects the non-primary variable when its chunk grid has more
-    # entries than the configured primary grid, so use the prescribed same-grid
-    # fallback to isolate the remaining structural sharding defect.
+    # Path-aware indexing is the v2 contract; shape-based creation intentionally
+    # remains the deprecated v1 compatibility path on the current base.
     expected = _multivar_dataset(different_chunk_grids=False)
     cas = CIDInMemoryCAS()
     store = await ShardedZarrStore.open(
         cas=cas,
         read_only=False,
-        array_shape=ARRAY_SHAPE,
-        chunk_shape=(2, 4, 6),
         chunks_per_shard=8,
+        manifest_version=SHARDED_ZARR_V2,
     )
 
-    expected.to_zarr(store=store, mode="w")
+    expected.to_zarr(store=store, mode="w", group="0")
     root_cid = await store.flush()
 
-    actual = await _open_sharded_dataset(cas, root_cid)
+    actual = await _open_sharded_dataset(cas, root_cid, group="0")
     np.testing.assert_array_equal(actual["temp"].values, expected["temp"].values)
     np.testing.assert_array_equal(actual["precip"].values, expected["precip"].values)
-    _assert_data_chunks_are_indexed(await _decode_root(cas, root_cid))
+    _assert_data_chunks_are_indexed(
+        await _decode_root(cas, root_cid), ("0/temp", "0/precip")
+    )
 
 
 @pytest.mark.asyncio

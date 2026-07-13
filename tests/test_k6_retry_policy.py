@@ -1,13 +1,14 @@
 import socket
 import threading
 from collections.abc import Iterator
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
 from multiformats import CID
 
-from py_hamt import KuboCAS
+from py_hamt import KuboCAS, store_httpx
 
 EXPECTED_BODY = b"gateway response after transient failures"
 TEST_CID = CID.decode("bafyreihyrpefhacm6kkp4ql6j6udakdit7g3dmkzfriqfykhjw6cad7lrm")
@@ -92,6 +93,82 @@ def make_cas(url: str, *, max_retries: int = 3) -> KuboCAS:
         max_retries=max_retries,
         initial_delay=0.01,
     )
+
+
+def test_retry_delay_parses_http_dates_and_ignores_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    future_naive_datetime = datetime.now() + timedelta(seconds=30)
+    monkeypatch.setattr(
+        store_httpx,
+        "parsedate_to_datetime",
+        lambda _: future_naive_datetime,
+    )
+    dated_response = httpx.Response(429, headers={"Retry-After": "future-date"})
+    assert store_httpx._retry_delay(10, 2, 1, dated_response) == 10
+
+    def reject_retry_after(_: str) -> datetime:
+        raise ValueError("invalid Retry-After")
+
+    monkeypatch.setattr(store_httpx, "parsedate_to_datetime", reject_retry_after)
+    monkeypatch.setattr(store_httpx.random, "random", lambda: 0.5)
+    invalid_response = httpx.Response(429, headers={"Retry-After": "invalid"})
+    assert store_httpx._retry_delay(10, 2, 1, invalid_response) == 10
+
+
+def test_slice_requested_range_handles_zero_suffix() -> None:
+    assert store_httpx._slice_requested_range(b"content", None, None, 0) == b""
+
+
+def test_kubo_cas_rejects_negative_concurrency() -> None:
+    with pytest.raises(ValueError, match="Semaphore initial value must be >= 0"):
+        KuboCAS(concurrency=-1)
+
+
+@pytest.mark.asyncio
+async def test_owned_kubo_cas_reopens_its_semaphore_after_close() -> None:
+    cas = KuboCAS()
+    cas._closed = True
+
+    semaphore = cas._loop_semaphore()
+
+    assert isinstance(semaphore, store_httpx.asyncio.Semaphore)
+    assert cas._closed is False
+    await cas.aclose()
+
+
+@pytest.mark.asyncio
+async def test_closed_kubo_cas_with_supplied_client_cannot_reopen() -> None:
+    client = httpx.AsyncClient()
+    cas = KuboCAS(client=client)
+    await cas.aclose()
+    try:
+        with pytest.raises(RuntimeError, match="KuboCAS is closed"):
+            cas._loop_semaphore()
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_save_does_not_retry_nonretryable_status() -> None:
+    request_count = 0
+
+    async def reject_save(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(400, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(reject_save))
+    cas = KuboCAS(client=client, max_retries=3)
+    try:
+        with pytest.raises(httpx.HTTPStatusError) as error:
+            await cas.save(b"invalid upload", codec="raw")
+    finally:
+        await cas.aclose()
+        await client.aclose()
+
+    assert error.value.response.status_code == 400
+    assert request_count == 1
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import xarray as xr
 from testing_utils import CIDInMemoryCAS
 
 from py_hamt import ShardedZarrStore
+from py_hamt.sharded_zarr_store import SHARDED_ZARR_V2
 
 
 @pytest.mark.asyncio
@@ -29,11 +30,10 @@ async def test_non_allowlisted_coordinate_names_round_trip() -> None:
     write_store = await ShardedZarrStore.open(
         cas=cas,
         read_only=False,
-        array_shape=(4, 4, 6),
-        chunk_shape=(2, 4, 6),
         chunks_per_shard=8,
+        manifest_version=SHARDED_ZARR_V2,
     )
-    dataset.to_zarr(store=write_store, mode="w")
+    dataset.to_zarr(store=write_store, mode="w", group="0")
     root_cid = await write_store.flush()
 
     read_store = await ShardedZarrStore.open(
@@ -41,6 +41,6 @@ async def test_non_allowlisted_coordinate_names_round_trip() -> None:
         read_only=True,
         root_cid=root_cid,
     )
-    actual = xr.open_zarr(store=read_store)
+    actual = xr.open_zarr(store=read_store, group="0")
 
     xr.testing.assert_identical(dataset.compute(), actual.compute())

@@ -1,11 +1,11 @@
 from collections import defaultdict
-from typing import DefaultDict
+from typing import DefaultDict, cast
 
 import pytest
 from dag_cbor.ipld import IPLDKind
 
 from py_hamt import HAMT, InMemoryCAS
-from py_hamt.hamt import Node
+from py_hamt.hamt import InMemoryTreeStore, Node
 
 
 def retained_node_count(node_store: object) -> int:
@@ -98,3 +98,56 @@ async def test_vacate_root_cid_golden() -> None:
     for key, value in values.items():
         assert await first_hamt.get(key) == value
         assert await second_hamt.get(key) == value
+
+
+@pytest.mark.asyncio
+async def test_clean_cache_handles_unhashable_ids_and_contributes_to_size() -> None:
+    hamt = await HAMT.build(cas=InMemoryCAS())
+    node_store = cast(InMemoryTreeStore, hamt.node_store)
+    unhashable_id = cast(IPLDKind, [])
+
+    assert node_store.get_clean_node(unhashable_id) is None
+    node_store.cache_clean_node(unhashable_id, Node())
+    node_store.cache_clean_node(b"existing-node", Node())
+    node_store.remove_clean_node(unhashable_id)
+
+    cached_node = Node()
+    node_store.cache_clean_node(b"clean-node", cached_node)
+    assert node_store.size() >= len(cached_node.serialize())
+
+
+@pytest.mark.asyncio
+async def test_reserialize_prunes_an_empty_child_from_its_parent() -> None:
+    hamt = await HAMT.build(cas=InMemoryCAS())
+    node_store = cast(InMemoryTreeStore, hamt.node_store)
+    root_id = hamt.root_node_id
+    root_node = await node_store.load(root_id)
+    empty_child = Node()
+    child_id = await node_store.add_to_buffer(empty_child)
+    child_slot = 7
+    root_node.set_link(child_slot, child_id)
+    node_stack = [(root_id, root_node), (child_id, empty_child)]
+    link_path = [0, child_slot]
+
+    await hamt._reserialize_and_link(node_stack, link_path)
+
+    assert node_stack == [(root_id, root_node)]
+    assert link_path == [0]
+    assert root_node.data[child_slot] == {}
+
+
+@pytest.mark.asyncio
+async def test_collect_subtree_entries_follows_links_and_honors_limit() -> None:
+    cas = InMemoryCAS()
+    hamt = await HAMT.build(cas=cas)
+    child = Node()
+    child.data[0] = {"first": "value", "second": "value"}
+    child_id = await cas.save(child.serialize(), codec="dag-cbor")
+    parent = Node()
+    parent.set_link(3, child_id)
+
+    assert await hamt._collect_subtree_entries(parent, limit=2) == {
+        "first": "value",
+        "second": "value",
+    }
+    assert await hamt._collect_subtree_entries(parent, limit=1) is None
