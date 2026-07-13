@@ -8,12 +8,12 @@ from multiformats import CID
 
 from .hamt import HAMT
 from .sharded_zarr_store import ShardedZarrStore
-from .store_httpx import KuboCAS
+from .store_httpx import ContentAddressedStore, KuboCAS
 from .zarr_hamt_store import ZarrHAMTStore
 
 
 async def convert_hamt_to_sharded(
-    cas: KuboCAS, hamt_root_cid: str, chunks_per_shard: int
+    cas: ContentAddressedStore, hamt_root_cid: str, chunks_per_shard: int
 ) -> str:
     """
     Converts a Zarr dataset from a HAMT-based store to a ShardedZarrStore.
@@ -60,20 +60,22 @@ async def convert_hamt_to_sharded(
 
     print("Destination store initialized.")
 
-    # 4. Iterate and copy all data from source to destination
+    # 4. Register every array before copying chunks. Zarr metadata supplies each
+    # array's independent shape and chunk grid to the versioned manifest.
     print("Starting data migration...")
-    primary_metadata_key = f"{data_var_name}/zarr.json"
-    primary_metadata_cid = cast(CID, await hamt_ro.get_pointer(primary_metadata_key))
-    await dest_store.set_pointer(
-        primary_metadata_key, str(primary_metadata_cid.encode("base32"))
-    )
+    source_keys = [key async for key in hamt_ro.keys()]
+    array_metadata_keys = [key for key in source_keys if key.endswith("zarr.json")]
+    for key in array_metadata_keys:
+        metadata_cid = cast(CID, await hamt_ro.get_pointer(key))
+        await dest_store.set_pointer(key, str(metadata_cid.encode("base32")))
+
     count = 0
-    async for key in hamt_ro.keys():
+    for key in source_keys:
         count += 1
-        if key == primary_metadata_key:
+        if key in array_metadata_keys:
             continue
         # Read the raw data (metadata or chunk) from the source
-        cid: CID = await hamt_ro.get_pointer(key)
+        cid = cast(CID, await hamt_ro.get_pointer(key))
         cid_base32_str = str(cid.encode("base32"))
 
         # Write the exact same key-value pair to the destination.

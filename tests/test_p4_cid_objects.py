@@ -95,7 +95,8 @@ async def test_cid_object_optimization_preserves_root_and_values() -> None:
 
     root_cid = await store.flush()
 
-    assert root_cid == "bafyr4igfegmzopod2rzkzs23t7kax2eoagzpib4c3nz7xnnkjxbfd3aw6u"
+    # The golden root includes the versioned per-array manifest layout.
+    assert root_cid == "bafyr4ibiddqekdsvo4oraxn5lfhqoq7cw477gcadnhymxu6vqmjcrp55jm"
     read_store = await ShardedZarrStore.open(
         cas=cas,
         read_only=True,
