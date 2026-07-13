@@ -16,6 +16,11 @@ def one_byte_colliding_hash(_: bytes) -> bytes:
     return b"\x00"
 
 
+def cascading_overflow_hash(data: bytes) -> bytes:
+    """Collide twice before distributing keys at the third tree level."""
+    return b"\x00\x00" + data
+
+
 @pytest.mark.asyncio
 async def test_happy_path_overwrites_do_not_deepcopy_the_traversal_path(
     monkeypatch: pytest.MonkeyPatch,
@@ -64,6 +69,23 @@ async def test_write_perf_fix_preserves_golden_root_cid() -> None:
         "1e2006c31744d8396c93ff78f618082c2fd5b07bf5f3a8d328a54d14dc11cae79165"
     )
     assert hamt.root_node_id.hex() == golden_root_cid
+
+
+@pytest.mark.asyncio
+async def test_detached_subtree_cascading_overflow_preserves_all_values() -> None:
+    hamt = await HAMT.build(
+        cas=InMemoryCAS(),
+        hash_fn=cascading_overflow_hash,
+        max_bucket_size=1,
+        values_are_bytes=True,
+    )
+    expected_values = {"a": b"value-a", "b": b"value-b"}
+
+    for key, value in expected_values.items():
+        await hamt.set(key, value)
+
+    for key, value in expected_values.items():
+        assert await hamt.get(key) == value
 
 
 @pytest.mark.asyncio

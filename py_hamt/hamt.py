@@ -638,8 +638,6 @@ class HAMT:
                 continue
 
             for bucket_key, bucket_value in bucket.items():
-                if bucket_key not in key_hashes:
-                    key_hashes[bucket_key] = self.hash_fn(bucket_key.encode())
                 kvs_queue.append((bucket_key, bucket_value, key_hashes[bucket_key]))
 
             new_node = Node()
