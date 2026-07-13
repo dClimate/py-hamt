@@ -1352,7 +1352,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self,
         cache_key: ShardCacheKey,
         shard_idx: int,
-        shard_cid: str,
+        shard_cid: IPLDKind,
         expected_entries: int,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -1392,7 +1392,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self,
         cache_key: ShardCacheKey,
         shard_idx: int,
-        shard_cid: str,
+        shard_cid: IPLDKind,
         index_in_shard: int,
         expected_entries: int,
     ) -> Optional[CID]:
@@ -1591,7 +1591,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             return None
         req_offset, req_length, req_suffix = self._map_byte_request(byte_range)
         data = await self.cas.load(
-            str(metadata_cid_obj),
+            metadata_cid_obj,
             offset=req_offset,
             length=req_length,
             suffix=req_suffix,
@@ -1654,10 +1654,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
         shard_cid_obj = array_index.shard_cids[shard_idx]
         if shard_cid_obj:
             self._pending_shard_loads[cache_key] = asyncio.Event()
-            shard_cid_str = str(shard_cid_obj)
             try:
                 await self._fetch_and_cache_full_shard(
-                    cache_key, shard_idx, shard_cid_str, array_index.chunks_per_shard
+                    cache_key, shard_idx, shard_cid_obj, array_index.chunks_per_shard
                 )
             finally:
                 pending_load = self._pending_shard_loads.pop(cache_key, None)
@@ -1865,7 +1864,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                             byte_range
                         )
                         data = await self.cas.load(
-                            str(metadata_cid_obj),
+                            metadata_cid_obj,
                             offset=req_offset,
                             length=req_length,
                             suffix=req_suffix,
@@ -1905,7 +1904,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                         chunk_cid_obj = await self._load_sparse_shard_entry(
                             cache_key,
                             shard_idx,
-                            str(array_index.shard_cids[shard_idx]),
+                            cast(CID, array_index.shard_cids[shard_idx]),
                             index_in_shard,
                             array_index.chunks_per_shard,
                         )
@@ -1922,11 +1921,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     hit = legacy_buffer is not None
                     return legacy_buffer
 
-                chunk_cid_str = str(chunk_cid_obj)
-
                 req_offset, req_length, req_suffix = self._map_byte_request(byte_range)
                 data = await self.cas.load(
-                    chunk_cid_str,
+                    chunk_cid_obj,
                     offset=req_offset,
                     length=req_length,
                     suffix=req_suffix,
@@ -1970,7 +1967,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         try:
             data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
-            await self._set_pointer(key, str(data_cid_obj), register_metadata=False)
+            await self._set_pointer_cid(
+                key, cast(CID, data_cid_obj), register_metadata=False
+            )
             if parsed_chunk is None:
                 self._metadata_read_cache[key] = raw_data_bytes
         except Exception as e:
@@ -1987,17 +1986,22 @@ class ShardedZarrStore(zarr.abc.store.Store):
     async def _set_pointer(
         self, key: str, pointer: str, *, register_metadata: bool
     ) -> None:
+        await self._set_pointer_cid(
+            key, CID.decode(pointer), register_metadata=register_metadata
+        )
+
+    async def _set_pointer_cid(
+        self, key: str, pointer_cid_obj: CID, *, register_metadata: bool
+    ) -> None:
         try:
             parsed_chunk = self._parse_chunk_key(key)
         except (ValueError, IndexError):
             if self._manifest_version != SHARDED_ZARR_V2:
                 raise
             return None
-        pointer_cid_obj = CID.decode(pointer)
-
         if parsed_chunk is None:
             if register_metadata and self._manifest_version == SHARDED_ZARR_V2:
-                raw_metadata = await self.cas.load(str(pointer_cid_obj))
+                raw_metadata = await self.cas.load(pointer_cid_obj)
                 stripped_metadata = self._strip_v2_root_consolidated_metadata(
                     key, raw_metadata
                 )
@@ -2014,7 +2018,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 register_metadata
                 and self._array_path_from_metadata_key(key) is not None
             ):
-                raw_metadata = await self.cas.load(str(pointer_cid_obj))
+                raw_metadata = await self.cas.load(pointer_cid_obj)
                 await self._register_array_metadata_from_bytes(key, raw_metadata)
             if register_metadata:
                 await self._ensure_v2_parent_group_metadata(key)

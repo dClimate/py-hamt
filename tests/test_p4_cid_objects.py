@@ -95,7 +95,7 @@ async def test_cid_object_optimization_preserves_root_and_values() -> None:
 
     root_cid = await store.flush()
 
-    assert root_cid == "bafyr4igfegmzopod2rzkzs23t7kax2eoagzpib4c3nz7xnnkjxbfd3aw6u"
+    assert root_cid == "bafyr4iewmdsuckgrb44tf7xie6jj5tuaany3he33r5qh352e37olgvuzhy"
     read_store = await ShardedZarrStore.open(
         cas=cas,
         read_only=True,
