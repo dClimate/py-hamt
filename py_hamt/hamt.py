@@ -604,82 +604,99 @@ class HAMT:
         pointer: IPLDKind = await self.cas.save(data, codec="raw")
         await self._set_pointer(key, pointer)
 
+    async def _build_overflow_subtree(
+        self,
+        kvs_queue: list[tuple[str, IPLDKind, bytes]],
+        depth: int,
+        key_hashes: dict[str, bytes],
+    ) -> IPLDKind:
+        """Build a detached subtree for a full bucket.
+
+        Every node touched here is new to the current write. Hash exhaustion can
+        therefore fail without exposing a partial mutation in the existing tree.
+        """
+        root_node = Node()
+        root_node_id = await self.node_store.save(None, root_node)
+        node_stack: list[tuple[IPLDKind, Node]] = [(root_node_id, root_node)]
+
+        while kvs_queue:
+            _, top_node = node_stack[-1]
+            curr_key, curr_val_ptr, raw_hash = kvs_queue[0]
+            map_key = extract_bits(raw_hash, depth + len(node_stack) - 1, 8)
+
+            item = top_node.data[map_key]
+            if isinstance(item, list):
+                next_node_id = item[0]
+                next_node = await self.node_store.load(next_node_id)
+                node_stack.append((next_node_id, next_node))
+                continue
+
+            bucket = cast(dict[str, IPLDKind], item)
+            if curr_key in bucket or len(bucket) < self.max_bucket_size:
+                bucket[curr_key] = curr_val_ptr
+                kvs_queue.pop(0)
+                continue
+
+            for bucket_key, bucket_value in bucket.items():
+                if bucket_key not in key_hashes:
+                    key_hashes[bucket_key] = self.hash_fn(bucket_key.encode())
+                kvs_queue.append((bucket_key, bucket_value, key_hashes[bucket_key]))
+
+            new_node = Node()
+            new_node_id = await self.node_store.save(None, new_node)
+            top_node.set_link(map_key, new_node_id)
+
+        return root_node_id
+
     async def _set_pointer(self, key: str, val_ptr: IPLDKind) -> None:
         """Set a value pointer without exposing partial tree mutations on failure."""
         async with self.lock:
             node_store = cast(InMemoryTreeStore, self.node_store)
-            original_buffer_ids: set[int] = set(node_store.buffer)
-            original_node_data: dict[int, tuple[Node, list[IPLDKind]]] = {}
+            node_stack: list[tuple[IPLDKind, Node]] = []
+            link_path: list[int] = [-1]
+            root_node: Node = await self.node_store.load(self.root_node_id)
+            node_stack.append((self.root_node_id, root_node))
 
-            def preserve_node(node: Node) -> None:
-                node_identity = id(node)
-                if node_identity not in original_node_data:
-                    original_node_data[node_identity] = (node, deepcopy(node.data))
+            raw_hash = self.hash_fn(key.encode())
+            while True:
+                _, top_node = node_stack[-1]
+                map_key = extract_bits(raw_hash, len(node_stack) - 1, 8)
 
-            try:
-                node_stack: list[tuple[IPLDKind, Node]] = []
-                link_path: list[int] = [-1]
-                root_node: Node = await self.node_store.load(self.root_node_id)
-                node_stack.append((self.root_node_id, root_node))
+                item = top_node.data[map_key]
+                if isinstance(item, list):
+                    next_node_id = item[0]
+                    next_node = await self.node_store.load(next_node_id)
+                    node_stack.append((next_node_id, next_node))
+                    link_path.append(map_key)
+                    continue
 
-                # FIFO queue to keep track of all the KVs we need to insert
-                # This is needed if any buckets overflow and so we need to reinsert all those KVs
-                key_hashes: dict[str, bytes] = {key: self.hash_fn(key.encode())}
-                kvs_queue: list[tuple[str, IPLDKind, bytes]] = []
-                kvs_queue.append((key, val_ptr, key_hashes[key]))
+                bucket = cast(dict[str, IPLDKind], item)
+                if key in bucket or len(bucket) < self.max_bucket_size:
+                    bucket[key] = val_ptr
+                    break
 
-                while len(kvs_queue) > 0:
-                    _, top_node = node_stack[-1]
-                    curr_key, curr_val_ptr, raw_hash = kvs_queue[0]
+                key_hashes = {key: raw_hash}
+                kvs_queue = [(key, val_ptr, raw_hash)]
+                for bucket_key, bucket_value in bucket.items():
+                    key_hashes[bucket_key] = self.hash_fn(bucket_key.encode())
+                    kvs_queue.append((bucket_key, bucket_value, key_hashes[bucket_key]))
 
-                    map_key: int = extract_bits(raw_hash, len(node_stack) - 1, 8)
+                original_buffer_ids = set(node_store.buffer)
+                try:
+                    new_node_id = await self._build_overflow_subtree(
+                        kvs_queue, len(node_stack), key_hashes
+                    )
+                except BaseException:
+                    for buffer_id in set(node_store.buffer) - original_buffer_ids:
+                        del node_store.buffer[buffer_id]
+                    raise
 
-                    item = top_node.data[map_key]
-                    if isinstance(item, list):
-                        next_node_id: IPLDKind = item[0]
-                        next_node: Node = await self.node_store.load(next_node_id)
-                        node_stack.append((next_node_id, next_node))
-                        link_path.append(map_key)
-                    elif isinstance(item, dict):
-                        bucket: dict[str, IPLDKind] = item
+                top_node.set_link(map_key, new_node_id)
+                break
 
-                        # If this bucket already has this same key, or has space, just rewrite the value and then go work on the others in the queue
-                        if curr_key in bucket or len(bucket) < self.max_bucket_size:
-                            preserve_node(top_node)
-                            bucket[curr_key] = curr_val_ptr
-                            kvs_queue.pop(0)
-                            continue
-
-                        # The current key is not in the bucket and the bucket is too full, so empty KVs from the bucket and restart insertion
-                        for k in bucket:
-                            v_ptr = bucket[k]
-                            if k not in key_hashes:
-                                key_hashes[k] = self.hash_fn(k.encode())
-                            kvs_queue.append((k, v_ptr, key_hashes[k]))
-
-                        # Create a new link to a new node so that we can reflow these KVs into a new subtree
-                        new_node = Node()
-                        new_node_id: IPLDKind = await self.node_store.save(
-                            None, new_node
-                        )
-                        link: list[IPLDKind] = [new_node_id]
-                        preserve_node(top_node)
-                        top_node.data[map_key] = link
-
-                # Relinking can mutate any ancestor, so retain every traversed node
-                # until serialization has completed successfully.
-                for _, node in node_stack:
-                    preserve_node(node)
-
-                # Finally, reserialize and fix all links, deleting empty nodes as needed
-                await self._reserialize_and_link(node_stack, link_path)
-                self.root_node_id = node_stack[0][0]
-            except BaseException:
-                for node, original_data in original_node_data.values():
-                    node.data = original_data
-                for buffer_id in set(node_store.buffer) - original_buffer_ids:
-                    del node_store.buffer[buffer_id]
-                raise
+            # Finally, reserialize and fix all links.
+            await self._reserialize_and_link(node_stack, link_path)
+            self.root_node_id = node_stack[0][0]
 
     async def delete(self, key: str) -> None:
         """Delete a key-value mapping."""
