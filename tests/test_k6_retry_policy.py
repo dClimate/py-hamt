@@ -1,7 +1,7 @@
 import socket
 import threading
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -98,7 +98,12 @@ def make_cas(url: str, *, max_retries: int = 3) -> KuboCAS:
 def test_retry_delay_parses_http_dates_and_ignores_invalid_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    future_naive_datetime = datetime.now() + timedelta(seconds=30)
+    # parsedate_to_datetime yields a naive datetime when the header lacks a
+    # timezone; _retry_delay treats such values as UTC, so anchor the fake
+    # future time to UTC (not local) to stay timezone-independent.
+    future_naive_datetime = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=30)
     monkeypatch.setattr(
         store_httpx,
         "parsedate_to_datetime",
