@@ -782,18 +782,18 @@ async def test_listing_and_metadata(
 
         # Test listing with a prefix
         prefix = "temp/"
-        with pytest.raises(
-            NotImplementedError, match="Listing with a prefix is not implemented yet."
-        ):
-            async for key in store_read.list_dir(prefix):
-                print(f"Key with prefix '{prefix}': {key}")
+        prefixed_dir_keys = {key async for key in store_read.list_dir(prefix)}
+        assert prefixed_dir_keys == {"zarr.json", "c"}
 
-        with pytest.raises(
-            ValueError, match="Byte range requests are not supported for metadata keys."
-        ):
-            proto = zarr.core.buffer.default_buffer_prototype()
-            byte_range = zarr.abc.store.RangeByteRequest(start=10, end=50)
-            await store_read.get("lat/zarr.json", proto, byte_range=byte_range)
+        proto = zarr.core.buffer.default_buffer_prototype()
+        byte_range = zarr.abc.store.RangeByteRequest(start=10, end=50)
+        full_metadata = await store_read.get("lat/zarr.json", proto)
+        ranged_metadata = await store_read.get(
+            "lat/zarr.json", proto, byte_range=byte_range
+        )
+        assert full_metadata is not None
+        assert ranged_metadata is not None
+        assert ranged_metadata.to_bytes() == full_metadata.to_bytes()[10:50]
 
 
 @pytest.mark.asyncio
@@ -986,10 +986,17 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert store._parse_chunk_key("zarr.json") is None
         assert store._parse_chunk_key("group1/zarr.json") is None
 
-        # Test excluded array prefixes
+        store._primary_array_path = "temp"
+
+        # Test chunks from non-primary arrays
         assert store._parse_chunk_key("time/c/0") is None
         assert store._parse_chunk_key("lat/c/0/0") is None
         assert store._parse_chunk_key("lon/c/0/0") is None
+        assert store._parse_chunk_key("x/c/0") is None
+
+        # Only the named primary array owns the shard index.
+        assert store._parse_chunk_key("c/0/0") is None
+        assert store._parse_chunk_key("temp/c/0/0") == (0, 0)
 
         # Test dimensionality mismatch
         with pytest.raises(IndexError, match="tuple index out of range"):
