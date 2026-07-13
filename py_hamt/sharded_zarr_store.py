@@ -801,7 +801,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 shard_cids=chunk_info["shard_cids"],
             )
         }
-        self._primary_array_path = ""
+        primary_array_path = chunk_info.get("primary_array_path", "")
+        self._primary_array_path = (
+            self._normalize_array_path(primary_array_path)
+            if isinstance(primary_array_path, str)
+            else ""
+        )
 
     def _load_v2_root(self) -> None:
         metadata = self._root_obj.get("metadata")
@@ -1426,6 +1431,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
             )
             if actual_array_name in self._V1_COORDINATE_ARRAY_PREFIXES:
                 return None
+            recorded_path = self._root_obj.get("chunks", {}).get("primary_array_path")
+            if isinstance(
+                recorded_path, str
+            ) and normalized_path != self._normalize_array_path(recorded_path):
+                return None
 
         parts = coord_part.split("/")
         try:
@@ -1845,13 +1855,22 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     metadata_cid_obj = self._root_obj["metadata"].get(lookup_key)
                     if metadata_cid_obj is None:
                         return None
-                    if byte_range is not None:
-                        raise ValueError(
-                            "Byte range requests are not supported for metadata keys."
-                        )
-                    data = self._metadata_read_cache.get(lookup_key)
+                    data = (
+                        self._metadata_read_cache.get(lookup_key)
+                        if byte_range is None
+                        else None
+                    )
                     if data is None:
-                        data = await self.cas.load(str(metadata_cid_obj))
+                        req_offset, req_length, req_suffix = self._map_byte_request(
+                            byte_range
+                        )
+                        data = await self.cas.load(
+                            str(metadata_cid_obj),
+                            offset=req_offset,
+                            length=req_length,
+                            suffix=req_suffix,
+                        )
+                    if byte_range is None:
                         self._metadata_read_cache[lookup_key] = data
                     hit = True
                     return prototype.buffer.from_bytes(data)
@@ -2003,6 +2022,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
             self._metadata_read_cache.pop(key, None)
             self._dirty_root = True
             return None
+
+        if self._manifest_version == SHARDED_ZARR_V1:
+            chunk_info = self._root_obj["chunks"]
+            if "primary_array_path" not in chunk_info:
+                self._primary_array_path = parsed_chunk.array_path
+                chunk_info["primary_array_path"] = parsed_chunk.array_path
+                self._dirty_root = True
 
         array_index = self._array_index_for_path(parsed_chunk.array_path)
         linear_chunk_index = self._get_linear_chunk_index_for_index(
@@ -2207,13 +2233,17 @@ class ShardedZarrStore(zarr.abc.store.Store):
             yielded.add(key)
             yield key
 
-        if self._manifest_version == SHARDED_ZARR_V2:
-            async for chunk_key in self._iter_chunk_keys():
-                if chunk_key not in yielded:
-                    yield chunk_key
+        async for chunk_key in self._iter_chunk_keys():
+            if chunk_key not in yielded:
+                yield chunk_key
 
     async def _iter_chunk_keys(self) -> AsyncIterator[str]:
         for array_path, array_index in self.array_indices.items():
+            listed_array_path = (
+                self._primary_array_path
+                if self._manifest_version == SHARDED_ZARR_V1
+                else array_path
+            )
             for shard_idx in range(array_index.num_shards):
                 cache_key = self._cache_key(array_path, shard_idx)
                 shard_data = await self._shard_data_cache.get(cache_key)
@@ -2235,7 +2265,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     coords = self._coords_from_linear_index(
                         linear_index, array_index.chunks_per_dim
                     )
-                    yield self._format_chunk_key(array_path, coords)
+                    yield self._format_chunk_key(listed_array_path or "", coords)
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
         async for key in self.list():
@@ -2245,6 +2275,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
     def _list_dir_candidate_keys(self) -> Set[str]:
         keys = set(self._root_obj.get("metadata", {}))
         if self._manifest_version != SHARDED_ZARR_V2:
+            chunk_prefix = (
+                "c" if not self._primary_array_path else f"{self._primary_array_path}/c"
+            )
+            keys.add(chunk_prefix)
             return keys
 
         for array_path in self.array_indices:

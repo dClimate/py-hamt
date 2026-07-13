@@ -785,12 +785,15 @@ async def test_listing_and_metadata(
         prefixed_dir_keys = {key async for key in store_read.list_dir(prefix)}
         assert {"zarr.json"}.issubset(prefixed_dir_keys)
 
-        with pytest.raises(
-            ValueError, match="Byte range requests are not supported for metadata keys."
-        ):
-            proto = zarr.core.buffer.default_buffer_prototype()
-            byte_range = zarr.abc.store.RangeByteRequest(start=10, end=50)
-            await store_read.get("lat/zarr.json", proto, byte_range=byte_range)
+        proto = zarr.core.buffer.default_buffer_prototype()
+        byte_range = zarr.abc.store.RangeByteRequest(start=10, end=50)
+        full_metadata = await store_read.get("lat/zarr.json", proto)
+        ranged_metadata = await store_read.get(
+            "lat/zarr.json", proto, byte_range=byte_range
+        )
+        assert full_metadata is not None
+        assert ranged_metadata is not None
+        assert ranged_metadata.to_bytes() == full_metadata.to_bytes()[10:50]
 
 
 @pytest.mark.asyncio
