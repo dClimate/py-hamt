@@ -146,6 +146,7 @@ class KuboCAS(ContentAddressedStore):
     client = httpx.AsyncClient(
         headers={"Authorization": "Bearer <token>"},
         auth=("user", "pass"),
+        follow_redirects=True,
     )
     cas = KuboCAS(client=client)
 
@@ -159,8 +160,10 @@ class KuboCAS(ContentAddressedStore):
     ### Parameters
     - **hasher** (str): multihash name (defaults to *blake3*).
     - **client** (`httpx.AsyncClient | None`): reuse an existing
-      client and its configured timeout; if *None* KuboCAS will create one
-      lazily with a 60-second timeout.
+      client and its configured timeout and redirect policy. User-supplied
+      clients should set ``follow_redirects=True`` when gateways may redirect.
+      If *None*, KuboCAS will create one lazily with a 60-second timeout and
+      redirect following enabled.
     - **headers** (dict[str, str] | None): default headers for the
       internally-created client.
     - **auth** (`tuple[str, str] | None`): authentication tuple (username, password)
@@ -207,7 +210,9 @@ class KuboCAS(ContentAddressedStore):
         A supplied client is associated with the running event loop lazily on
         first use, so constructing ``KuboCAS`` does not require an async context.
         Its configured timeout is respected. Clients created internally by
-        ``KuboCAS`` use a 60-second timeout.
+        ``KuboCAS`` use a 60-second timeout and follow redirects. Supplied
+        clients retain their own redirect policy and should be configured with
+        ``follow_redirects=True`` when gateways may redirect.
 
         If you are using the `KuboCAS` instance in an `async with` block, it will automatically close the client when the block is exited which is what we suggest below:
         ```python
@@ -386,6 +391,7 @@ class KuboCAS(ContentAddressedStore):
                     headers=self._default_headers,
                     auth=self._default_auth,
                     limits=self._default_limits,
+                    follow_redirects=True,
                     # Uncomment when they finally support Robust HTTP/2 GOAWAY responses
                     # http2=True,
                 )
