@@ -7,6 +7,7 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import (
     ClassVar,
@@ -278,7 +279,10 @@ class MemoryBoundedLRUCache:
     An LRU cache that evicts items when memory usage exceeds a threshold.
 
     Memory usage is calculated using sys.getsizeof for accurate sizing.
-    Dirty shards (those marked for writing) are never evicted until marked clean.
+    Dirty shards (those marked for writing) and shards pinned by active users are
+    never evicted. Pins are refcounted so concurrent users can safely share a shard.
+    If protected shards exceed the configured budget, the cache temporarily
+    overflows rather than evicting data that is in use or waiting to be flushed.
     All operations are thread-safe for async access using an asyncio.Lock.
     """
 
@@ -286,6 +290,7 @@ class MemoryBoundedLRUCache:
         self.max_memory_bytes = max_memory_bytes
         self._cache: OrderedDict[ShardCacheKey, List[Optional[CID]]] = OrderedDict()
         self._dirty_shards: Set[ShardCacheKey] = set()
+        self._pin_counts: Dict[ShardCacheKey, int] = {}
         self._shard_sizes: Dict[ShardCacheKey, int] = {}
         self._actual_memory_usage = 0
         self._cache_lock = asyncio.Lock()
@@ -329,27 +334,62 @@ class MemoryBoundedLRUCache:
             self._shard_sizes[shard_idx] = shard_size
             self._actual_memory_usage += shard_size
 
-            while (
-                self._actual_memory_usage > self.max_memory_bytes
-                and len(self._cache) > 1
-            ):
-                evicted = False
-                checked_dirty_shards = set()
-                while self._cache:
-                    candidate_idx, candidate_data = self._cache.popitem(last=False)
-                    if candidate_idx not in self._dirty_shards:
-                        self._actual_memory_usage -= self._shard_sizes.pop(
-                            candidate_idx, 0
-                        )
-                        evicted = True
-                        break
+            self._evict_if_needed_locked()
 
-                    self._cache[candidate_idx] = candidate_data
-                    checked_dirty_shards.add(candidate_idx)
-                    if len(checked_dirty_shards) == len(self._dirty_shards):
-                        break
-                if not evicted:
-                    break
+    def _evict_if_needed_locked(self) -> None:
+        """Evict clean, unpinned LRU entries while the cache lock is held."""
+        while (
+            self._actual_memory_usage > self.max_memory_bytes and len(self._cache) > 1
+        ):
+            candidate_idx = next(
+                (
+                    cached_idx
+                    for cached_idx in self._cache
+                    if cached_idx not in self._dirty_shards
+                    and self._pin_counts.get(cached_idx, 0) == 0
+                ),
+                None,
+            )
+            if candidate_idx is None:
+                return
+            self._cache.pop(candidate_idx)
+            self._actual_memory_usage -= self._shard_sizes.pop(candidate_idx, 0)
+
+    @asynccontextmanager
+    async def pin(self, shard_idx: ShardCacheKey) -> AsyncIterator[None]:
+        """Prevent a shard from being evicted for the duration of the context."""
+        async with self._cache_lock:
+            self._pin_counts[shard_idx] = self._pin_counts.get(shard_idx, 0) + 1
+        try:
+            yield
+        finally:
+            async with self._cache_lock:
+                remaining_pins = self._pin_counts[shard_idx] - 1
+                if remaining_pins:
+                    self._pin_counts[shard_idx] = remaining_pins
+                else:
+                    del self._pin_counts[shard_idx]
+                self._evict_if_needed_locked()
+
+    async def update_entry(
+        self, shard_idx: ShardCacheKey, entry_idx: int, value: Optional[CID]
+    ) -> bool:
+        """Update one cached entry and mark its shard dirty atomically."""
+        async with self._cache_lock:
+            shard_data = self._cache.get(shard_idx)
+            if shard_data is None:
+                raise RuntimeError(f"Shard {shard_idx} not found in cache")
+            if shard_data[entry_idx] == value:
+                return False
+
+            old_size = self._shard_sizes[shard_idx]
+            shard_data[entry_idx] = value
+            new_size = self._get_shard_size(shard_data)
+            self._shard_sizes[shard_idx] = new_size
+            self._actual_memory_usage += new_size - old_size
+            self._dirty_shards.add(shard_idx)
+            self._evict_if_needed_locked()
+            return True
 
     async def mark_dirty(self, shard_idx: ShardCacheKey) -> None:
         """Mark a shard as dirty (should not be evicted)."""
@@ -361,6 +401,7 @@ class MemoryBoundedLRUCache:
         """Mark a shard as clean (can be evicted)."""
         async with self._cache_lock:
             self._dirty_shards.discard(shard_idx)
+            self._evict_if_needed_locked()
 
     async def discard(self, shard_idx: ShardCacheKey) -> None:
         """Remove one shard from cache and dirty tracking."""
@@ -760,7 +801,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 shard_cids=chunk_info["shard_cids"],
             )
         }
-        self._primary_array_path = ""
+        primary_array_path = chunk_info.get("primary_array_path", "")
+        self._primary_array_path = (
+            self._normalize_array_path(primary_array_path)
+            if isinstance(primary_array_path, str)
+            else ""
+        )
 
     def _load_v2_root(self) -> None:
         metadata = self._root_obj.get("metadata")
@@ -1306,7 +1352,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self,
         cache_key: ShardCacheKey,
         shard_idx: int,
-        shard_cid: str,
+        shard_cid: IPLDKind,
         expected_entries: int,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -1346,7 +1392,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         self,
         cache_key: ShardCacheKey,
         shard_idx: int,
-        shard_cid: str,
+        shard_cid: IPLDKind,
         index_in_shard: int,
         expected_entries: int,
     ) -> Optional[CID]:
@@ -1384,6 +1430,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 normalized_path.split("/")[-1] if normalized_path else ""
             )
             if actual_array_name in self._V1_COORDINATE_ARRAY_PREFIXES:
+                return None
+            recorded_path = self._root_obj.get("chunks", {}).get("primary_array_path")
+            if isinstance(
+                recorded_path, str
+            ) and normalized_path != self._normalize_array_path(recorded_path):
                 return None
 
         parts = coord_part.split("/")
@@ -1540,7 +1591,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             return None
         req_offset, req_length, req_suffix = self._map_byte_request(byte_range)
         data = await self.cas.load(
-            str(metadata_cid_obj),
+            metadata_cid_obj,
             offset=req_offset,
             length=req_length,
             suffix=req_suffix,
@@ -1548,6 +1599,17 @@ class ShardedZarrStore(zarr.abc.store.Store):
         return prototype.buffer.from_bytes(data)
 
     async def _load_or_initialize_shard_cache(
+        self, shard_idx: int, array_path: Optional[str] = None
+    ) -> List[Optional[CID]]:
+        """Return a shard after keeping it pinned throughout cache population."""
+        array_index = self._array_index_for_path(array_path)
+        cache_key = self._cache_key(array_index.array_path, shard_idx)
+        async with self._shard_data_cache.pin(cache_key):
+            return await self._load_or_initialize_shard_cache_pinned(
+                shard_idx, array_path
+            )
+
+    async def _load_or_initialize_shard_cache_pinned(
         self, shard_idx: int, array_path: Optional[str] = None
     ) -> List[Optional[CID]]:
         """
@@ -1592,10 +1654,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
         shard_cid_obj = array_index.shard_cids[shard_idx]
         if shard_cid_obj:
             self._pending_shard_loads[cache_key] = asyncio.Event()
-            shard_cid_str = str(shard_cid_obj)
             try:
                 await self._fetch_and_cache_full_shard(
-                    cache_key, shard_idx, shard_cid_str, array_index.chunks_per_shard
+                    cache_key, shard_idx, shard_cid_obj, array_index.chunks_per_shard
                 )
             finally:
                 pending_load = self._pending_shard_loads.pop(cache_key, None)
@@ -1615,6 +1676,19 @@ class ShardedZarrStore(zarr.abc.store.Store):
             entries=len(result),
         )
         return result
+
+    @asynccontextmanager
+    async def _use_shard(
+        self, shard_idx: int, array_path: Optional[str] = None
+    ) -> AsyncIterator[List[Optional[CID]]]:
+        """Yield a pinned shard while serializing access to its contents."""
+        array_index = self._array_index_for_path(array_path)
+        cache_key = self._cache_key(array_index.array_path, shard_idx)
+        async with self._shard_data_cache.pin(cache_key):
+            async with self._shard_locks[cache_key]:
+                yield await self._load_or_initialize_shard_cache(
+                    shard_idx, array_index.array_path
+                )
 
     async def set_partial_values(
         self, key_start_values: Iterable[Tuple[str, int, BytesLike]]
@@ -1688,52 +1762,55 @@ class ShardedZarrStore(zarr.abc.store.Store):
             dirty_shards = list(self._shard_data_cache._dirty_shards)
         if dirty_shards:
             for cache_key in sorted(dirty_shards, key=str):
-                shard_lock = self._shard_locks[cache_key]
-                async with shard_lock:
-                    shard_data_list = await self._shard_data_cache.get(cache_key)
-                    if shard_data_list is None:
-                        raise RuntimeError(
-                            f"Dirty shard {cache_key} not found in cache"
-                        )
-
-                    shard_data_bytes = dag_cbor.encode(cast(IPLDKind, shard_data_list))
-                    new_shard_cid_obj = await self.cas.save(
-                        shard_data_bytes,
-                        codec="dag-cbor",
-                    )
-                    if not isinstance(new_shard_cid_obj, CID):  # pragma: no cover
-                        raise TypeError(
-                            "ShardedZarrStore requires CAS.save to return CIDs."
-                        )
-
-                    if self._manifest_version == SHARDED_ZARR_V1:
-                        if not isinstance(cache_key, int):  # pragma: no cover
-                            raise TypeError("v1 shard cache keys must be integers.")
-                        shard_idx = int(cache_key)
-                        if (
-                            self._root_obj["chunks"]["shard_cids"][shard_idx]
-                            != new_shard_cid_obj
-                        ):
-                            self._root_obj["chunks"]["shard_cids"][shard_idx] = (
-                                new_shard_cid_obj
+                async with self._shard_data_cache.pin(cache_key):
+                    shard_lock = self._shard_locks[cache_key]
+                    async with shard_lock:
+                        shard_data_list = await self._shard_data_cache.get(cache_key)
+                        if shard_data_list is None:
+                            raise RuntimeError(
+                                f"Dirty shard {cache_key} not found in cache"
                             )
-                            self.array_indices[""].shard_cids[shard_idx] = (
-                                new_shard_cid_obj
-                            )
-                            self._dirty_root = True
-                    else:
-                        if isinstance(cache_key, int):  # pragma: no cover
+
+                        shard_data_bytes = dag_cbor.encode(
+                            cast(IPLDKind, shard_data_list)
+                        )
+                        new_shard_cid_obj = await self.cas.save(
+                            shard_data_bytes,
+                            codec="dag-cbor",
+                        )
+                        if not isinstance(new_shard_cid_obj, CID):  # pragma: no cover
                             raise TypeError(
-                                "v2 shard cache keys must include array paths."
+                                "ShardedZarrStore requires CAS.save to return CIDs."
                             )
-                        array_path, shard_idx = cache_key
-                        array_index = self.array_indices[array_path]
-                        if array_index.shard_cids[shard_idx] != new_shard_cid_obj:
-                            array_index.shard_cids[shard_idx] = new_shard_cid_obj
-                            self._dirty_root = True
-                            self._sync_arrays_to_root()
 
-                    await self._shard_data_cache.mark_clean(cache_key)
+                        if self._manifest_version == SHARDED_ZARR_V1:
+                            if not isinstance(cache_key, int):  # pragma: no cover
+                                raise TypeError("v1 shard cache keys must be integers.")
+                            shard_idx = int(cache_key)
+                            if (
+                                self._root_obj["chunks"]["shard_cids"][shard_idx]
+                                != new_shard_cid_obj
+                            ):
+                                self._root_obj["chunks"]["shard_cids"][shard_idx] = (
+                                    new_shard_cid_obj
+                                )
+                                self.array_indices[""].shard_cids[shard_idx] = (
+                                    new_shard_cid_obj
+                                )
+                                self._dirty_root = True
+                        else:
+                            if isinstance(cache_key, int):  # pragma: no cover
+                                raise TypeError(
+                                    "v2 shard cache keys must include array paths."
+                                )
+                            array_path, shard_idx = cache_key
+                            array_index = self.array_indices[array_path]
+                            if array_index.shard_cids[shard_idx] != new_shard_cid_obj:
+                                array_index.shard_cids[shard_idx] = new_shard_cid_obj
+                                self._dirty_root = True
+                                self._sync_arrays_to_root()
+
+                        await self._shard_data_cache.mark_clean(cache_key)
 
         if self._dirty_root:
             self._root_obj["metadata"] = {
@@ -1777,13 +1854,22 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     metadata_cid_obj = self._root_obj["metadata"].get(lookup_key)
                     if metadata_cid_obj is None:
                         return None
-                    if byte_range is not None:
-                        raise ValueError(
-                            "Byte range requests are not supported for metadata keys."
-                        )
-                    data = self._metadata_read_cache.get(lookup_key)
+                    data = (
+                        self._metadata_read_cache.get(lookup_key)
+                        if byte_range is None
+                        else None
+                    )
                     if data is None:
-                        data = await self.cas.load(str(metadata_cid_obj))
+                        req_offset, req_length, req_suffix = self._map_byte_request(
+                            byte_range
+                        )
+                        data = await self.cas.load(
+                            metadata_cid_obj,
+                            offset=req_offset,
+                            length=req_length,
+                            suffix=req_suffix,
+                        )
+                    if byte_range is None:
                         self._metadata_read_cache[lookup_key] = data
                     hit = True
                     return prototype.buffer.from_bytes(data)
@@ -1818,7 +1904,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                         chunk_cid_obj = await self._load_sparse_shard_entry(
                             cache_key,
                             shard_idx,
-                            str(array_index.shard_cids[shard_idx]),
+                            cast(CID, array_index.shard_cids[shard_idx]),
                             index_in_shard,
                             array_index.chunks_per_shard,
                         )
@@ -1835,11 +1921,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     hit = legacy_buffer is not None
                     return legacy_buffer
 
-                chunk_cid_str = str(chunk_cid_obj)
-
                 req_offset, req_length, req_suffix = self._map_byte_request(byte_range)
                 data = await self.cas.load(
-                    chunk_cid_str,
+                    chunk_cid_obj,
                     offset=req_offset,
                     length=req_length,
                     suffix=req_suffix,
@@ -1883,7 +1967,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         try:
             data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
-            await self._set_pointer(key, str(data_cid_obj), register_metadata=False)
+            await self._set_pointer_cid(
+                key, cast(CID, data_cid_obj), register_metadata=False
+            )
             if parsed_chunk is None:
                 self._metadata_read_cache[key] = raw_data_bytes
         except Exception as e:
@@ -1900,17 +1986,22 @@ class ShardedZarrStore(zarr.abc.store.Store):
     async def _set_pointer(
         self, key: str, pointer: str, *, register_metadata: bool
     ) -> None:
+        await self._set_pointer_cid(
+            key, CID.decode(pointer), register_metadata=register_metadata
+        )
+
+    async def _set_pointer_cid(
+        self, key: str, pointer_cid_obj: CID, *, register_metadata: bool
+    ) -> None:
         try:
             parsed_chunk = self._parse_chunk_key(key)
         except (ValueError, IndexError):
             if self._manifest_version != SHARDED_ZARR_V2:
                 raise
             return None
-        pointer_cid_obj = CID.decode(pointer)
-
         if parsed_chunk is None:
             if register_metadata and self._manifest_version == SHARDED_ZARR_V2:
-                raw_metadata = await self.cas.load(str(pointer_cid_obj))
+                raw_metadata = await self.cas.load(pointer_cid_obj)
                 stripped_metadata = self._strip_v2_root_consolidated_metadata(
                     key, raw_metadata
                 )
@@ -1927,7 +2018,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 register_metadata
                 and self._array_path_from_metadata_key(key) is not None
             ):
-                raw_metadata = await self.cas.load(str(pointer_cid_obj))
+                raw_metadata = await self.cas.load(pointer_cid_obj)
                 await self._register_array_metadata_from_bytes(key, raw_metadata)
             if register_metadata:
                 await self._ensure_v2_parent_group_metadata(key)
@@ -1935,6 +2026,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
             self._metadata_read_cache.pop(key, None)
             self._dirty_root = True
             return None
+
+        if self._manifest_version == SHARDED_ZARR_V1:
+            chunk_info = self._root_obj["chunks"]
+            if "primary_array_path" not in chunk_info:
+                self._primary_array_path = parsed_chunk.array_path
+                chunk_info["primary_array_path"] = parsed_chunk.array_path
+                self._dirty_root = True
 
         array_index = self._array_index_for_path(parsed_chunk.array_path)
         linear_chunk_index = self._get_linear_chunk_index_for_index(
@@ -1945,15 +2043,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
         )
 
         cache_key = self._cache_key(array_index.array_path, shard_idx)
-        shard_lock = self._shard_locks[cache_key]
-        async with shard_lock:
-            target_shard_list = await self._load_or_initialize_shard_cache(
-                shard_idx, array_index.array_path
+        async with self._use_shard(shard_idx, array_index.array_path):
+            await self._shard_data_cache.update_entry(
+                cache_key, index_in_shard, pointer_cid_obj
             )
-
-            if target_shard_list[index_in_shard] != pointer_cid_obj:
-                target_shard_list[index_in_shard] = pointer_cid_obj
-                await self._shard_data_cache.mark_dirty(cache_key)
         return None
 
     async def exists(self, key: str) -> bool:
@@ -1972,12 +2065,12 @@ class ShardedZarrStore(zarr.abc.store.Store):
             shard_idx, index_in_shard = self._get_shard_info_for_index(
                 linear_chunk_index, array_index
             )
-            target_shard_list = await self._load_or_initialize_shard_cache(
+            async with self._use_shard(
                 shard_idx, array_index.array_path
-            )
-            return target_shard_list[
-                index_in_shard
-            ] is not None or lookup_key in self._root_obj.get("metadata", {})
+            ) as target_shard_list:
+                return target_shard_list[
+                    index_in_shard
+                ] is not None or lookup_key in self._root_obj.get("metadata", {})
         except (ValueError, IndexError, KeyError):
             return False
 
@@ -2029,15 +2122,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
         )
 
         cache_key = self._cache_key(array_index.array_path, shard_idx)
-        shard_lock = self._shard_locks[cache_key]
-        async with shard_lock:
-            target_shard_list = await self._load_or_initialize_shard_cache(
-                shard_idx, array_index.array_path
+        async with self._use_shard(shard_idx, array_index.array_path):
+            changed = await self._shard_data_cache.update_entry(
+                cache_key, index_in_shard, None
             )
-            if target_shard_list[index_in_shard] is not None:
-                target_shard_list[index_in_shard] = None
-                await self._shard_data_cache.mark_dirty(cache_key)
-            elif self._root_obj["metadata"].pop(key, None) is not None:
+            if not changed and self._root_obj["metadata"].pop(key, None) is not None:
                 self._metadata_read_cache.pop(key, None)
                 self._dirty_root = True
 
@@ -2148,13 +2237,17 @@ class ShardedZarrStore(zarr.abc.store.Store):
             yielded.add(key)
             yield key
 
-        if self._manifest_version == SHARDED_ZARR_V2:
-            async for chunk_key in self._iter_chunk_keys():
-                if chunk_key not in yielded:
-                    yield chunk_key
+        async for chunk_key in self._iter_chunk_keys():
+            if chunk_key not in yielded:
+                yield chunk_key
 
     async def _iter_chunk_keys(self) -> AsyncIterator[str]:
         for array_path, array_index in self.array_indices.items():
+            listed_array_path = (
+                self._primary_array_path
+                if self._manifest_version == SHARDED_ZARR_V1
+                else array_path
+            )
             for shard_idx in range(array_index.num_shards):
                 cache_key = self._cache_key(array_path, shard_idx)
                 shard_data = await self._shard_data_cache.get(cache_key)
@@ -2176,7 +2269,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     coords = self._coords_from_linear_index(
                         linear_index, array_index.chunks_per_dim
                     )
-                    yield self._format_chunk_key(array_path, coords)
+                    yield self._format_chunk_key(listed_array_path or "", coords)
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
         async for key in self.list():
@@ -2186,6 +2279,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
     def _list_dir_candidate_keys(self) -> Set[str]:
         keys = set(self._root_obj.get("metadata", {}))
         if self._manifest_version != SHARDED_ZARR_V2:
+            chunk_prefix = (
+                "c" if not self._primary_array_path else f"{self._primary_array_path}/c"
+            )
+            keys.add(chunk_prefix)
             return keys
 
         for array_path in self.array_indices:
@@ -2292,14 +2389,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
             )
 
             cache_key = self._cache_key(target_index.array_path, global_shard_idx)
-            shard_lock = self._shard_locks[cache_key]
-            async with shard_lock:
-                target_shard_list = await self._load_or_initialize_shard_cache(
-                    global_shard_idx, target_index.array_path
+            async with self._use_shard(global_shard_idx, target_index.array_path):
+                await self._shard_data_cache.update_entry(
+                    cache_key, index_in_global_shard, pointer_cid_obj
                 )
-                if target_shard_list[index_in_global_shard] != pointer_cid_obj:
-                    target_shard_list[index_in_global_shard] = pointer_cid_obj
-                    await self._shard_data_cache.mark_dirty(cache_key)
 
     async def resize_store(
         self, new_shape: Tuple[int, ...], *, array_path: Optional[str] = None
