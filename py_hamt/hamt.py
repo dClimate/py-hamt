@@ -20,6 +20,8 @@ from dag_cbor.ipld import IPLDKind
 from . import instrumentation
 from .store_httpx import ContentAddressedStore
 
+_VACATE_CONCURRENCY = 16
+
 
 def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
     """
@@ -279,12 +281,25 @@ class InMemoryTreeStore(NodeStore):
                     if buffer_id in remaining_ids
                     and buffered_children[buffer_id].isdisjoint(remaining_ids)
                 ]
-                new_ids: list[IPLDKind] = await asyncio.gather(*[
-                    self.hamt.cas.save(
-                        self.buffer[buffer_id].serialize(), codec="dag-cbor"
-                    )
+                vacate_semaphore = asyncio.Semaphore(_VACATE_CONCURRENCY)
+
+                async def save_node(buffer_id: int) -> IPLDKind:
+                    async with vacate_semaphore:
+                        return await self.hamt.cas.save(
+                            self.buffer[buffer_id].serialize(), codec="dag-cbor"
+                        )
+
+                save_tasks = [
+                    asyncio.ensure_future(save_node(buffer_id))
                     for buffer_id in wave_ids
-                ])
+                ]
+                try:
+                    new_ids: list[IPLDKind] = await asyncio.gather(*save_tasks)
+                except BaseException:
+                    for save_task in save_tasks:
+                        save_task.cancel()
+                    await asyncio.gather(*save_tasks, return_exceptions=True)
+                    raise
 
                 for old_id, new_id in zip(wave_ids, new_ids):
                     parent_id = parent_ids[old_id]
