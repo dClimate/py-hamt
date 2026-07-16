@@ -1967,9 +1967,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         try:
             data_cid_obj = await self.cas.save(raw_data_bytes, codec="raw")
-            await self._set_pointer_cid(
-                key, cast(CID, data_cid_obj), register_metadata=False
-            )
+            if not isinstance(data_cid_obj, CID):
+                raise TypeError("ShardedZarrStore requires CAS.save to return CIDs.")
+            await self._set_pointer_cid(key, data_cid_obj, register_metadata=False)
             if parsed_chunk is None:
                 self._metadata_read_cache[key] = raw_data_bytes
         except Exception as e:
