@@ -2123,10 +2123,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         cache_key = self._cache_key(array_index.array_path, shard_idx)
         async with self._use_shard(shard_idx, array_index.array_path):
-            changed = await self._shard_data_cache.update_entry(
-                cache_key, index_in_shard, None
-            )
-            if not changed and self._root_obj["metadata"].pop(key, None) is not None:
+            await self._shard_data_cache.update_entry(cache_key, index_in_shard, None)
+            if self._root_obj["metadata"].pop(key, None) is not None:
                 self._metadata_read_cache.pop(key, None)
                 self._dirty_root = True
 
