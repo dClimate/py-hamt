@@ -505,15 +505,46 @@ class KuboCAS(ContentAddressedStore):
         Close every internally-created client, leaving a supplied client open.
 
         Must be called from an async context.
+
+        For clients owned by closed loops with stock async-only transports,
+        cleanup degenerates to a warning. The OS-level socket is shut down
+        with a FIN, but its local file descriptor is released at garbage
+        collection. Callers that require deterministic release should call
+        ``aclose()`` on the owning loop before it exits.
         """
-        # This method is async, so we can reliably await the async close method.
-        # The complex sync/async logic is handled by __del__.
-        for client in list(self._internally_created_clients):
-            if not client.is_closed:
+        try:
+            current_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        for owner_loop, client in list(self._client_per_loop.items()):
+            if client not in self._internally_created_clients:
+                continue
+
+            try:
+                if owner_loop is current_loop or not owner_loop.is_closed():
+                    await client.aclose()
+                    continue
+
+                # AsyncClient marks itself closed before awaiting its transport.
+                # A dead owner loop therefore needs the transport's sync fallback.
+                transport: Any = client._transport
+                close_transport = getattr(transport, "close", None)
+                if close_transport is None:
+                    await client.aclose()
+                    continue
+
+                close_transport()
                 try:
                     await client.aclose()
                 except Exception:
-                    pass  # best-effort cleanup
+                    pass  # The transport was already closed synchronously.
+            except Exception as exc:
+                warnings.warn(
+                    f"Failed to close an internally created HTTP client: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         self._client_per_loop.clear()
         self._internally_created_clients.clear()
