@@ -2,6 +2,7 @@ import socket
 import threading
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -101,9 +102,9 @@ def test_retry_delay_parses_http_dates_and_ignores_invalid_values(
     # parsedate_to_datetime yields a naive datetime when the header lacks a
     # timezone; _retry_delay treats such values as UTC, so anchor the fake
     # future time to UTC (not local) to stay timezone-independent.
-    future_naive_datetime = datetime.now(timezone.utc).replace(
-        tzinfo=None
-    ) + timedelta(seconds=30)
+    future_naive_datetime = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=30
+    )
     monkeypatch.setattr(
         store_httpx,
         "parsedate_to_datetime",
@@ -119,6 +120,34 @@ def test_retry_delay_parses_http_dates_and_ignores_invalid_values(
     monkeypatch.setattr(store_httpx.random, "random", lambda: 0.5)
     invalid_response = httpx.Response(429, headers={"Retry-After": "invalid"})
     assert store_httpx._retry_delay(10, 2, 1, invalid_response) == 10
+
+
+def test_retry_delay_uses_numeric_retry_after_as_minimum() -> None:
+    response = httpx.Response(429, headers={"Retry-After": "7"})
+
+    delay = store_httpx._retry_delay(1, 2, 1, response)
+
+    assert delay >= 7
+
+
+def test_retry_delay_uses_http_date_retry_after_as_minimum() -> None:
+    retry_at = datetime.now(timezone.utc) + timedelta(seconds=7)
+    response = httpx.Response(
+        503,
+        headers={"Retry-After": format_datetime(retry_at, usegmt=True)},
+    )
+
+    delay = store_httpx._retry_delay(1, 2, 1, response)
+
+    assert delay >= 5
+
+
+def test_retry_delay_preserves_short_retry_after() -> None:
+    response = httpx.Response(429, headers={"Retry-After": "1.5"})
+
+    delay = store_httpx._retry_delay(2, 2, 2, response)
+
+    assert delay == 1.5
 
 
 def test_slice_requested_range_handles_zero_suffix() -> None:
