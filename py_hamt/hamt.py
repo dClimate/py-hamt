@@ -901,13 +901,17 @@ class HAMT:
         """
         Return the number of key value mappings in this HAMT.
 
-        When the HAMT is write enabled, this counts a snapshot of the keys taken
-        under the async lock. The lock is released before counting, so concurrent
-        mutations do not affect this result. If read only, then this can be run
-        concurrently with other operations.
+        When the HAMT is write enabled, keys are counted directly while holding
+        the async lock, without materializing a snapshot. If read only, counting
+        can run concurrently with other operations.
         """
         count: int = 0
-        async for _ in self.keys():
-            count += 1
+        if self.read_only:
+            async for _ in self._keys_no_locking():
+                count += 1
+        else:
+            async with self.lock:
+                async for _ in self._keys_no_locking():
+                    count += 1
 
         return count
