@@ -316,6 +316,11 @@ class KuboCAS(ContentAddressedStore):
 
         if client is not None and client_factory is not None:
             raise ValueError("client and client_factory are mutually exclusive")
+        if client_factory is not None and (headers is not None or auth is not None):
+            raise ValueError(
+                "client_factory is mutually exclusive with headers/auth; "
+                "configure them on the clients the factory builds"
+            )
 
         self._owns_client: bool = False
         self._closed: bool = True
@@ -362,9 +367,11 @@ class KuboCAS(ContentAddressedStore):
             self._default_timeout: httpx.Timeout | float = client.timeout
             self._default_limits = self._copy_client_limits(client)
             self._default_follow_redirects: bool = client.follow_redirects
-            self._default_event_hooks: dict[str, list[Callable[..., Any]]] | None = (
-                client.event_hooks
-            )
+            # Snapshot the hooks like the headers above: later mutations of the
+            # supplied client must not leak into fallback clients.
+            self._default_event_hooks: dict[str, list[Callable[..., Any]]] | None = {
+                event: list(hooks) for event, hooks in client.event_hooks.items()
+            }
         else:
             # No client supplied. We will own any clients we create.
             self._owns_client = True
@@ -471,9 +478,9 @@ class KuboCAS(ContentAddressedStore):
                     warnings.warn(
                         "A user-supplied httpx.AsyncClient cannot be reused across "
                         "event loops; falling back to an internally created client "
-                        "that preserves only headers, auth, timeout, redirect policy, "
-                        "and event hooks. Pass client_factory to preserve full "
-                        "configuration.",
+                        "that preserves only headers, auth, timeout, limits, "
+                        "redirect policy, and event hooks. Pass client_factory to "
+                        "preserve full configuration.",
                         RuntimeWarning,
                         stacklevel=2,
                     )

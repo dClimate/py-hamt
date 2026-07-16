@@ -94,3 +94,11 @@ def test_second_loop_fallback_preserves_redirect_policy() -> None:
         assert fallback_client.follow_redirects is False
     finally:
         _close_clients(cas, supplied_client)
+
+
+def test_client_factory_rejects_headers_and_auth() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive with headers/auth"):
+        KuboCAS(
+            client_factory=httpx.AsyncClient,
+            headers={"X-Header": "value"},
+        )
