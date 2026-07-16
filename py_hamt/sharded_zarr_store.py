@@ -1499,9 +1499,20 @@ class ShardedZarrStore(zarr.abc.store.Store):
             if actual_array_name in self._V1_COORDINATE_ARRAY_PREFIXES:
                 return None
             recorded_path = self._root_obj.get("chunks", {}).get("primary_array_path")
-            if isinstance(
-                recorded_path, str
-            ) and normalized_path != self._normalize_array_path(recorded_path):
+            if isinstance(recorded_path, str):
+                primary_path_is_exclusive = True
+                effective_primary_path = recorded_path
+            elif self._primary_array_path:
+                primary_path_is_exclusive = True
+                effective_primary_path = self._primary_array_path
+            else:
+                primary_path_is_exclusive = False
+                effective_primary_path = ""
+            if (
+                primary_path_is_exclusive
+                and normalized_path
+                != self._normalize_array_path(effective_primary_path)
+            ):
                 return None
 
         parts = coord_part.split("/")
@@ -1514,13 +1525,15 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise
 
         if self._manifest_version == SHARDED_ZARR_V1:
-            key_is_recorded_primary = isinstance(
-                recorded_path, str
-            ) and normalized_path == self._normalize_array_path(recorded_path)
+            key_is_primary = (
+                primary_path_is_exclusive
+                and normalized_path
+                == self._normalize_array_path(effective_primary_path)
+            )
             named_array_metadata = self._root_obj.get("metadata", {})
             if (
                 normalized_path
-                and not key_is_recorded_primary
+                and not key_is_primary
                 and len(coords) != len(self.array_indices[""].chunks_per_dim)
                 and (
                     f"{normalized_path}/zarr.json" in named_array_metadata
@@ -1530,7 +1543,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 # A named array that registered its own metadata and whose
                 # rank differs from the primary geometry can never be a
                 # primary chunk: classify it as metadata instead of failing
-                # coordinate validation. Keys under the recorded primary path
+                # coordinate validation. Keys under the effective primary path
                 # still validate strictly so malformed primary keys fail loud.
                 return None
             self._validate_chunk_coords(coords, self.array_indices[""])
