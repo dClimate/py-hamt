@@ -281,20 +281,25 @@ class InMemoryTreeStore(NodeStore):
                     if buffer_id in remaining_ids
                     and buffered_children[buffer_id].isdisjoint(remaining_ids)
                 ]
-                vacate_semaphore = asyncio.Semaphore(_VACATE_CONCURRENCY)
+                new_ids: list[IPLDKind] = [None] * len(wave_ids)
+                next_wave_index = 0
 
-                async def save_node(buffer_id: int) -> IPLDKind:
-                    async with vacate_semaphore:
-                        return await self.hamt.cas.save(
+                async def save_nodes() -> None:
+                    nonlocal next_wave_index
+                    while next_wave_index < len(wave_ids):
+                        wave_index = next_wave_index
+                        next_wave_index += 1
+                        buffer_id = wave_ids[wave_index]
+                        new_ids[wave_index] = await self.hamt.cas.save(
                             self.buffer[buffer_id].serialize(), codec="dag-cbor"
                         )
 
                 save_tasks = [
-                    asyncio.ensure_future(save_node(buffer_id))
-                    for buffer_id in wave_ids
+                    asyncio.ensure_future(save_nodes())
+                    for _ in range(min(_VACATE_CONCURRENCY, len(wave_ids)))
                 ]
                 try:
-                    new_ids: list[IPLDKind] = await asyncio.gather(*save_tasks)
+                    await asyncio.gather(*save_tasks)
                 except BaseException:
                     for save_task in save_tasks:
                         save_task.cancel()

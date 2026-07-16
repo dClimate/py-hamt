@@ -1860,10 +1860,15 @@ class ShardedZarrStore(zarr.abc.store.Store):
         async with self._shard_data_cache._cache_lock:
             dirty_shards = list(self._shard_data_cache._dirty_shards)
         if dirty_shards:
-            flush_semaphore = asyncio.Semaphore(_FLUSH_CONCURRENCY)
+            sorted_dirty_shards = sorted(dirty_shards, key=str)
+            next_shard_index = 0
 
-            async def flush_shard(cache_key: ShardCacheKey) -> None:
-                async with flush_semaphore:
+            async def flush_shards() -> None:
+                nonlocal next_shard_index
+                while next_shard_index < len(sorted_dirty_shards):
+                    shard_index = next_shard_index
+                    next_shard_index += 1
+                    cache_key = sorted_dirty_shards[shard_index]
                     async with self._shard_data_cache.pin(cache_key):
                         shard_lock = self._shard_locks[cache_key]
                         async with shard_lock:
@@ -1925,8 +1930,8 @@ class ShardedZarrStore(zarr.abc.store.Store):
                             await self._shard_data_cache.mark_clean(cache_key)
 
             flush_tasks = [
-                asyncio.ensure_future(flush_shard(cache_key))
-                for cache_key in sorted(dirty_shards, key=str)
+                asyncio.ensure_future(flush_shards())
+                for _ in range(min(_FLUSH_CONCURRENCY, len(sorted_dirty_shards)))
             ]
             try:
                 await asyncio.gather(*flush_tasks)
