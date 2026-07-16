@@ -173,7 +173,7 @@ def test_slice_requested_range_handles_zero_suffix() -> None:
 
 
 def test_kubo_cas_rejects_negative_concurrency() -> None:
-    with pytest.raises(ValueError, match="Semaphore initial value must be >= 0"):
+    with pytest.raises(ValueError, match="concurrency must be a positive integer"):
         KuboCAS(concurrency=-1)
 
 

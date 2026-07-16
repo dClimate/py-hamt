@@ -358,8 +358,8 @@ class KuboCAS(ContentAddressedStore):
                 max_connections=64, max_keepalive_connections=32
             )
 
-        if concurrency < 0:
-            raise ValueError("Semaphore initial value must be >= 0")
+        if concurrency <= 0:
+            raise ValueError("concurrency must be a positive integer")
         self._concurrency: int = concurrency
         self._closed = False
 
