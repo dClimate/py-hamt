@@ -266,7 +266,7 @@ async def test_load_or_initialize_shard_cache_concurrent_loads(
             assert result == shard_data
 
         # Verify shard is cached and no pending loads remain
-        assert await store._shard_data_cache.__contains__(shard_idx)
+        assert shard_idx in store._shard_data_cache
         assert await store._shard_data_cache.get(shard_idx) == shard_data
         assert shard_idx not in store._pending_shard_loads
 
@@ -1358,7 +1358,7 @@ async def test_memory_bounded_lru_cache_basic():
     # Test basic put/get
     await cache.put(0, small_shard)
     assert await cache.get(0) == small_shard
-    assert await cache.__contains__(0)
+    assert 0 in cache
     assert cache.cache_size == 1
 
     # Test that get moves item to end (most recently used)

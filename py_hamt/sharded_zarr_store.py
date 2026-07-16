@@ -419,9 +419,8 @@ class MemoryBoundedLRUCache:
             self._shard_sizes.clear()
             self._actual_memory_usage = 0
 
-    async def __contains__(self, shard_idx: ShardCacheKey) -> bool:
-        async with self._cache_lock:
-            return shard_idx in self._cache
+    def __contains__(self, shard_idx: ShardCacheKey) -> bool:
+        return shard_idx in self._cache
 
     @property
     def estimated_memory_usage(self) -> int:
