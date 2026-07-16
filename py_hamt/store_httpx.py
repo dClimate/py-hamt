@@ -25,7 +25,7 @@ def _retry_delay(
     retry_number: int,
     response: Optional[httpx.Response] = None,
 ) -> float:
-    """Return a jittered backoff, capped by a valid ``Retry-After`` value."""
+    """Return a valid ``Retry-After`` value, otherwise a jittered backoff."""
     backoff_delay = initial_delay * (backoff_factor ** (retry_number - 1))
     retry_after = response.headers.get("Retry-After") if response is not None else None
     if retry_after is not None:
@@ -34,6 +34,8 @@ def _retry_delay(
         except ValueError:
             try:
                 retry_at = parsedate_to_datetime(retry_after)
+                if ":" not in retry_after:
+                    return backoff_delay
                 if retry_at.tzinfo is None:
                     retry_at = retry_at.replace(tzinfo=timezone.utc)
                 retry_after_seconds = (
@@ -43,7 +45,7 @@ def _retry_delay(
                 retry_after_seconds = -1
 
         if retry_after_seconds >= 0:
-            return min(retry_after_seconds, backoff_delay)
+            return retry_after_seconds
 
     jitter = backoff_delay * 0.1 * (random.random() - 0.5)
     return backoff_delay + jitter
