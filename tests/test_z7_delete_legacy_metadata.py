@@ -85,6 +85,20 @@ async def overwritten_legacy_store() -> tuple[CIDInMemoryCAS, ShardedZarrStore]:
 
 
 @pytest.mark.asyncio
+async def test_overwrite_removes_legacy_metadata_entry() -> None:
+    cas, store = await overwritten_legacy_store()
+
+    new_root_cid = await store.flush()
+    root_obj = dag_cbor.decode(await cas.load(new_root_cid))
+    assert isinstance(root_obj, dict)
+    metadata = root_obj["metadata"]
+    assert isinstance(metadata, dict)
+    assert CHUNK_KEY not in metadata, (
+        "overwriting a legacy chunk must not pin the superseded CID in metadata"
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_removes_legacy_metadata_when_shard_slot_exists() -> None:
     _, store = await overwritten_legacy_store()
 

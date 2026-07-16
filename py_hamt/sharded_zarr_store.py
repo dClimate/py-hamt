@@ -2047,6 +2047,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
             await self._shard_data_cache.update_entry(
                 cache_key, index_in_shard, pointer_cid_obj
             )
+            # A legacy root may also carry this chunk key in the metadata
+            # mapping; drop it so the superseded CID is not pinned forever and
+            # cannot resurface through the legacy fallback once the shard slot
+            # empties again.
+            if self._root_obj["metadata"].pop(key, None) is not None:
+                self._metadata_read_cache.pop(key, None)
+                self._dirty_root = True
         return None
 
     async def exists(self, key: str) -> bool:
