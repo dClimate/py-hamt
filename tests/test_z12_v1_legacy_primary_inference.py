@@ -1,0 +1,67 @@
+import json
+
+import dag_cbor
+import pytest
+import zarr
+from testing_utils import CIDInMemoryCAS
+
+from py_hamt import ShardedZarrStore
+
+PROTOTYPE = zarr.core.buffer.default_buffer_prototype()
+ARRAY_METADATA = json.dumps(
+    {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [4, 4],
+        "data_type": "uint8",
+        "chunk_grid": {
+            "name": "regular",
+            "configuration": {"chunk_shape": [2, 2]},
+        },
+        "chunk_key_encoding": {
+            "name": "default",
+            "configuration": {"separator": "/"},
+        },
+        "fill_value": 0,
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "attributes": {},
+    },
+    separators=(",", ":"),
+).encode()
+
+
+def buf(data: bytes) -> zarr.core.buffer.Buffer:
+    return PROTOTYPE.buffer.from_bytes(data)
+
+
+@pytest.mark.asyncio
+async def test_v1_legacy_root_infers_primary_array_path_for_listing() -> None:
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    await store.set("temp/zarr.json", buf(ARRAY_METADATA))
+    await store.set("temp/c/0/0", buf(b"chunk"))
+    root = await store.flush()
+
+    root_obj = dag_cbor.decode(await cas.load(root))
+    root_obj["chunks"].pop("primary_array_path")
+    legacy_root = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root),
+    )
+
+    chunk = await reopened.get("temp/c/0/0", PROTOTYPE)
+    assert chunk is not None
+    assert chunk.to_bytes() == b"chunk"
+
+    listed = [key async for key in reopened.list()]
+    assert "temp/c/0/0" in listed and "c/0/0" not in listed
+    assert [key async for key in reopened.list_prefix("temp/c/")] == ["temp/c/0/0"]
