@@ -1448,6 +1448,19 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise
 
         if self._manifest_version == SHARDED_ZARR_V1:
+            named_array_metadata = self._root_obj["metadata"]
+            if (
+                not isinstance(recorded_path, str)
+                and normalized_path
+                and (
+                    f"{normalized_path}/zarr.json" in named_array_metadata
+                    or f"{normalized_path}/.zarray" in named_array_metadata
+                )
+                and len(coords) != len(self.array_indices[""].chunks_per_dim)
+            ):
+                # Before the primary path is recorded, treat a foreign-rank
+                # named array as metadata.
+                return None
             self._validate_chunk_coords(coords, self.array_indices[""])
         elif normalized_path in self.array_indices:
             self._validate_chunk_coords(coords, self.array_indices[normalized_path])
