@@ -284,7 +284,8 @@ class MemoryBoundedLRUCache:
     never evicted. Pins are refcounted so concurrent users can safely share a shard.
     If protected shards exceed the configured budget, the cache temporarily
     overflows rather than evicting data that is in use or waiting to be flushed.
-    All operations are thread-safe for async access using an asyncio.Lock.
+    Mutating operations are safe for async access using an asyncio.Lock;
+    ``in`` membership is a plain synchronous dict read on the event loop.
     """
 
     def __init__(self, max_memory_bytes: int = 100 * 1024 * 1024):  # 100MB default

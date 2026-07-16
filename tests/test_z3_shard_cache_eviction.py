@@ -33,12 +33,12 @@ class CIDInMemoryCAS(ContentAddressedStore):
 
     async def load(
         self,
-        id: IPLDKind,
+        identifier: IPLDKind,
         offset: int | None = None,
         length: int | None = None,
         suffix: int | None = None,
     ) -> bytes:
-        data = self.store[_normalize_cid(id)]
+        data = self.store[_normalize_cid(identifier)]
         if offset is not None:
             if length is not None:
                 return data[offset : offset + length]

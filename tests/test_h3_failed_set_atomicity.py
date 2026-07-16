@@ -21,12 +21,4 @@ async def test_failed_set_preserves_previously_committed_key() -> None:
     with pytest.raises(IndexError):
         await hamt.set("b", b"value-b")
 
-    try:
-        committed_value = await hamt.get("a")
-    except Exception as error:
-        pytest.fail(
-            "previously committed key 'a' lost after failed set: "
-            f"{type(error).__name__}: {error}"
-        )
-
-    assert committed_value == b"value-a"
+    assert await hamt.get("a") == b"value-a"

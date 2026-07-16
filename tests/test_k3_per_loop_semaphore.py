@@ -24,7 +24,7 @@ def test_contended_loads_work_across_sequential_event_loops() -> None:
             self.end_headers()
             self.wfile.write(expected_body)
 
-        def log_message(self, format: str, *args: object) -> None:
+        def log_message(self, message_format: str, *args: object) -> None:
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), GatewayHandler)

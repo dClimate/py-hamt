@@ -42,7 +42,7 @@ def recording_gateway() -> Iterator[tuple[str, RecordedHeaders]]:
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args: object) -> None:
+        def log_message(self, message_format: str, *args: object) -> None:
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), RecordingHandler)

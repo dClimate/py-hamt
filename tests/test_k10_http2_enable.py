@@ -88,6 +88,8 @@ class GoAwayGatewayProtocol(asyncio.Protocol):
         try:
             received_events = self.h2_connection.receive_data(data)
         except Exception:
+            # Protocol callbacks must close the connection on any decoder
+            # failure rather than let it escape into the event loop.
             self.transport.close()
             return
 
@@ -162,7 +164,7 @@ def tls_goaway_gateway(
             gateway.url = f"https://127.0.0.1:{port}"
             ready.set()
             server_loop.run_forever()
-        except BaseException as error:
+        except Exception as error:
             setup_errors.append(error)
             ready.set()
         finally:

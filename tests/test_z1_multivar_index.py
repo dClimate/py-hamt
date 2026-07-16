@@ -104,10 +104,15 @@ async def _open_sharded_dataset(
 
 
 @pytest.mark.asyncio
-async def test_multivar_chunks_have_per_array_indexes() -> None:
+@pytest.mark.parametrize("different_chunk_grids", [False, True])
+async def test_multivar_chunks_have_per_array_indexes(
+    different_chunk_grids: bool,
+) -> None:
     # Path-aware indexing is the v2 contract; shape-based creation intentionally
     # remains the deprecated v1 compatibility path on the current base.
-    expected = _multivar_dataset(different_chunk_grids=False)
+    # Distinct per-array chunk grids exercise the core multi-array corruption
+    # scenario: reuse of the primary array's geometry would corrupt "precip".
+    expected = _multivar_dataset(different_chunk_grids=different_chunk_grids)
     cas = CIDInMemoryCAS()
     store = await ShardedZarrStore.open(
         cas=cas,
@@ -129,7 +134,7 @@ async def test_multivar_chunks_have_per_array_indexes() -> None:
 
 @pytest.mark.asyncio
 async def test_converter_multivar_builds_per_array_indexes() -> None:
-    expected = _multivar_dataset(different_chunk_grids=False)
+    expected = _multivar_dataset(different_chunk_grids=True)
     cas = CIDInMemoryCAS()
     hamt = await HAMT.build(cas=cas, values_are_bytes=True)
     source_store = ZarrHAMTStore(hamt, read_only=False)

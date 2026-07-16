@@ -23,7 +23,7 @@ def retrying_kubo_server() -> Iterator[tuple[str, dict[str, int]]]:
     class RetryHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def log_message(self, format: str, *args: object) -> None:
+        def log_message(self, message_format: str, *args: object) -> None:
             pass
 
         def _record_hit(self, key: str) -> int:
@@ -178,7 +178,7 @@ def test_kubo_cas_rejects_negative_concurrency() -> None:
 
 
 def test_kubo_cas_rejects_zero_concurrency() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="concurrency must be a positive integer"):
         KuboCAS(concurrency=0)
 
 

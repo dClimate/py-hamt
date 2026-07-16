@@ -127,8 +127,9 @@ async def test_root_level_chunk_key_no_silent_clobber() -> None:
 
     try:
         await store.set("c/0/0", buf(b"ROOT-CHUNK"))
-    except Exception:
-        # Rejecting root-level chunks explicitly is an acceptable contract.
+    except ValueError:
+        # Rejecting root-level chunks explicitly is an acceptable contract
+        # (_validate_chunk_write_key raises ValueError for this case).
         pass
     else:
         named = await store.get("temp/c/0/0", PROTOTYPE)

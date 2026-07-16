@@ -192,7 +192,7 @@ class KuboCAS(ContentAddressedStore):
        configured on that client are reused for **every** request.
     2. **Let `KuboCAS` build the client** but pass
        `headers=` *and*/or `auth=` kwargs; they are forwarded to the
-       internally–created `AsyncClient`.
+       internally-created `AsyncClient`.
 
     ```python
     import httpx
@@ -532,7 +532,7 @@ class KuboCAS(ContentAddressedStore):
                 self._closed = True
 
     # --------------------------------------------------------------------- #
-    # save() – now uses the per-loop client                                 #
+    # save() - now uses the per-loop client                                 #
     # --------------------------------------------------------------------- #
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
         """Add data to Kubo and return its CID.
@@ -684,7 +684,7 @@ class KuboCAS(ContentAddressedStore):
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     # --------------------------------------------------------------------- #
-    # pin_cid() – method to pin a CID                                       #
+    # pin_cid() - method to pin a CID                                       #
     # --------------------------------------------------------------------- #
     async def pin_cid(
         self,
