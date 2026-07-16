@@ -697,7 +697,10 @@ class HAMT:
             self.root_node_id = node_stack[0][0]
 
     async def delete(self, key: str) -> None:
-        """Delete a key-value mapping."""
+        """Delete a key-value mapping atomically on failure.
+
+        If deletion raises for any reason, the observable tree remains unchanged.
+        """
 
         # Also deletes the pointer at the same time so this doesn't have a _delete_pointer duo
         if self.read_only:
@@ -720,6 +723,14 @@ class HAMT:
                 if isinstance(item, dict):
                     bucket = item
                     if key in bucket:
+                        # Collapse may inspect sibling subtrees after the bucket is
+                        # changed. Load them first so a CAS failure cannot leave a
+                        # shared cached node partially mutated. The pre-delete tree
+                        # has one extra entry along this path, hence the +1 budget.
+                        for _, path_node in node_stack[1:]:
+                            await self._collect_subtree_entries(
+                                path_node, self.max_bucket_size + 1
+                            )
                         del bucket[key]
                         created_change = True
                     # Break out since whether or not the key is in the bucket, it should have been here so either now reserialize or raise a KeyError
