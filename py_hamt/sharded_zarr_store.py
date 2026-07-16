@@ -1825,9 +1825,20 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
                             await self._shard_data_cache.mark_clean(cache_key)
 
-            await asyncio.gather(
-                *(flush_shard(cache_key) for cache_key in sorted(dirty_shards, key=str))
-            )
+            flush_tasks = [
+                asyncio.ensure_future(flush_shard(cache_key))
+                for cache_key in sorted(dirty_shards, key=str)
+            ]
+            try:
+                await asyncio.gather(*flush_tasks)
+            except BaseException:
+                # No sibling task may outlive a failed flush: they would keep
+                # mutating store state (and using the CAS) without the write
+                # lock after the caller has already observed the failure.
+                for flush_task in flush_tasks:
+                    flush_task.cancel()
+                await asyncio.gather(*flush_tasks, return_exceptions=True)
+                raise
 
         if self._dirty_root:
             self._root_obj["metadata"] = {
