@@ -177,6 +177,11 @@ def test_kubo_cas_rejects_negative_concurrency() -> None:
         KuboCAS(concurrency=-1)
 
 
+def test_kubo_cas_rejects_zero_concurrency() -> None:
+    with pytest.raises(ValueError):
+        KuboCAS(concurrency=0)
+
+
 @pytest.mark.asyncio
 async def test_owned_kubo_cas_reopens_its_semaphore_after_close() -> None:
     cas = KuboCAS()
