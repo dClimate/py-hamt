@@ -991,7 +991,8 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert store._parse_chunk_key("lat/c/0/0") is None
         assert store._parse_chunk_key("lon/c/0/0") is None
 
-        # Test dimensionality mismatch
+        # A wrong-rank named key with no registered metadata for its array
+        # still fails coordinate validation loudly.
         with pytest.raises(IndexError, match="tuple index out of range"):
             store._parse_chunk_key("temp/c/0/0/0/0")
 

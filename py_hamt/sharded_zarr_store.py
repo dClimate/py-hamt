@@ -820,7 +820,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if not isinstance(metadata, dict):
             return
 
-        matching_paths: list[str] = []
+        matching_paths: set[str] = set()
         for key, metadata_cid in metadata.items():
             if not isinstance(key, str):
                 continue
@@ -834,19 +834,46 @@ class ShardedZarrStore(zarr.abc.store.Store):
             try:
                 metadata_bytes = await self.cas.load(metadata_cid)
             except Exception:
-                continue
+                # A candidate we could not read might have been the true
+                # primary. Guessing from the survivors could rebind shard
+                # data under the wrong prefix, so abort the inference and
+                # keep the legacy default instead.
+                return
             metadata_json = self._decode_metadata_json(metadata_bytes)
             if metadata_json is None:
                 continue
             declared_shape = metadata_json.get("shape")
-            if isinstance(declared_shape, (list, tuple)) and tuple(
-                declared_shape
-            ) == tuple(self._array_shape):
-                matching_paths.append(normalized_path)
+            if not (
+                isinstance(declared_shape, (list, tuple))
+                and tuple(declared_shape) == tuple(self._array_shape)
+            ):
+                continue
+            declared_chunk_shape = self._declared_chunk_shape(metadata_json)
+            if declared_chunk_shape is not None and declared_chunk_shape != tuple(
+                self._chunk_shape
+            ):
+                continue
+            matching_paths.add(normalized_path)
 
         if len(matching_paths) == 1:
-            self._primary_array_path = matching_paths[0]
-            chunk_info["primary_array_path"] = matching_paths[0]
+            # Best-effort, in-memory only: never persist a guessed path, so a
+            # later flush of a writable open cannot seal a wrong inference.
+            self._primary_array_path = next(iter(matching_paths))
+
+    @staticmethod
+    def _declared_chunk_shape(metadata_json: dict) -> Optional[tuple[int, ...]]:
+        """Extract the chunk shape a zarr v2/v3 array metadata document declares."""
+        chunk_grid = metadata_json.get("chunk_grid")
+        if isinstance(chunk_grid, dict):
+            configuration = chunk_grid.get("configuration")
+            if isinstance(configuration, dict):
+                chunk_shape = configuration.get("chunk_shape")
+                if isinstance(chunk_shape, (list, tuple)):
+                    return tuple(chunk_shape)
+        chunks = metadata_json.get("chunks")
+        if isinstance(chunks, (list, tuple)):
+            return tuple(chunks)
+        return None
 
     def _load_v2_root(self) -> None:
         metadata = self._root_obj.get("metadata")
@@ -1487,18 +1514,24 @@ class ShardedZarrStore(zarr.abc.store.Store):
             raise
 
         if self._manifest_version == SHARDED_ZARR_V1:
-            named_array_metadata = self._root_obj["metadata"]
+            key_is_recorded_primary = isinstance(
+                recorded_path, str
+            ) and normalized_path == self._normalize_array_path(recorded_path)
+            named_array_metadata = self._root_obj.get("metadata", {})
             if (
-                not isinstance(recorded_path, str)
-                and normalized_path
+                normalized_path
+                and not key_is_recorded_primary
+                and len(coords) != len(self.array_indices[""].chunks_per_dim)
                 and (
                     f"{normalized_path}/zarr.json" in named_array_metadata
                     or f"{normalized_path}/.zarray" in named_array_metadata
                 )
-                and len(coords) != len(self.array_indices[""].chunks_per_dim)
             ):
-                # Before the primary path is recorded, treat a foreign-rank
-                # named array as metadata.
+                # A named array that registered its own metadata and whose
+                # rank differs from the primary geometry can never be a
+                # primary chunk: classify it as metadata instead of failing
+                # coordinate validation. Keys under the recorded primary path
+                # still validate strictly so malformed primary keys fail loud.
                 return None
             self._validate_chunk_coords(coords, self.array_indices[""])
         elif normalized_path in self.array_indices:

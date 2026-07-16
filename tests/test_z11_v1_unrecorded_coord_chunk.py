@@ -89,3 +89,19 @@ async def test_v1_coordinate_chunk_after_primary_chunk_round_trips() -> None:
         root_cid=root_cid,
     )
     await assert_value(reopened, "y/c/0", b"coord-chunk")
+
+
+@pytest.mark.asyncio
+async def test_v1_wrong_rank_key_under_recorded_primary_fails_loud() -> None:
+    """A malformed (wrong-rank) key under the recorded primary path must keep
+    failing coordinate validation instead of being silently reclassified as
+    metadata — masking it would let a store opened with a mismatched
+    array_shape divert every chunk into root metadata."""
+    cas = CIDInMemoryCAS()
+    store = await new_v1_store(cas)
+
+    await store.set("temp/zarr.json", buf(COORD_ARRAY_METADATA))
+    await store.set("temp/c/0/0", buf(b"primary"))  # records "temp" as primary
+
+    with pytest.raises((IndexError, RuntimeError)):
+        await store.set("temp/c/0", buf(b"malformed"))

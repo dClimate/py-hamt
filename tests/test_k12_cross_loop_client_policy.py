@@ -1,10 +1,26 @@
 import asyncio
 import warnings
+from collections.abc import Iterator
 
 import httpx
 import pytest
 
 from py_hamt import KuboCAS
+
+
+@pytest.fixture(autouse=True)
+def preserve_current_event_loop() -> Iterator[None]:
+    """Restore the current loop after tests that use ``asyncio.run``."""
+    try:
+        previous_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        previous_loop = None
+
+    try:
+        yield
+    finally:
+        if previous_loop is not None:
+            asyncio.set_event_loop(previous_loop)
 
 
 def _client_for_current_loop(cas: KuboCAS) -> httpx.AsyncClient:

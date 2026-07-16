@@ -65,3 +65,53 @@ async def test_v1_legacy_root_infers_primary_array_path_for_listing() -> None:
     listed = [key async for key in reopened.list()]
     assert "temp/c/0/0" in listed and "c/0/0" not in listed
     assert [key async for key in reopened.list_prefix("temp/c/")] == ["temp/c/0/0"]
+
+
+class FlakyMetadataCAS(CIDInMemoryCAS):
+    """Fails loads of one specific CID to simulate a partial CAS outage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing_cid: object = None
+
+    async def load(self, id, offset=None, length=None, suffix=None):  # type: ignore[override]
+        if self.failing_cid is not None and str(id) == str(self.failing_cid):
+            raise ConnectionError("simulated partial CAS outage")
+        return await super().load(id, offset=offset, length=length, suffix=suffix)
+
+
+@pytest.mark.asyncio
+async def test_inference_aborts_when_a_candidate_cannot_be_loaded() -> None:
+    """If any candidate's metadata cannot be loaded, the true primary might be
+    the unreadable one — inference must abort (keep the legacy '' default)
+    rather than confidently adopt a surviving same-shape candidate."""
+    cas = FlakyMetadataCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    await store.set("temp/zarr.json", buf(ARRAY_METADATA))
+    await store.set("precip/zarr.json", buf(ARRAY_METADATA))
+    await store.set("temp/c/0/0", buf(b"chunk"))
+    root = await store.flush()
+
+    root_obj = dag_cbor.decode(await cas.load(root))
+    root_obj["chunks"].pop("primary_array_path")
+    legacy_root = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+
+    # Make temp's metadata unreadable: only "precip" would survive the scan.
+    metadata = root_obj["metadata"]
+    cas.failing_cid = metadata["temp/zarr.json"]
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root),
+    )
+    assert reopened._primary_array_path in (None, ""), (
+        "a partial CAS outage must not rebind shard data under a surviving "
+        f"candidate, got {reopened._primary_array_path!r}"
+    )
