@@ -2,10 +2,11 @@ import asyncio
 import logging
 import random
 import re
+import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, Literal, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Literal, Optional, Tuple, cast
 
 import httpx
 from dag_cbor.ipld import IPLDKind
@@ -187,9 +188,12 @@ class KuboCAS(ContentAddressedStore):
     ### Authentication / custom headers
     You have two options:
 
-    1. **Bring your own `httpx.AsyncClient`**
-       Pass it via `client=...` — any default headers or auth
-       configured on that client are reused for **every** request.
+    1. **Bring your own `httpx.AsyncClient` or client factory**
+       Pass a client via `client=...` for use on one event loop, or pass
+       `client_factory=...` to build a fully configured client for each event
+       loop. Reusing a supplied client from a later loop emits a warning and
+       falls back to an internal client that preserves only headers, auth,
+       timeout, redirect policy, and event hooks.
     2. **Let `KuboCAS` build the client** but pass
        `headers=` *and*/or `auth=` kwargs; they are forwarded to the
        internally-created `AsyncClient`.
@@ -221,6 +225,10 @@ class KuboCAS(ContentAddressedStore):
       If *None*, KuboCAS will create one lazily with a 60-second timeout and
       redirect following and HTTP/2 enabled. Plaintext endpoints continue to
       use HTTP/1.1 because HTTP/2 negotiation requires TLS/ALPN.
+    - **client_factory** (`Callable[[], httpx.AsyncClient] | None`): create a
+      separate, fully configured client for each event loop. KuboCAS owns and
+      closes clients returned by the factory. Mutually exclusive with
+      **client**.
     - **headers** (dict[str, str] | None): default headers for the
       internally-created client.
     - **auth** (`tuple[str, str] | None`): authentication tuple (username, password)
@@ -250,6 +258,7 @@ class KuboCAS(ContentAddressedStore):
         gateway_base_url: str | None = None,
         concurrency: int = 32,
         *,
+        client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
         pin_on_add: bool = False,
@@ -266,12 +275,15 @@ class KuboCAS(ContentAddressedStore):
         as a class instance cannot know when it will no longer be in use, unless explicitly told to do so.
 
         A supplied client is associated with the running event loop lazily on
-        first use, so constructing ``KuboCAS`` does not require an async context.
-        Its configured timeout is respected. Clients created internally by
-        ``KuboCAS`` use a 60-second timeout, follow redirects, and negotiate
-        HTTP/2 for HTTPS endpoints that support it. Supplied clients retain
-        their own redirect policy and should be configured with
-        ``follow_redirects=True`` when gateways may redirect.
+        first use, so constructing ``KuboCAS`` does not require an async
+        context. On a later event loop, KuboCAS warns and uses an internally
+        created fallback that preserves only the supplied client's headers,
+        auth, timeout, redirect policy, and event hooks. Pass
+        ``client_factory`` instead when every event loop needs the client's
+        full configuration. Factory clients are owned and closed by KuboCAS.
+        Clients created internally by ``KuboCAS`` use a 60-second timeout,
+        follow redirects, and negotiate HTTP/2 for HTTPS endpoints that
+        support it.
 
         If you are using the `KuboCAS` instance in an `async with` block, it will automatically close the client when the block is exited which is what we suggest below:
         ```python
@@ -301,6 +313,9 @@ class KuboCAS(ContentAddressedStore):
         ### RPC and HTTP Gateway Base URLs
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
+
+        if client is not None and client_factory is not None:
+            raise ValueError("client and client_factory are mutually exclusive")
 
         self._owns_client: bool = False
         self._closed: bool = True
@@ -346,6 +361,10 @@ class KuboCAS(ContentAddressedStore):
             self._default_auth: httpx.Auth | Tuple[str, str] | None = client.auth
             self._default_timeout: httpx.Timeout | float = client.timeout
             self._default_limits = self._copy_client_limits(client)
+            self._default_follow_redirects: bool = client.follow_redirects
+            self._default_event_hooks: dict[str, list[Callable[..., Any]]] | None = (
+                client.event_hooks
+            )
         else:
             # No client supplied. We will own any clients we create.
             self._owns_client = True
@@ -357,6 +376,9 @@ class KuboCAS(ContentAddressedStore):
             self._default_limits = httpx.Limits(
                 max_connections=64, max_keepalive_connections=32
             )
+            self._default_follow_redirects = True
+            self._default_event_hooks = None
+        self._client_factory: Optional[Callable[[], httpx.AsyncClient]] = client_factory
 
         if concurrency <= 0:
             raise ValueError("concurrency must be a positive integer")
@@ -441,13 +463,27 @@ class KuboCAS(ContentAddressedStore):
             if self._supplied_client is not None:
                 client = self._supplied_client
                 self._supplied_client = None
+            elif self._client_factory is not None:
+                client = self._client_factory()
+                self._internally_created_clients.add(client)
             else:
+                if self._user_client is not None:
+                    warnings.warn(
+                        "A user-supplied httpx.AsyncClient cannot be reused across "
+                        "event loops; falling back to an internally created client "
+                        "that preserves only headers, auth, timeout, redirect policy, "
+                        "and event hooks. Pass client_factory to preserve full "
+                        "configuration.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 client = httpx.AsyncClient(
                     timeout=self._default_timeout,
                     headers=self._default_headers,
                     auth=self._default_auth,
                     limits=self._default_limits,
-                    follow_redirects=True,
+                    follow_redirects=self._default_follow_redirects,
+                    event_hooks=self._default_event_hooks,
                     http2=True,
                 )
                 self._internally_created_clients.add(client)
