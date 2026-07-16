@@ -35,6 +35,7 @@ from .store_httpx import ContentAddressedStore
 SHARDED_ZARR_V1 = "sharded_zarr_v1"
 SHARDED_ZARR_V2 = "sharded_zarr_v2"
 ZARR_METADATA_SUFFIXES = ("zarr.json", ".zarray", ".zattrs", ".zgroup")
+_FLUSH_CONCURRENCY = 8
 
 ShardCacheKey = int | tuple[str, int]
 ShardReadMode = Literal["full", "sparse"]
@@ -1760,56 +1761,73 @@ class ShardedZarrStore(zarr.abc.store.Store):
         async with self._shard_data_cache._cache_lock:
             dirty_shards = list(self._shard_data_cache._dirty_shards)
         if dirty_shards:
-            for cache_key in sorted(dirty_shards, key=str):
-                async with self._shard_data_cache.pin(cache_key):
-                    shard_lock = self._shard_locks[cache_key]
-                    async with shard_lock:
-                        shard_data_list = await self._shard_data_cache.get(cache_key)
-                        if shard_data_list is None:
-                            raise RuntimeError(
-                                f"Dirty shard {cache_key} not found in cache"
-                            )
+            flush_semaphore = asyncio.Semaphore(_FLUSH_CONCURRENCY)
 
-                        shard_data_bytes = dag_cbor.encode(
-                            cast(IPLDKind, shard_data_list)
-                        )
-                        new_shard_cid_obj = await self.cas.save(
-                            shard_data_bytes,
-                            codec="dag-cbor",
-                        )
-                        if not isinstance(new_shard_cid_obj, CID):  # pragma: no cover
-                            raise TypeError(
-                                "ShardedZarrStore requires CAS.save to return CIDs."
+            async def flush_shard(cache_key: ShardCacheKey) -> None:
+                async with flush_semaphore:
+                    async with self._shard_data_cache.pin(cache_key):
+                        shard_lock = self._shard_locks[cache_key]
+                        async with shard_lock:
+                            shard_data_list = await self._shard_data_cache.get(
+                                cache_key
                             )
+                            if shard_data_list is None:
+                                raise RuntimeError(
+                                    f"Dirty shard {cache_key} not found in cache"
+                                )
 
-                        if self._manifest_version == SHARDED_ZARR_V1:
-                            if not isinstance(cache_key, int):  # pragma: no cover
-                                raise TypeError("v1 shard cache keys must be integers.")
-                            shard_idx = int(cache_key)
-                            if (
-                                self._root_obj["chunks"]["shard_cids"][shard_idx]
-                                != new_shard_cid_obj
-                            ):
-                                self._root_obj["chunks"]["shard_cids"][shard_idx] = (
-                                    new_shard_cid_obj
-                                )
-                                self.array_indices[""].shard_cids[shard_idx] = (
-                                    new_shard_cid_obj
-                                )
-                                self._dirty_root = True
-                        else:
-                            if isinstance(cache_key, int):  # pragma: no cover
+                            shard_data_bytes = dag_cbor.encode(
+                                cast(IPLDKind, shard_data_list)
+                            )
+                            new_shard_cid_obj = await self.cas.save(
+                                shard_data_bytes,
+                                codec="dag-cbor",
+                            )
+                            if not isinstance(
+                                new_shard_cid_obj, CID
+                            ):  # pragma: no cover
                                 raise TypeError(
-                                    "v2 shard cache keys must include array paths."
+                                    "ShardedZarrStore requires CAS.save to return CIDs."
                                 )
-                            array_path, shard_idx = cache_key
-                            array_index = self.array_indices[array_path]
-                            if array_index.shard_cids[shard_idx] != new_shard_cid_obj:
-                                array_index.shard_cids[shard_idx] = new_shard_cid_obj
-                                self._dirty_root = True
-                                self._sync_arrays_to_root()
 
-                        await self._shard_data_cache.mark_clean(cache_key)
+                            if self._manifest_version == SHARDED_ZARR_V1:
+                                if not isinstance(cache_key, int):  # pragma: no cover
+                                    raise TypeError(
+                                        "v1 shard cache keys must be integers."
+                                    )
+                                shard_idx = int(cache_key)
+                                if (
+                                    self._root_obj["chunks"]["shard_cids"][shard_idx]
+                                    != new_shard_cid_obj
+                                ):
+                                    self._root_obj["chunks"]["shard_cids"][
+                                        shard_idx
+                                    ] = new_shard_cid_obj
+                                    self.array_indices[""].shard_cids[shard_idx] = (
+                                        new_shard_cid_obj
+                                    )
+                                    self._dirty_root = True
+                            else:
+                                if isinstance(cache_key, int):  # pragma: no cover
+                                    raise TypeError(
+                                        "v2 shard cache keys must include array paths."
+                                    )
+                                array_path, shard_idx = cache_key
+                                array_index = self.array_indices[array_path]
+                                if (
+                                    array_index.shard_cids[shard_idx]
+                                    != new_shard_cid_obj
+                                ):
+                                    array_index.shard_cids[shard_idx] = (
+                                        new_shard_cid_obj
+                                    )
+                                    self._dirty_root = True
+
+                            await self._shard_data_cache.mark_clean(cache_key)
+
+            await asyncio.gather(
+                *(flush_shard(cache_key) for cache_key in sorted(dirty_shards, key=str))
+            )
 
         if self._dirty_root:
             self._root_obj["metadata"] = {
