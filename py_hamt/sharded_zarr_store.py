@@ -766,6 +766,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         manifest_version = self._root_obj.get("manifest_version")
         if manifest_version == SHARDED_ZARR_V1:
             self._load_v1_root()
+            await self._infer_v1_legacy_primary_array_path()
         elif manifest_version == SHARDED_ZARR_V2:
             self._load_v2_root()
         else:
@@ -808,6 +809,44 @@ class ShardedZarrStore(zarr.abc.store.Store):
             if isinstance(primary_array_path, str)
             else ""
         )
+
+    async def _infer_v1_legacy_primary_array_path(self) -> None:
+        chunk_info = self._root_obj["chunks"]
+        # Only legacy roots missing the field may be inferred; recorded values win.
+        if "primary_array_path" in chunk_info:
+            return
+
+        metadata = self._root_obj.get("metadata")
+        if not isinstance(metadata, dict):
+            return
+
+        matching_paths: list[str] = []
+        for key, metadata_cid in metadata.items():
+            if not isinstance(key, str):
+                continue
+            array_path = self._array_path_from_metadata_key(key)
+            if array_path is None:
+                continue
+            normalized_path = self._normalize_array_path(array_path)
+            if normalized_path.rsplit("/", 1)[-1] in self._V1_COORDINATE_ARRAY_PREFIXES:
+                continue
+
+            try:
+                metadata_bytes = await self.cas.load(metadata_cid)
+            except Exception:
+                continue
+            metadata_json = self._decode_metadata_json(metadata_bytes)
+            if metadata_json is None:
+                continue
+            declared_shape = metadata_json.get("shape")
+            if isinstance(declared_shape, (list, tuple)) and tuple(
+                declared_shape
+            ) == tuple(self._array_shape):
+                matching_paths.append(normalized_path)
+
+        if len(matching_paths) == 1:
+            self._primary_array_path = matching_paths[0]
+            chunk_info["primary_array_path"] = matching_paths[0]
 
     def _load_v2_root(self) -> None:
         metadata = self._root_obj.get("metadata")
