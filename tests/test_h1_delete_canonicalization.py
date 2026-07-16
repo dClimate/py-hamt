@@ -11,7 +11,7 @@ Operation = tuple[Literal["set", "delete"], str]
 # These numeric strings have the same first byte in their BLAKE3 hashes. The
 # additional keys exercise interleavings outside that colliding root bucket.
 COLLIDING_KEYS = ("5", "15", "123", "317", "349")
-KEY_POOL = COLLIDING_KEYS + ("0", "1", "2", "alpha", "omega")
+KEY_POOL = (*COLLIDING_KEYS, "0", "1", "2", "alpha", "omega")
 DELETE_AFTER_SPLIT: list[Operation] = [
     *(("set", key) for key in COLLIDING_KEYS),
     *(("delete", key) for key in COLLIDING_KEYS[1:]),

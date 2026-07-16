@@ -192,26 +192,26 @@ class InMemoryTreeStore(NodeStore):
         # cache is explicitly vacated. Dirty nodes remain exclusively in buffer.
         self.clean_cache: dict[IPLDKind, Node] = {}
 
-    def get_clean_node(self, id: IPLDKind) -> Node | None:
+    def get_clean_node(self, node_id: IPLDKind) -> Node | None:
         """Return a cached CAS node, or None for misses and unhashable IDs."""
         try:
-            return self.clean_cache.get(id)
+            return self.clean_cache.get(node_id)
         except TypeError:
             return None
 
-    def cache_clean_node(self, id: IPLDKind, node: Node) -> None:
+    def cache_clean_node(self, node_id: IPLDKind, node: Node) -> None:
         """Cache a CAS node when its IPLD identifier is hashable."""
         try:
-            self.clean_cache[id] = node
+            self.clean_cache[node_id] = node
         except TypeError:
             # CAS implementations normally use bytes or CID objects. Gracefully
             # skip caching for a custom store that returns another IPLD kind.
             pass
 
-    def remove_clean_node(self, id: IPLDKind) -> None:
+    def remove_clean_node(self, node_id: IPLDKind) -> None:
         """Stop serving a clean node once that object becomes dirty."""
         try:
-            self.clean_cache.pop(id, None)
+            self.clean_cache.pop(node_id, None)
         except TypeError:
             pass
 
@@ -697,9 +697,11 @@ class HAMT:
             self.root_node_id = node_stack[0][0]
 
     async def delete(self, key: str) -> None:
-        """Delete a key-value mapping atomically on failure.
+        """Delete a key-value mapping.
 
-        If deletion raises for any reason, the observable tree remains unchanged.
+        Failure-atomic with respect to storage errors: all fallible CAS loads
+        happen before any node is mutated, so if deletion raises, the
+        observable tree remains unchanged.
         """
 
         # Also deletes the pointer at the same time so this doesn't have a _delete_pointer duo
