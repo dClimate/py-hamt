@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
+# Ceiling on server-directed waits so a broken or hostile gateway cannot make
+# a request sleep unbounded (e.g. ``Retry-After: inf`` or a far-future date).
+_MAX_RETRY_AFTER_SECONDS = 300.0
+
 
 def _retry_delay(
     initial_delay: float,
@@ -34,8 +38,6 @@ def _retry_delay(
         except ValueError:
             try:
                 retry_at = parsedate_to_datetime(retry_after)
-                if ":" not in retry_after:
-                    return backoff_delay
                 if retry_at.tzinfo is None:
                     retry_at = retry_at.replace(tzinfo=timezone.utc)
                 retry_after_seconds = (
@@ -45,7 +47,7 @@ def _retry_delay(
                 retry_after_seconds = -1
 
         if retry_after_seconds >= 0:
-            return retry_after_seconds
+            return min(retry_after_seconds, _MAX_RETRY_AFTER_SECONDS)
 
     jitter = backoff_delay * 0.1 * (random.random() - 0.5)
     return backoff_delay + jitter

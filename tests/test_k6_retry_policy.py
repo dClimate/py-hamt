@@ -111,7 +111,8 @@ def test_retry_delay_parses_http_dates_and_ignores_invalid_values(
         lambda _: future_naive_datetime,
     )
     dated_response = httpx.Response(429, headers={"Retry-After": "future-date"})
-    assert store_httpx._retry_delay(10, 2, 1, dated_response) == 10
+    delay = store_httpx._retry_delay(10, 2, 1, dated_response)
+    assert 28 <= delay <= 30
 
     def reject_retry_after(_: str) -> datetime:
         raise ValueError("invalid Retry-After")
@@ -122,15 +123,15 @@ def test_retry_delay_parses_http_dates_and_ignores_invalid_values(
     assert store_httpx._retry_delay(10, 2, 1, invalid_response) == 10
 
 
-def test_retry_delay_uses_numeric_retry_after_as_minimum() -> None:
+def test_retry_delay_numeric_retry_after_not_shortened_by_backoff() -> None:
     response = httpx.Response(429, headers={"Retry-After": "7"})
 
     delay = store_httpx._retry_delay(1, 2, 1, response)
 
-    assert delay >= 7
+    assert delay == 7
 
 
-def test_retry_delay_uses_http_date_retry_after_as_minimum() -> None:
+def test_retry_delay_http_date_retry_after_not_shortened_by_backoff() -> None:
     retry_at = datetime.now(timezone.utc) + timedelta(seconds=7)
     response = httpx.Response(
         503,
@@ -139,7 +140,24 @@ def test_retry_delay_uses_http_date_retry_after_as_minimum() -> None:
 
     delay = store_httpx._retry_delay(1, 2, 1, response)
 
-    assert delay >= 5
+    assert 5 <= delay <= 7
+
+
+@pytest.mark.parametrize("header", ["inf", "1e309", "999999"])
+def test_retry_delay_caps_pathological_retry_after(header: str) -> None:
+    response = httpx.Response(429, headers={"Retry-After": header})
+
+    delay = store_httpx._retry_delay(1, 2, 1, response)
+
+    assert delay == store_httpx._MAX_RETRY_AFTER_SECONDS
+
+
+def test_retry_delay_ignores_nan_retry_after() -> None:
+    response = httpx.Response(429, headers={"Retry-After": "nan"})
+
+    delay = store_httpx._retry_delay(10, 2, 1, response)
+
+    assert 9 <= delay <= 11
 
 
 def test_retry_delay_preserves_short_retry_after() -> None:
