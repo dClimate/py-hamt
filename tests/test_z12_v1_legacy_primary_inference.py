@@ -115,3 +115,81 @@ async def test_inference_aborts_when_a_candidate_cannot_be_loaded() -> None:
         "a partial CAS outage must not rebind shard data under a surviving "
         f"candidate, got {reopened._primary_array_path!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_inference_skips_non_candidates_and_dedupes_dual_format() -> None:
+    """The scan must skip coordinate arrays, undecodable blobs, shape and
+    chunk-shape mismatches, non-string keys, and count an array once even
+    when it registers both zarr.json and v2 .zarray metadata."""
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    await store.set("temp/zarr.json", buf(ARRAY_METADATA))
+    await store.set("temp/c/0/0", buf(b"chunk"))
+    root = await store.flush()
+
+    def meta(payload: dict) -> bytes:
+        return json.dumps(payload).encode()
+
+    root_obj = dag_cbor.decode(await cas.load(root))
+    root_obj["chunks"].pop("primary_array_path")
+    metadata = root_obj["metadata"]
+    metadata["lat/zarr.json"] = await cas.save(meta({"shape": [4, 4]}), codec="raw")
+    metadata["garbage/zarr.json"] = await cas.save(b"not-json", codec="raw")
+    metadata["wrongshape/zarr.json"] = await cas.save(
+        meta({"shape": [8, 8]}), codec="raw"
+    )
+    metadata["wrongchunks/zarr.json"] = await cas.save(
+        meta({
+            "shape": [4, 4],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": {"chunk_shape": [4, 4]},
+            },
+        }),
+        codec="raw",
+    )
+    # v2-format dual registration of the same array: "chunks" key, same grid.
+    metadata["temp/.zarray"] = await cas.save(
+        meta({"shape": [4, 4], "chunks": [2, 2]}), codec="raw"
+    )
+    legacy_root = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root),
+    )
+    assert reopened._primary_array_path == "temp"
+    listed = [key async for key in reopened.list()]
+    assert "temp/c/0/0" in listed
+
+
+@pytest.mark.asyncio
+async def test_inference_handles_malformed_metadata_maps() -> None:
+    """Direct-call coverage for defensive branches dag-cbor cannot produce:
+    a non-mapping metadata value and a non-string metadata key."""
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    store._root_obj["chunks"].pop("primary_array_path", None)
+
+    store._root_obj["metadata"] = None
+    await store._infer_v1_legacy_primary_array_path()
+    assert store._primary_array_path in (None, "")
+
+    cid = await cas.save(b"payload", codec="raw")
+    store._root_obj["metadata"] = {1: cid}
+    await store._infer_v1_legacy_primary_array_path()
+    assert store._primary_array_path in (None, "")
