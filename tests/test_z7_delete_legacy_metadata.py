@@ -1,10 +1,12 @@
 import json
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 import dag_cbor
 import pytest
 import zarr
 from dag_cbor.ipld import IPLDKind
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from multiformats import CID
 from testing_utils import CIDInMemoryCAS
 
@@ -12,6 +14,7 @@ from py_hamt import ShardedZarrStore
 
 PROTOTYPE = zarr.core.buffer.default_buffer_prototype()
 CHUNK_KEY = "myarr/c/0/0"
+LegacyAction = tuple[Literal["set", "delete", "flush_reopen"], bytes]
 ARRAY_METADATA = json.dumps(
     {
         "zarr_format": 3,
@@ -134,6 +137,18 @@ async def shard_empty_legacy_store() -> tuple[CIDInMemoryCAS, ShardedZarrStore]:
     return cas, store
 
 
+async def assert_optional_value(
+    store: ShardedZarrStore,
+    expected: bytes | None,
+) -> None:
+    value = await store.get(CHUNK_KEY, PROTOTYPE)
+    if expected is None:
+        assert value is None, value.to_bytes() if value is not None else None
+    else:
+        assert value is not None
+        assert value.to_bytes() == expected
+
+
 @pytest.mark.asyncio
 async def test_overwrite_removes_legacy_metadata_entry() -> None:
     cas, store = await shard_empty_legacy_store()
@@ -176,3 +191,57 @@ async def test_delete_persists_legacy_metadata_removal_after_reopen() -> None:
 
     deleted = await reopened.get(CHUNK_KEY, PROTOTYPE)
     assert deleted is None, deleted.to_bytes() if deleted is not None else None
+
+
+@pytest.mark.asyncio
+@given(
+    actions=st.lists(
+        st.one_of(
+            st.tuples(st.just("set"), st.binary(max_size=64)),
+            st.tuples(st.just("delete"), st.just(b"")),
+            st.tuples(st.just("flush_reopen"), st.just(b"")),
+        ),
+        min_size=1,
+        max_size=10,
+    ),
+)
+@settings(max_examples=25, deadline=None)
+async def test_legacy_chunk_mutation_sequence_property(
+    actions: list[LegacyAction],
+) -> None:
+    """No operation history may revive the superseded legacy metadata CID."""
+    cas, store = await shard_empty_legacy_store()
+    expected: bytes | None = b"current"
+    mutation_seen = False
+
+    for action, payload in actions:
+        if action == "set":
+            await store.set(CHUNK_KEY, buf(payload))
+            expected = payload
+            mutation_seen = True
+        elif action == "delete":
+            await store.delete(CHUNK_KEY)
+            expected = None
+            mutation_seen = True
+        else:
+            checkpoint_root = await store.flush()
+            checkpoint_obj = await _decoded_root(cas, checkpoint_root)
+            if mutation_seen:
+                assert CHUNK_KEY not in checkpoint_obj["metadata"]
+            store = await ShardedZarrStore.open(
+                cas=cas,
+                read_only=False,
+                root_cid=checkpoint_root,
+            )
+        await assert_optional_value(store, expected)
+
+    final_root = await store.flush()
+    final_root_obj = await _decoded_root(cas, final_root)
+    if mutation_seen:
+        assert CHUNK_KEY not in final_root_obj["metadata"]
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=final_root,
+    )
+    await assert_optional_value(reopened, expected)
