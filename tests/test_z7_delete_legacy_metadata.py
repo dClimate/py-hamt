@@ -1,8 +1,10 @@
 import json
+from typing import TypedDict, cast
 
 import dag_cbor
 import pytest
 import zarr
+from dag_cbor.ipld import IPLDKind
 from multiformats import CID
 from testing_utils import CIDInMemoryCAS
 
@@ -31,6 +33,15 @@ ARRAY_METADATA = json.dumps(
 ).encode()
 
 
+class _ArrayManifest(TypedDict):
+    shard_cids: list[CID | None]
+
+
+class _IPLDV2Root(TypedDict):
+    metadata: dict[str, IPLDKind]
+    arrays: dict[str, _ArrayManifest]
+
+
 def buf(data: bytes) -> zarr.core.buffer.Buffer:
     return PROTOTYPE.buffer.from_bytes(data)
 
@@ -49,10 +60,13 @@ async def _base_store() -> tuple[CIDInMemoryCAS, str]:
     return cas, root_cid
 
 
-async def _decoded_root(cas: CIDInMemoryCAS, root_cid: str) -> dict:
+async def _decoded_root(
+    cas: CIDInMemoryCAS,
+    root_cid: str,
+) -> _IPLDV2Root:
     root_obj = dag_cbor.decode(await cas.load(root_cid))
     assert isinstance(root_obj, dict)
-    return root_obj
+    return cast(_IPLDV2Root, root_obj)
 
 
 async def dual_representation_store() -> tuple[CIDInMemoryCAS, ShardedZarrStore]:
@@ -66,7 +80,10 @@ async def dual_representation_store() -> tuple[CIDInMemoryCAS, ShardedZarrStore]
     metadata = root_obj["metadata"]
     assert isinstance(metadata, dict)
     metadata[CHUNK_KEY] = stale_cid
-    legacy_root_cid = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+    legacy_root_cid = await cas.save(
+        dag_cbor.encode(cast(IPLDKind, root_obj)),
+        codec="dag-cbor",
+    )
 
     store = await ShardedZarrStore.open(
         cas=cas,
@@ -101,7 +118,10 @@ async def shard_empty_legacy_store() -> tuple[CIDInMemoryCAS, ShardedZarrStore]:
     metadata = root_obj["metadata"]
     assert isinstance(metadata, dict)
     metadata[CHUNK_KEY] = original_chunk_cid
-    legacy_root_cid = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+    legacy_root_cid = await cas.save(
+        dag_cbor.encode(cast(IPLDKind, root_obj)),
+        codec="dag-cbor",
+    )
 
     store = await ShardedZarrStore.open(
         cas=cas,

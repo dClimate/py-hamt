@@ -4,6 +4,7 @@ from typing import Any, cast
 import dag_cbor
 import pytest
 import zarr
+from dag_cbor.ipld import IPLDKind
 from testing_utils import CIDInMemoryCAS
 
 from py_hamt import ShardedZarrStore
@@ -147,10 +148,21 @@ class FlakyMetadataCAS(CIDInMemoryCAS):
         super().__init__()
         self.failing_cid: object = None
 
-    async def load(self, id, offset=None, length=None, suffix=None):  # type: ignore[override]
-        if self.failing_cid is not None and str(id) == str(self.failing_cid):
+    async def load(
+        self,
+        identifier: IPLDKind,
+        offset: int | None = None,
+        length: int | None = None,
+        suffix: int | None = None,
+    ) -> bytes:
+        if self.failing_cid is not None and str(identifier) == str(self.failing_cid):
             raise ConnectionError("simulated partial CAS outage")
-        return await super().load(id, offset=offset, length=length, suffix=suffix)
+        return await super().load(
+            identifier,
+            offset=offset,
+            length=length,
+            suffix=suffix,
+        )
 
 
 @pytest.mark.asyncio
@@ -207,7 +219,7 @@ async def test_inference_skips_non_candidates_and_dedupes_dual_format() -> None:
     await store.set("temp/c/0/0", buf(b"chunk"))
     root = await store.flush()
 
-    def meta(payload: dict) -> bytes:
+    def meta(payload: dict[str, object]) -> bytes:
         return json.dumps(payload).encode()
 
     root_obj = decode_root(await cas.load(root))

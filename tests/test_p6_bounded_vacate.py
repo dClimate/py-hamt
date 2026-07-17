@@ -80,12 +80,15 @@ async def test_failed_vacate_leaves_no_orphan_save_tasks() -> None:
     hamt = await build_wide_hamt(cas)
     cas.arm()
 
+    baseline_tasks = asyncio.all_tasks()
     with pytest.raises(ConnectionError):
         await hamt.cache_vacate()
 
     pending = [
         task
         for task in asyncio.all_tasks()
-        if task is not asyncio.current_task() and not task.done()
+        if task not in baseline_tasks
+        and task is not asyncio.current_task()
+        and not task.done()
     ]
     assert pending == [], f"orphaned vacate save tasks survived the failure: {pending}"
