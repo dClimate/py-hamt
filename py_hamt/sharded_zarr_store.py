@@ -849,9 +849,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
             ):
                 continue
             declared_chunk_shape = self._declared_chunk_shape(metadata_json)
-            if declared_chunk_shape is not None and declared_chunk_shape != tuple(
-                self._chunk_shape
-            ):
+            if declared_chunk_shape != tuple(self._chunk_shape):
                 continue
             matching_paths.add(normalized_path)
 

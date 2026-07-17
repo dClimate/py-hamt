@@ -1,4 +1,5 @@
 import json
+from typing import Any, cast
 
 import dag_cbor
 import pytest
@@ -28,10 +29,24 @@ ARRAY_METADATA = json.dumps(
     },
     separators=(",", ":"),
 ).encode()
+CHUNKLESS_ARRAY_METADATA = json.dumps(
+    {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [4, 4],
+    },
+    separators=(",", ":"),
+).encode()
 
 
 def buf(data: bytes) -> zarr.core.buffer.Buffer:
     return PROTOTYPE.buffer.from_bytes(data)
+
+
+def decode_root(data: bytes) -> dict[str, Any]:
+    root_obj = dag_cbor.decode(data)
+    assert isinstance(root_obj, dict)
+    return cast(dict[str, Any], root_obj)
 
 
 @pytest.mark.asyncio
@@ -48,7 +63,7 @@ async def test_v1_legacy_root_infers_primary_array_path_for_listing() -> None:
     await store.set("temp/c/0/0", buf(b"chunk"))
     root = await store.flush()
 
-    root_obj = dag_cbor.decode(await cas.load(root))
+    root_obj = decode_root(await cas.load(root))
     root_obj["chunks"].pop("primary_array_path")
     legacy_root = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
 
@@ -65,6 +80,64 @@ async def test_v1_legacy_root_infers_primary_array_path_for_listing() -> None:
     listed = [key async for key in reopened.list()]
     assert "temp/c/0/0" in listed and "c/0/0" not in listed
     assert [key async for key in reopened.list_prefix("temp/c/")] == ["temp/c/0/0"]
+
+
+@pytest.mark.asyncio
+async def test_inference_rejects_lone_chunkless_candidate() -> None:
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    await store.set("temp/zarr.json", buf(ARRAY_METADATA))
+    await store.set("temp/c/0/0", buf(b"chunk"))
+    root = await store.flush()
+
+    root_obj = decode_root(await cas.load(root))
+    root_obj["chunks"].pop("primary_array_path")
+    malformed_cid = await cas.save(CHUNKLESS_ARRAY_METADATA, codec="raw")
+    root_obj["metadata"] = {"malformed/zarr.json": malformed_cid}
+    legacy_root = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root),
+    )
+    assert reopened._primary_array_path in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_inference_ignores_chunkless_candidate_beside_valid_array() -> None:
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    await store.set("temp/zarr.json", buf(ARRAY_METADATA))
+    await store.set("temp/c/0/0", buf(b"chunk"))
+    root = await store.flush()
+
+    root_obj = decode_root(await cas.load(root))
+    root_obj["chunks"].pop("primary_array_path")
+    root_obj["metadata"]["malformed/zarr.json"] = await cas.save(
+        CHUNKLESS_ARRAY_METADATA,
+        codec="raw",
+    )
+    legacy_root = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root),
+    )
+    assert reopened._primary_array_path == "temp"
 
 
 class FlakyMetadataCAS(CIDInMemoryCAS):
@@ -98,7 +171,7 @@ async def test_inference_aborts_when_a_candidate_cannot_be_loaded() -> None:
     await store.set("temp/c/0/0", buf(b"chunk"))
     root = await store.flush()
 
-    root_obj = dag_cbor.decode(await cas.load(root))
+    root_obj = decode_root(await cas.load(root))
     root_obj["chunks"].pop("primary_array_path")
     legacy_root = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
 
@@ -137,7 +210,7 @@ async def test_inference_skips_non_candidates_and_dedupes_dual_format() -> None:
     def meta(payload: dict) -> bytes:
         return json.dumps(payload).encode()
 
-    root_obj = dag_cbor.decode(await cas.load(root))
+    root_obj = decode_root(await cas.load(root))
     root_obj["chunks"].pop("primary_array_path")
     metadata = root_obj["metadata"]
     metadata["lat/zarr.json"] = await cas.save(meta({"shape": [4, 4]}), codec="raw")
