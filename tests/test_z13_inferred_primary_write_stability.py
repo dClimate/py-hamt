@@ -6,6 +6,7 @@ from typing import Any, cast
 import dag_cbor
 import pytest
 import zarr
+from dag_cbor.ipld import IPLDKind
 from testing_utils import CIDInMemoryCAS
 
 from py_hamt import ShardedZarrStore
@@ -46,6 +47,30 @@ def array_metadata(*, shape: tuple[int, ...], chunk_shape: tuple[int, ...]) -> b
 
 def buf(data: bytes) -> zarr.core.buffer.Buffer:
     return PROTOTYPE.buffer.from_bytes(data)
+
+
+class FailingShardLoadCAS(CIDInMemoryCAS):
+    """Fail one selected load after a legacy root has been opened."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing_cid: IPLDKind | None = None
+
+    async def load(
+        self,
+        identifier: IPLDKind,
+        offset: int | None = None,
+        length: int | None = None,
+        suffix: int | None = None,
+    ) -> bytes:
+        if self.failing_cid is not None and str(identifier) == str(self.failing_cid):
+            raise RuntimeError("simulated shard load failure")
+        return await super().load(
+            identifier,
+            offset=offset,
+            length=length,
+            suffix=suffix,
+        )
 
 
 async def decoded_root(cas: CIDInMemoryCAS, root_cid: str) -> dict[str, Any]:
@@ -268,6 +293,98 @@ async def test_recorded_empty_primary_routes_named_chunk_to_metadata() -> None:
     assert await read_bytes(reopened_for_read, root_chunk_key) == original_root_chunk
     assert named_chunk_key in mutated_metadata
     assert mutated_chunk_info["primary_array_path"] == ""
+
+
+@pytest.mark.asyncio
+async def test_recorded_empty_primary_listing_round_trips_through_get() -> None:
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    root_chunk_key = "/c/0/0"
+    canonical_root_chunk_key = "c/0/0"
+    root_chunk = b"root-00"
+    await store.set(root_chunk_key, buf(root_chunk))
+    root_cid = await store.flush()
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=root_cid,
+    )
+    listed = [key async for key in reopened.list()]
+
+    assert listed == [canonical_root_chunk_key]
+    listed_value = await reopened.get(listed[0], PROTOTYPE)
+    assert listed_value is not None
+    assert listed_value.to_bytes() == root_chunk
+
+    root_obj = await decoded_root(cas, root_cid)
+    chunk_info = root_obj["chunks"]
+    assert isinstance(chunk_info, dict)
+    chunk_info.pop("primary_array_path")
+    legacy_root_cid = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+    legacy_reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root_cid),
+    )
+    legacy_listed = [key async for key in legacy_reopened.list()]
+    assert legacy_listed == [root_chunk_key]
+    legacy_value = await legacy_reopened.get(legacy_listed[0], PROTOTYPE)
+    assert legacy_value is not None
+    assert legacy_value.to_bytes() == root_chunk
+
+
+@pytest.mark.asyncio
+async def test_failed_first_primary_write_does_not_persist_its_path() -> None:
+    cas = FailingShardLoadCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    original_key = "temp/c/0/0"
+    original_chunk = b"original-temp"
+    await store.set(original_key, buf(original_chunk))
+    recorded_root_cid = await store.flush()
+
+    root_obj = await decoded_root(cas, recorded_root_cid)
+    chunk_info = root_obj["chunks"]
+    assert isinstance(chunk_info, dict)
+    shard_cid = chunk_info["shard_cids"][0]
+    chunk_info.pop("primary_array_path")
+    legacy_root_cid = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        root_cid=str(legacy_root_cid),
+    )
+    cas.failing_cid = shard_cid
+    with pytest.raises(RuntimeError, match="simulated shard load failure"):
+        await reopened.set("wrong/c/0/0", buf(b"failed-write"))
+
+    assert "primary_array_path" not in reopened._root_obj["chunks"]
+    assert reopened._primary_array_path == ""
+
+    cas.failing_cid = None
+    flushed_root_cid = await reopened.flush()
+    persisted_root = await decoded_root(cas, flushed_root_cid)
+    assert "primary_array_path" not in persisted_root["chunks"]
+
+    read_store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=flushed_root_cid,
+    )
+    assert await read_bytes(read_store, original_key) == original_chunk
 
 
 @pytest.mark.asyncio

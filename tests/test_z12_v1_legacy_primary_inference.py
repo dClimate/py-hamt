@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any, Literal, cast
 
@@ -11,6 +12,7 @@ from hypothesis.internal.conjecture.data import ConjectureData
 from testing_utils import CIDInMemoryCAS
 
 from py_hamt import ShardedZarrStore
+from py_hamt.sharded_zarr_store import _V1_INFERENCE_CONCURRENCY
 
 PROTOTYPE = zarr.core.buffer.default_buffer_prototype()
 ARRAY_METADATA = json.dumps(
@@ -251,6 +253,46 @@ class FlakyMetadataCAS(CIDInMemoryCAS):
         )
 
 
+class ConcurrentMetadataCAS(CIDInMemoryCAS):
+    """Measure concurrency and request count for selected metadata loads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delayed_cids: list[IPLDKind] = []
+        self.load_count = 0
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def load(
+        self,
+        identifier: IPLDKind,
+        offset: int | None = None,
+        length: int | None = None,
+        suffix: int | None = None,
+    ) -> bytes:
+        if not any(identifier == candidate for candidate in self.delayed_cids):
+            return await super().load(
+                identifier,
+                offset=offset,
+                length=length,
+                suffix=suffix,
+            )
+
+        self.load_count += 1
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().load(
+                identifier,
+                offset=offset,
+                length=length,
+                suffix=suffix,
+            )
+        finally:
+            self.in_flight -= 1
+
+
 @pytest.mark.asyncio
 async def test_inference_aborts_when_a_candidate_cannot_be_loaded() -> None:
     """If any candidate's metadata cannot be loaded, the true primary might be
@@ -286,6 +328,89 @@ async def test_inference_aborts_when_a_candidate_cannot_be_loaded() -> None:
         "a partial CAS outage must not rebind shard data under a surviving "
         f"candidate, got {reopened._primary_array_path!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_inference_loads_candidates_concurrently_and_stops_when_ambiguous() -> (
+    None
+):
+    cas = ConcurrentMetadataCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    await store.set("temp/c/0/0", buf(b"chunk"))
+    root_cid = await store.flush()
+    root_obj = decode_root(await cas.load(root_cid))
+    root_obj["chunks"].pop("primary_array_path")
+
+    candidate_count = _V1_INFERENCE_CONCURRENCY * 3
+    metadata: dict[str, IPLDKind] = {}
+    for index in range(candidate_count):
+        candidate_cid = await cas.save(
+            json.dumps({
+                "candidate": index,
+                "shape": [4, 4],
+                "chunks": [2, 2],
+            }).encode(),
+            codec="raw",
+        )
+        metadata[f"array-{index}/.zarray"] = candidate_cid
+    root_obj["metadata"] = metadata
+    legacy_root_cid = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+    cas.delayed_cids = list(metadata.values())
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root_cid),
+    )
+
+    assert reopened._primary_array_path == ""
+    assert cas.max_in_flight == _V1_INFERENCE_CONCURRENCY
+    assert cas.load_count == _V1_INFERENCE_CONCURRENCY
+    assert cas.load_count < candidate_count
+
+
+@pytest.mark.asyncio
+async def test_inference_propagates_candidate_load_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    store._root_obj["chunks"].pop("primary_array_path", None)
+    metadata_cid = await cas.save(ARRAY_METADATA, codec="raw")
+    store._root_obj["metadata"] = {"temp/zarr.json": metadata_cid}
+    original_load = cas.load
+
+    async def cancelling_load(
+        identifier: IPLDKind,
+        offset: int | None = None,
+        length: int | None = None,
+        suffix: int | None = None,
+    ) -> bytes:
+        if identifier == metadata_cid:
+            raise asyncio.CancelledError
+        return await original_load(
+            identifier,
+            offset=offset,
+            length=length,
+            suffix=suffix,
+        )
+
+    monkeypatch.setattr(cas, "load", cancelling_load)
+
+    with pytest.raises(asyncio.CancelledError):
+        await store._infer_v1_legacy_primary_array_path()
 
 
 @pytest.mark.asyncio

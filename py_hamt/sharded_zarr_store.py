@@ -36,6 +36,7 @@ SHARDED_ZARR_V1 = "sharded_zarr_v1"
 SHARDED_ZARR_V2 = "sharded_zarr_v2"
 ZARR_METADATA_SUFFIXES = ("zarr.json", ".zarray", ".zattrs", ".zgroup")
 _FLUSH_CONCURRENCY = 8
+_V1_INFERENCE_CONCURRENCY = 8
 
 ShardCacheKey = int | tuple[str, int]
 ShardReadMode = Literal["full", "sparse"]
@@ -820,7 +821,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if not isinstance(metadata, dict):
             return
 
-        matching_paths: set[str] = set()
+        candidates: list[tuple[str, IPLDKind]] = []
         for key, metadata_cid in metadata.items():
             if not isinstance(key, str):
                 continue
@@ -831,27 +832,43 @@ class ShardedZarrStore(zarr.abc.store.Store):
             if normalized_path.rsplit("/", 1)[-1] in self._V1_COORDINATE_ARRAY_PREFIXES:
                 continue
 
-            try:
-                metadata_bytes = await self.cas.load(metadata_cid)
-            except Exception:
-                # A candidate we could not read might have been the true
-                # primary. Guessing from the survivors could rebind shard
-                # data under the wrong prefix, so abort the inference and
-                # keep the legacy default instead.
+            candidates.append((normalized_path, metadata_cid))
+
+        matching_paths: set[str] = set()
+        for batch_start in range(0, len(candidates), _V1_INFERENCE_CONCURRENCY):
+            batch = candidates[batch_start : batch_start + _V1_INFERENCE_CONCURRENCY]
+            metadata_results = await asyncio.gather(
+                *(self.cas.load(metadata_cid) for _, metadata_cid in batch),
+                return_exceptions=True,
+            )
+
+            for (normalized_path, _), metadata_result in zip(batch, metadata_results):
+                if isinstance(metadata_result, BaseException):
+                    if isinstance(metadata_result, asyncio.CancelledError):
+                        raise metadata_result
+                    # A candidate we could not read might have been the true
+                    # primary. Guessing from the survivors could rebind shard
+                    # data under the wrong prefix, so abort the inference and
+                    # keep the legacy default instead.
+                    return
+                metadata_json = self._decode_metadata_json(metadata_result)
+                if metadata_json is None:
+                    continue
+                declared_shape = metadata_json.get("shape")
+                if not (
+                    isinstance(declared_shape, (list, tuple))
+                    and tuple(declared_shape) == tuple(self._array_shape)
+                ):
+                    continue
+                declared_chunk_shape = self._declared_chunk_shape(metadata_json)
+                if declared_chunk_shape != tuple(self._chunk_shape):
+                    continue
+                matching_paths.add(normalized_path)
+
+            # Once two different paths match, later metadata cannot make the
+            # inference unambiguous. Avoid issuing more remote CAS requests.
+            if len(matching_paths) > 1:
                 return
-            metadata_json = self._decode_metadata_json(metadata_bytes)
-            if metadata_json is None:
-                continue
-            declared_shape = metadata_json.get("shape")
-            if not (
-                isinstance(declared_shape, (list, tuple))
-                and tuple(declared_shape) == tuple(self._array_shape)
-            ):
-                continue
-            declared_chunk_shape = self._declared_chunk_shape(metadata_json)
-            if declared_chunk_shape != tuple(self._chunk_shape):
-                continue
-            matching_paths.add(normalized_path)
 
         if len(matching_paths) == 1:
             # Best-effort, in-memory only: never persist a guessed path, so a
@@ -1483,7 +1500,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
             coord_part = key[marker_idx + len(chunk_marker) :]
         elif key.startswith("c/"):
             if self._manifest_version == SHARDED_ZARR_V1:
-                return None
+                recorded_path = self._root_obj.get("chunks", {}).get(
+                    "primary_array_path"
+                )
+                if not (
+                    isinstance(recorded_path, str)
+                    and self._normalize_array_path(recorded_path) == ""
+                ):
+                    return None
             array_path = ""
             coord_part = key[len("c/") :]
         else:
@@ -2157,13 +2181,6 @@ class ShardedZarrStore(zarr.abc.store.Store):
             self._dirty_root = True
             return None
 
-        if self._manifest_version == SHARDED_ZARR_V1:
-            chunk_info = self._root_obj["chunks"]
-            if "primary_array_path" not in chunk_info:
-                self._primary_array_path = parsed_chunk.array_path
-                chunk_info["primary_array_path"] = parsed_chunk.array_path
-                self._dirty_root = True
-
         array_index = self._array_index_for_path(parsed_chunk.array_path)
         linear_chunk_index = self._get_linear_chunk_index_for_index(
             parsed_chunk.coords, array_index
@@ -2183,6 +2200,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
             # empties again.
             if self._root_obj["metadata"].pop(key, None) is not None:
                 self._metadata_read_cache.pop(key, None)
+                self._dirty_root = True
+
+        if self._manifest_version == SHARDED_ZARR_V1:
+            chunk_info = self._root_obj["chunks"]
+            if "primary_array_path" not in chunk_info:
+                self._primary_array_path = parsed_chunk.array_path
+                chunk_info["primary_array_path"] = parsed_chunk.array_path
                 self._dirty_root = True
         return None
 
@@ -2404,7 +2428,22 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     coords = self._coords_from_linear_index(
                         linear_index, array_index.chunks_per_dim
                     )
-                    yield self._format_chunk_key(listed_array_path or "", coords)
+                    chunk_key = self._format_chunk_key(listed_array_path or "", coords)
+                    if (
+                        self._manifest_version == SHARDED_ZARR_V1
+                        and not listed_array_path
+                    ):
+                        recorded_path = self._root_obj.get("chunks", {}).get(
+                            "primary_array_path"
+                        )
+                        if not (
+                            isinstance(recorded_path, str)
+                            and self._normalize_array_path(recorded_path) == ""
+                        ):
+                            # Unrecorded V1 roots distinguish shard chunks
+                            # ("/c/...") from legacy metadata keys ("c/...").
+                            chunk_key = f"/{chunk_key}"
+                    yield chunk_key
 
     async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
         async for key in self.list():

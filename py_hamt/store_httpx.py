@@ -72,6 +72,13 @@ def _slice_requested_range(
     return data
 
 
+def _close_client_on_stopped_loop(
+    owner_loop: asyncio.AbstractEventLoop, client: httpx.AsyncClient
+) -> None:
+    """Run client cleanup on its stopped but still usable owner loop."""
+    owner_loop.run_until_complete(client.aclose())
+
+
 class ContentAddressedStore(ABC):
     """
     Abstract class that represents a content addressed storage that the `HAMT` can use for keeping data.
@@ -522,8 +529,20 @@ class KuboCAS(ContentAddressedStore):
                 continue
 
             try:
-                if owner_loop is current_loop or not owner_loop.is_closed():
+                if owner_loop is current_loop:
                     await client.aclose()
+                    continue
+
+                if not owner_loop.is_closed():
+                    if owner_loop.is_running():
+                        close_future = asyncio.run_coroutine_threadsafe(
+                            client.aclose(), owner_loop
+                        )
+                        await asyncio.wrap_future(close_future)
+                    else:
+                        await asyncio.to_thread(
+                            _close_client_on_stopped_loop, owner_loop, client
+                        )
                     continue
 
                 # AsyncClient marks itself closed before awaiting its transport.

@@ -211,3 +211,74 @@ def test_aclose_awaits_current_loop_transport_normally() -> None:
     assert transports[0].closed
     assert transports[0].aclose_calls == 1
     assert transports[0].close_calls == 0
+
+
+def test_aclose_runs_cleanup_on_stopped_foreign_owner_loop() -> None:
+    """A stopped foreign owner loop is temporarily run for cleanup."""
+    transports: list[LoopBoundRecordingTransport] = []
+
+    def client_factory() -> httpx.AsyncClient:
+        transport = LoopBoundRecordingTransport()
+        transports.append(transport)
+        return httpx.AsyncClient(transport=transport)
+
+    cas = KuboCAS(client_factory=client_factory)
+    owner_loop = asyncio.new_event_loop()
+
+    async def create_client() -> None:
+        cas._loop_client()
+
+    try:
+        owner_loop.run_until_complete(create_client())
+
+        asyncio.run(cas.aclose())
+
+        assert len(transports) == 1
+        assert transports[0].closed
+        assert cas._client_per_loop == {}
+        assert cas._closed
+    finally:
+        owner_loop.close()
+
+
+def test_aclose_schedules_cleanup_on_running_foreign_loop() -> None:
+    """A live foreign loop must execute transport cleanup on that loop."""
+    transports: list[LoopBoundRecordingTransport] = []
+
+    def client_factory() -> httpx.AsyncClient:
+        transport = LoopBoundRecordingTransport()
+        transports.append(transport)
+        return httpx.AsyncClient(transport=transport)
+
+    cas = KuboCAS(client_factory=client_factory)
+    owner_loop = asyncio.new_event_loop()
+    loop_started = threading.Event()
+
+    def run_owner_loop() -> None:
+        asyncio.set_event_loop(owner_loop)
+        loop_started.set()
+        owner_loop.run_forever()
+
+    owner_thread = threading.Thread(target=run_owner_loop)
+    owner_thread.start()
+    assert loop_started.wait(timeout=5)
+
+    async def create_client() -> None:
+        cas._loop_client()
+
+    try:
+        create_future = asyncio.run_coroutine_threadsafe(create_client(), owner_loop)
+        create_future.result(timeout=5)
+
+        asyncio.run(cas.aclose())
+
+        assert len(transports) == 1
+        assert transports[0].closed
+        assert transports[0].aclose_calls == 1
+        assert cas._client_per_loop == {}
+        assert cas._closed
+    finally:
+        owner_loop.call_soon_threadsafe(owner_loop.stop)
+        owner_thread.join(timeout=5)
+        assert not owner_thread.is_alive()
+        owner_loop.close()
