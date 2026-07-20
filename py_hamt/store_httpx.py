@@ -72,6 +72,14 @@ def _slice_requested_range(
     return data
 
 
+# Upper bound on how long aclose() waits for a cross-loop client close that was
+# scheduled onto a *running* owner loop. Bounds the window where that loop stops
+# between the is_running() check and the coroutine executing, which would
+# otherwise leave the wrapped future pending forever. Module-level so tests can
+# shrink it; a healthy running loop closes near-instantly, well under this.
+_CROSS_LOOP_ACLOSE_TIMEOUT_S = 30.0
+
+
 def _close_client_on_stopped_loop(
     owner_loop: asyncio.AbstractEventLoop, client: httpx.AsyncClient
 ) -> None:
@@ -538,12 +546,24 @@ class KuboCAS(ContentAddressedStore):
                         close_future = asyncio.run_coroutine_threadsafe(
                             client.aclose(), owner_loop
                         )
-                        await asyncio.wrap_future(close_future)
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.wrap_future(close_future),
+                                timeout=_CROSS_LOOP_ACLOSE_TIMEOUT_S,
+                            )
+                        except TimeoutError:
+                            # The owner loop stopped (or stalled) after
+                            # is_running() succeeded, so the scheduled close can
+                            # never complete. Cancel it and fall through to the
+                            # synchronous transport shutdown below.
+                            close_future.cancel()
+                        else:
+                            continue
                     else:
                         await asyncio.to_thread(
                             _close_client_on_stopped_loop, owner_loop, client
                         )
-                    continue
+                        continue
 
                 # AsyncClient marks itself closed before awaiting its transport.
                 # A dead owner loop therefore needs the transport's sync fallback.

@@ -6,7 +6,7 @@ import sys
 import time
 import warnings
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import (
@@ -510,6 +510,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         self.array_indices: Dict[str, ArrayIndex] = {}
         self._primary_array_path: Optional[str] = None
+        # True only when the primary path was heuristically inferred for a
+        # legacy V1 root (never recorded on disk). Tracked separately from the
+        # path's truthiness because an inferred *root* primary is "", which is
+        # indistinguishable from "not inferred" under a plain truthiness check.
+        self._primary_inferred: bool = False
         self._default_chunks_per_shard: Optional[int] = None
 
         self._array_shape: Tuple[int, ...] = ()
@@ -873,7 +878,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
         if len(matching_paths) == 1:
             # Best-effort, in-memory only: never persist a guessed path, so a
             # later flush of a writable open cannot seal a wrong inference.
+            # The flag keeps the (possibly empty-string) inferred primary
+            # exclusive so foreign chunk writes cannot rebind over it.
             self._primary_array_path = next(iter(matching_paths))
+            self._primary_inferred = True
 
     @staticmethod
     def _declared_chunk_shape(metadata_json: dict) -> Optional[tuple[int, ...]]:
@@ -1102,7 +1110,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
         for shard_idx, shard_cid_obj in enumerate(array_index.shard_cids):
             cache_key = self._cache_key(array_index.array_path, shard_idx)
             shard_lock = self._shard_locks[cache_key]
-            async with shard_lock:
+            # Pin across fetch+read: an over-budget cache whose older entries are
+            # all dirty or pinned would otherwise make the just-fetched clean
+            # shard the sole eviction candidate, evicting it before the snapshot
+            # read below and turning the load into a spurious RuntimeError.
+            async with shard_lock, self._shard_data_cache.pin(cache_key):
                 shard_data = await self._shard_data_cache.get(cache_key)
                 if shard_data is None and shard_cid_obj is not None:
                     await self._fetch_and_cache_full_shard(
@@ -1524,9 +1536,13 @@ class ShardedZarrStore(zarr.abc.store.Store):
             if isinstance(recorded_path, str):
                 primary_path_is_exclusive = True
                 effective_primary_path = recorded_path
-            elif self._primary_array_path:
+            elif self._primary_inferred or self._primary_array_path:
+                # An inferred primary is exclusive even when it is the root
+                # ("") — the flag, not the truthiness, decides. Without it a
+                # foreign same-rank named chunk would parse against the shard
+                # index and rebind the primary to itself.
                 primary_path_is_exclusive = True
-                effective_primary_path = self._primary_array_path
+                effective_primary_path = self._primary_array_path or ""
             else:
                 primary_path_is_exclusive = False
                 effective_primary_path = ""
@@ -1854,6 +1870,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         clone.array_indices = self.array_indices
         clone._primary_array_path = self._primary_array_path
+        clone._primary_inferred = self._primary_inferred
         clone._default_chunks_per_shard = self._default_chunks_per_shard
 
         clone._array_shape = self._array_shape
@@ -2202,7 +2219,11 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 self._metadata_read_cache.pop(key, None)
                 self._dirty_root = True
 
-        if self._manifest_version == SHARDED_ZARR_V1:
+        if self._manifest_version == SHARDED_ZARR_V1 and not self._primary_inferred:
+            # A genuinely-unrecorded root's first chunk write establishes and
+            # persists its primary. An *inferred* primary is never sealed here:
+            # inference is in-memory only, and the exclusivity flag guarantees
+            # only true-primary chunks reach this point anyway.
             chunk_info = self._root_obj["chunks"]
             if "primary_array_path" not in chunk_info:
                 self._primary_array_path = parsed_chunk.array_path
@@ -2466,11 +2487,20 @@ class ShardedZarrStore(zarr.abc.store.Store):
             keys.add("c" if array_path == "" else f"{array_path}/c")
         return keys
 
-    def _is_v2_chunk_listing_prefix(self, normalized_prefix: str) -> bool:
-        if self._manifest_version != SHARDED_ZARR_V2:
-            return False
-        for array_path in self.array_indices:
-            chunk_prefix = "c" if array_path == "" else f"{array_path}/c"
+    def _chunk_listing_prefixes(self) -> Iterator[str]:
+        """The chunk-directory prefixes ``_iter_chunk_keys`` emits keys under."""
+        if self._manifest_version == SHARDED_ZARR_V2:
+            for array_path in self.array_indices:
+                yield "c" if array_path == "" else f"{array_path}/c"
+        else:
+            # V1 emits a single primary chunk tree, rooted at "c" or
+            # "<primary>/c" to match the recorded/inferred primary path.
+            yield (
+                "c" if not self._primary_array_path else f"{self._primary_array_path}/c"
+            )
+
+    def _is_chunk_listing_prefix(self, normalized_prefix: str) -> bool:
+        for chunk_prefix in self._chunk_listing_prefixes():
             if normalized_prefix == chunk_prefix or normalized_prefix.startswith(
                 f"{chunk_prefix}/"
             ):
@@ -2726,7 +2756,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         effective_prefix = self._v2_effective_list_dir_prefix(normalized_prefix)
         match_prefix = f"{effective_prefix}/" if effective_prefix else ""
 
-        if self._is_v2_chunk_listing_prefix(effective_prefix):
+        if self._is_chunk_listing_prefix(effective_prefix):
             async for key in self._iter_chunk_keys():
                 if not key.startswith(match_prefix):
                     continue

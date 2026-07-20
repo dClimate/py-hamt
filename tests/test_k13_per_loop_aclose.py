@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import queue
 import threading
 import warnings
@@ -8,6 +7,7 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
+import py_hamt.store_httpx as store_httpx
 from py_hamt import KuboCAS
 
 
@@ -168,10 +168,8 @@ def test_aclose_warns_for_stock_transport_owned_by_closed_loop() -> None:
         raise server_errors.get()
 
 
-def test_aclose_reports_a_transport_cleanup_failure(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An unrecoverable close failure must not disappear without a warning."""
+def test_aclose_reports_a_transport_cleanup_failure() -> None:
+    """An unrecoverable close failure must surface the specific cleanup warning."""
     cas = KuboCAS(
         client_factory=lambda: httpx.AsyncClient(transport=UncloseableTransport())
     )
@@ -180,14 +178,11 @@ def test_aclose_reports_a_transport_cleanup_failure(
         cas._loop_client()
         await cas.aclose()
 
-    with warnings.catch_warnings(record=True) as caught_warnings:
-        warnings.simplefilter("always")
-        with caplog.at_level(logging.WARNING):
-            asyncio.run(create_and_close())
-
-    diagnostics = [str(item.message) for item in caught_warnings]
-    diagnostics.extend(record.getMessage() for record in caplog.records)
-    assert diagnostics, "aclose() silently swallowed the transport cleanup failure"
+    with pytest.warns(
+        RuntimeWarning,
+        match="Failed to close an internally created HTTP client",
+    ):
+        asyncio.run(create_and_close())
 
 
 def test_aclose_awaits_current_loop_transport_normally() -> None:
@@ -278,6 +273,64 @@ def test_aclose_schedules_cleanup_on_running_foreign_loop() -> None:
         assert cas._client_per_loop == {}
         assert cas._closed
     finally:
+        owner_loop.call_soon_threadsafe(owner_loop.stop)
+        owner_thread.join(timeout=5)
+        assert not owner_thread.is_alive()
+        owner_loop.close()
+
+
+def test_aclose_falls_back_when_running_owner_loop_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running owner loop that stalls mid-close must not hang aclose().
+
+    The loop passes the ``is_running()`` check but then never executes the
+    scheduled close, so ``wrap_future`` would wait forever. The bounded wait
+    times out, cancels the scheduled close, and falls back to the synchronous
+    transport shutdown.
+    """
+    monkeypatch.setattr(store_httpx, "_CROSS_LOOP_ACLOSE_TIMEOUT_S", 0.05)
+
+    transports: list[LoopBoundRecordingTransport] = []
+
+    def client_factory() -> httpx.AsyncClient:
+        transport = LoopBoundRecordingTransport()
+        transports.append(transport)
+        return httpx.AsyncClient(transport=transport)
+
+    cas = KuboCAS(client_factory=client_factory)
+    owner_loop = asyncio.new_event_loop()
+    loop_started = threading.Event()
+
+    def run_owner_loop() -> None:
+        asyncio.set_event_loop(owner_loop)
+        loop_started.set()
+        owner_loop.run_forever()
+
+    owner_thread = threading.Thread(target=run_owner_loop)
+    owner_thread.start()
+    assert loop_started.wait(timeout=5)
+
+    async def create_client() -> None:
+        cas._loop_client()
+
+    block = threading.Event()
+    try:
+        create_future = asyncio.run_coroutine_threadsafe(create_client(), owner_loop)
+        create_future.result(timeout=5)
+
+        # Freeze the still-"running" owner loop so the scheduled close can never
+        # execute, forcing the bounded wait to time out.
+        owner_loop.call_soon_threadsafe(block.wait)
+
+        asyncio.run(cas.aclose())
+
+        assert transports[0].close_calls == 1
+        assert transports[0].closed
+        assert cas._client_per_loop == {}
+        assert cas._closed
+    finally:
+        block.set()
         owner_loop.call_soon_threadsafe(owner_loop.stop)
         owner_thread.join(timeout=5)
         assert not owner_thread.is_alive()
