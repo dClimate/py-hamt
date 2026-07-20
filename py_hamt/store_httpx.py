@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import re
+import threading
 import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -70,6 +71,20 @@ def _slice_requested_range(
             return b""
         return data[-suffix:]
     return data
+
+
+def _range_not_satisfiable_is_empty(response: httpx.Response, offset: int) -> bool:
+    """Whether a ``416`` response describes an empty read at ``offset``.
+
+    A spec-compliant gateway rejects a range whose first byte is at or past
+    the end of the object with ``416 Range Not Satisfiable`` and a
+    ``Content-Range: bytes */N`` header. Python slice semantics (and
+    ``InMemoryCAS``) return ``b""`` for that same read, so ``KuboCAS`` matches
+    by treating it as empty rather than surfacing the error.
+    """
+    content_range = response.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes \*/(\d+)", content_range.strip())
+    return match is not None and offset >= int(match.group(1))
 
 
 # Upper bound on how long aclose() waits for a cross-loop client close that was
@@ -341,6 +356,10 @@ class KuboCAS(ContentAddressedStore):
         self._closed: bool = True
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
         self._internally_created_clients: set[httpx.AsyncClient] = set()
+        # Serializes first-use client binding so concurrent event loops on
+        # different threads cannot both consume ``_supplied_client`` and bind
+        # one httpx.AsyncClient to two loops.
+        self._first_use_lock: threading.Lock = threading.Lock()
         self._semaphore_per_loop: Dict[
             asyncio.AbstractEventLoop, asyncio.Semaphore
         ] = {}
@@ -482,35 +501,39 @@ class KuboCAS(ContentAddressedStore):
         try:
             return self._client_per_loop[loop]
         except KeyError:
-            if self._supplied_client is not None:
-                client = self._supplied_client
-                self._supplied_client = None
-            elif self._client_factory is not None:
-                client = self._client_factory()
-                self._internally_created_clients.add(client)
-            else:
-                if self._user_client is not None:
-                    warnings.warn(
-                        "A user-supplied httpx.AsyncClient cannot be reused across "
-                        "event loops; falling back to an internally created client "
-                        "that preserves only headers, auth, timeout, limits, "
-                        "redirect policy, and event hooks. Pass client_factory to "
-                        "preserve full configuration.",
-                        RuntimeWarning,
-                        stacklevel=2,
+            # First use on this loop. Hold the lock across supplied-client
+            # consumption, client creation, and the per-loop assignment so two
+            # loops racing on different threads cannot bind the same client.
+            with self._first_use_lock:
+                if self._supplied_client is not None:
+                    client = self._supplied_client
+                    self._supplied_client = None
+                elif self._client_factory is not None:
+                    client = self._client_factory()
+                    self._internally_created_clients.add(client)
+                else:
+                    if self._user_client is not None:
+                        warnings.warn(
+                            "A user-supplied httpx.AsyncClient cannot be reused "
+                            "across event loops; falling back to an internally "
+                            "created client that preserves only headers, auth, "
+                            "timeout, limits, redirect policy, and event hooks. "
+                            "Pass client_factory to preserve full configuration.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    client = httpx.AsyncClient(
+                        timeout=self._default_timeout,
+                        headers=self._default_headers,
+                        auth=self._default_auth,
+                        limits=self._default_limits,
+                        follow_redirects=self._default_follow_redirects,
+                        event_hooks=self._default_event_hooks,
+                        http2=True,
                     )
-                client = httpx.AsyncClient(
-                    timeout=self._default_timeout,
-                    headers=self._default_headers,
-                    auth=self._default_auth,
-                    limits=self._default_limits,
-                    follow_redirects=self._default_follow_redirects,
-                    event_hooks=self._default_event_hooks,
-                    http2=True,
-                )
-                self._internally_created_clients.add(client)
-            self._client_per_loop[loop] = client
-            return client
+                    self._internally_created_clients.add(client)
+                self._client_per_loop[loop] = client
+                return client
 
     # --------------------------------------------------------------------- #
     # graceful shutdown: close **all** clients we own                       #
@@ -745,6 +768,17 @@ class KuboCAS(ContentAddressedStore):
                 try:
                     async with semaphore:  # Throttle each gateway attempt
                         response = await client.get(url, headers=headers or None)
+                    # A range starting at/past EOF is answered with 416 by a
+                    # compliant gateway; return b"" to match Python-slice
+                    # semantics (and InMemoryCAS) instead of raising.
+                    if (
+                        offset is not None
+                        and response.status_code
+                        == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE
+                        and _range_not_satisfiable_is_empty(response, offset)
+                    ):
+                        final_retry_count = retry_count
+                        return b""
                     response.raise_for_status()
                     content = response.content
                     response_bytes = len(content)

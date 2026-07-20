@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from typing import TypeAlias
 
+import httpx
 import pytest
 
 from py_hamt import InMemoryCAS, KuboCAS
@@ -23,6 +24,20 @@ def range_gateway() -> Iterator[tuple[str, RecordedRanges]]:
             cid = self.path.rsplit("/", 1)[-1].split("?", 1)[0]
             range_header = self.headers.get("Range")
             recorded_ranges.setdefault(cid, []).append(range_header)
+
+            if (
+                cid in ("range-not-satisfiable", "malformed-416")
+                and range_header is not None
+            ):
+                # Compliant gateway rejects a range starting at/past EOF with
+                # 416 + ``Content-Range: bytes */N``. ``malformed-416`` omits
+                # the header to exercise the non-empty-slice fallback.
+                self.send_response(416)
+                if cid == "range-not-satisfiable":
+                    self.send_header("Content-Range", f"bytes */{len(BODY)}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
 
             if cid == "honors-range" and range_header is not None:
                 unit, requested_range = range_header.split("=", 1)
@@ -176,3 +191,61 @@ async def test_inmemorycas_normal_ranges_use_python_slice_semantics() -> None:
     assert await cas.load(key, offset=5, length=10) == BODY[5:15]
     assert await cas.load(key, offset=5) == BODY[5:]
     assert await cas.load(key, suffix=7) == BODY[-7:]
+
+
+@pytest.mark.asyncio
+async def test_inmemorycas_offset_past_eof_returns_empty() -> None:
+    """Python-slice semantics: a read starting at/past EOF yields b""."""
+    cas = InMemoryCAS()
+    key = await cas.save(BODY, "raw")
+
+    assert await cas.load(key, offset=len(BODY)) == b""
+    assert await cas.load(key, offset=len(BODY) + 10) == b""
+    assert await cas.load(key, offset=len(BODY) + 10, length=5) == b""
+
+
+@pytest.mark.asyncio
+async def test_kubocas_offset_past_eof_returns_empty(
+    range_gateway: tuple[str, RecordedRanges],
+) -> None:
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        actual = await cas.load("range-not-satisfiable", offset=len(BODY) + 10)
+    finally:
+        await cas.aclose()
+
+    assert actual == b"", (
+        f"offset past EOF returned {len(actual)} bytes; expected b'' to match "
+        "Python-slice / InMemoryCAS semantics"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kubocas_in_bounds_416_is_surfaced_as_error(
+    range_gateway: tuple[str, RecordedRanges],
+) -> None:
+    # A 416 whose ``*/N`` still covers the requested offset is a genuine
+    # (unexpected) error, not an empty read: it must not be swallowed.
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await cas.load("range-not-satisfiable", offset=5)
+    finally:
+        await cas.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kubocas_416_without_content_range_is_surfaced_as_error(
+    range_gateway: tuple[str, RecordedRanges],
+) -> None:
+    # Without a parseable ``Content-Range`` we cannot prove the read is empty,
+    # so the 416 is raised rather than treated as b"".
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await cas.load("malformed-416", offset=len(BODY) + 10)
+    finally:
+        await cas.aclose()
