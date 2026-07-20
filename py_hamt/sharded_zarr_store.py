@@ -876,12 +876,23 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 return
 
         if len(matching_paths) == 1:
-            # Best-effort, in-memory only: never persist a guessed path, so a
-            # later flush of a writable open cannot seal a wrong inference.
-            # The flag keeps the (possibly empty-string) inferred primary
-            # exclusive so foreign chunk writes cannot rebind over it.
+            # Inference only lands here when exactly one candidate matches, so
+            # the identified primary is correct. The flag keeps the
+            # (possibly empty-string) inferred primary exclusive so foreign
+            # chunk writes route to metadata instead of rebinding over it.
             self._primary_array_path = next(iter(matching_paths))
             self._primary_inferred = True
+            if not self.read_only:
+                # Persist the unambiguous inference so a later reopen routes from
+                # a recorded primary rather than re-inferring. This is what makes
+                # routing deterministic: without it, adding a second
+                # same-geometry array would make the reopen inference ambiguous
+                # and misroute a metadata-stored chunk into the shard slot.
+                # Read-only opens cannot flush, so they rely on the flag alone.
+                self._root_obj["chunks"]["primary_array_path"] = (
+                    self._primary_array_path
+                )
+                self._dirty_root = True
 
     @staticmethod
     def _declared_chunk_shape(metadata_json: dict) -> Optional[tuple[int, ...]]:
@@ -2758,9 +2769,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         if self._is_chunk_listing_prefix(effective_prefix):
             async for key in self._iter_chunk_keys():
-                if not key.startswith(match_prefix):
+                # Unrecorded V1 roots emit the primary shard tree with a
+                # leading slash ("/c/...") to distinguish it from legacy
+                # metadata keys, but list_dir prefixes are slash-stripped.
+                # Normalize the emitted key so list_dir("c") matches "/c/...".
+                normalized_key = key[1:] if key.startswith("/") else key
+                if not normalized_key.startswith(match_prefix):
                     continue
-                suffix = key[len(match_prefix) :]
+                suffix = normalized_key[len(match_prefix) :]
                 first_component = suffix.split("/", 1)[0]
                 if first_component not in seen:
                     seen.add(first_component)

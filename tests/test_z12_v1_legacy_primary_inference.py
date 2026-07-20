@@ -554,7 +554,11 @@ async def test_v1_legacy_primary_inference_property(
     coordinate_condition: CandidateCondition,
     failure_kind: FailureKind,
 ) -> None:
-    """Inference is order-independent, conservative, and never persisted."""
+    """Inference is order-independent and conservative.
+
+    An unambiguous result is recorded on a writable open so a later reopen is
+    deterministic; an ambiguous or absent result records nothing.
+    """
     cas = FlakyMetadataCAS()
     store = await ShardedZarrStore.open(
         cas=cas,
@@ -608,9 +612,13 @@ async def test_v1_legacy_primary_inference_property(
         root_cid=str(legacy_root),
     )
     # DAG-CBOR canonicalizes map ordering. Restore the generated order for the
-    # direct inference seam used by the deterministic defensive tests above.
+    # direct inference seam and reset the artifacts the writable open's own
+    # inference already produced, so this call is exercised in isolation.
     reopened._root_obj["metadata"] = metadata
+    reopened._root_obj["chunks"] = dict(original_chunks)
     reopened._primary_array_path = ""
+    reopened._primary_inferred = False
+    reopened._dirty_root = False
     cas.failing_cid = failing_cid
     await reopened._infer_v1_legacy_primary_array_path()
 
@@ -626,8 +634,18 @@ async def test_v1_legacy_primary_inference_property(
         else ""
     )
     assert reopened._primary_array_path == expected_path
-    assert reopened._root_obj["chunks"] == original_chunks
 
-    flushed_root = await reopened.flush()
-    assert flushed_root == str(legacy_root)
-    assert decode_root(await cas.load(flushed_root))["chunks"] == original_chunks
+    if expected_path:
+        # Unambiguous inference on a writable open is recorded so a later reopen
+        # routes from the recorded primary instead of re-inferring.
+        expected_chunks = {**original_chunks, "primary_array_path": expected_path}
+        assert reopened._root_obj["chunks"] == expected_chunks
+        flushed_root = await reopened.flush()
+        assert flushed_root != str(legacy_root)
+        assert decode_root(await cas.load(flushed_root))["chunks"] == expected_chunks
+    else:
+        # An ambiguous or absent result records nothing.
+        assert reopened._root_obj["chunks"] == original_chunks
+        flushed_root = await reopened.flush()
+        assert flushed_root == str(legacy_root)
+        assert decode_root(await cas.load(flushed_root))["chunks"] == original_chunks

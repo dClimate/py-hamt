@@ -170,11 +170,11 @@ async def exercise_non_primary_write(
 async def assert_inferred_primary_write_is_accepted(
     cas: CIDInMemoryCAS, legacy_root_cid: str
 ) -> None:
-    """Writing the inferred primary must NOT seal it and must preserve chunks.
+    """A writable open records the unambiguous inferred primary and keeps chunks.
 
-    Inference is in-memory only: a writable open that writes to the inferred
-    primary must never persist the guessed path, so a later reopen re-derives
-    it rather than trusting a sealed guess.
+    Recording makes routing deterministic: a later reopen reads from the sealed
+    primary instead of re-inferring, so a second same-geometry array can no
+    longer make the reopen inference ambiguous and misroute a chunk.
     """
     store = await ShardedZarrStore.open(
         cas=cas,
@@ -190,7 +190,7 @@ async def assert_inferred_primary_write_is_accepted(
     root_obj = await decoded_root(cas, flushed_root_cid)
     chunk_info = root_obj["chunks"]
     assert isinstance(chunk_info, dict)
-    assert "primary_array_path" not in chunk_info
+    assert chunk_info["primary_array_path"] == "temp"
 
     reopened = await ShardedZarrStore.open(
         cas=cas,
@@ -205,37 +205,21 @@ async def assert_inferred_primary_write_is_accepted(
 async def test_non_primary_write_matches_recorded_primary_semantics() -> None:
     cas, recorded_root_cid, legacy_root_cid = await v1_recorded_and_legacy_roots()
 
-    # Guard the complementary case first: a write under the inferred primary
-    # itself is accepted, is never sealed to disk, and survives a reopen.
+    # A writable open records the unambiguous inferred primary, so a legacy root
+    # behaves identically to one that already had the primary recorded.
     await assert_inferred_primary_write_is_accepted(cas, legacy_root_cid)
 
-    recorded = await exercise_non_primary_write(cas, recorded_root_cid)
-    assert recorded == NonPrimaryWriteOutcome(
+    expected = NonPrimaryWriteOutcome(
         live_primary="temp",
         persisted_primary="temp",
         precip_in_metadata=True,
         temp_chunks=TEMP_CHUNKS,
         precip_chunk=PRECIP_CHUNK,
     )
-
+    recorded = await exercise_non_primary_write(cas, recorded_root_cid)
     inferred = await exercise_non_primary_write(cas, legacy_root_cid)
-    violations: list[str] = []
-    if inferred.live_primary != recorded.live_primary:
-        violations.append(
-            f"in-memory primary changed to {inferred.live_primary!r}, expected 'temp'"
-        )
-    # Foreign metadata-routed writes must never seal the guessed primary:
-    # inference is in-memory only, so nothing is persisted to disk.
-    assert inferred.persisted_primary is None
-    if inferred.precip_in_metadata != recorded.precip_in_metadata:
-        violations.append("precip write did not use recorded-primary metadata routing")
-    if inferred.temp_chunks != recorded.temp_chunks:
-        violations.append(f"temp chunks changed after reopen: {inferred.temp_chunks!r}")
-    if inferred.precip_chunk != recorded.precip_chunk:
-        violations.append(
-            f"precip bytes differ: {inferred.precip_chunk!r} != {recorded.precip_chunk!r}"
-        )
-    assert not violations, "\n".join(violations)
+    assert recorded == expected
+    assert inferred == expected
 
 
 @pytest.mark.asyncio
@@ -397,7 +381,16 @@ async def test_failed_first_primary_write_does_not_persist_its_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_same_geometry_secondary_write_stays_in_metadata() -> None:
+async def test_same_geometry_secondary_write_is_routed_deterministically() -> None:
+    """A second same-geometry array must not corrupt the primary across a reopen.
+
+    Because the writable open records the inferred primary, the reopen routes
+    from that recorded value instead of re-inferring. Without recording, the
+    second array's metadata made the reopen inference ambiguous, so its
+    metadata-stored chunk re-parsed against the shared shard index and read the
+    primary's slot (``temp-00``) instead of its own bytes. Recording makes the
+    secondary chunk read back its own value.
+    """
     cas, _, legacy_root_cid = await v1_recorded_and_legacy_roots()
     store = await ShardedZarrStore.open(
         cas=cas,
@@ -423,7 +416,17 @@ async def test_same_geometry_secondary_write_stays_in_metadata() -> None:
     assert isinstance(chunk_info, dict)
     assert isinstance(metadata, dict)
     assert secondary_key in metadata
-    assert "primary_array_path" not in chunk_info
+    # The inferred primary is now recorded, so the reopen is unambiguous.
+    assert chunk_info["primary_array_path"] == "temp"
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=flushed_root_cid,
+    )
+    assert await read_temp_chunks(reopened) == TEMP_CHUNKS
+    # The corruption fix: the secondary reads its OWN bytes, not temp's slot.
+    assert await read_bytes(reopened, secondary_key) == secondary_chunk
 
 
 @pytest.mark.asyncio
@@ -483,14 +486,14 @@ async def v1_root_primary_legacy_root() -> tuple[CIDInMemoryCAS, str]:
 
 
 @pytest.mark.asyncio
-async def test_inferred_root_primary_is_not_rebound_by_foreign_write() -> None:
+async def test_inferred_root_primary_is_recorded_and_not_rebound() -> None:
     """A foreign same-rank chunk must not rebind an inferred root primary ("").
 
-    Inference sets the primary to "" (the root array). Because "" is falsy, a
-    plain truthiness check cannot distinguish "inferred root" from "nothing
-    inferred"; the ``_primary_inferred`` flag keeps it exclusive so the foreign
-    write routes to metadata instead of overwriting the root shard slot and
-    sealing the wrong primary.
+    Inference sets the primary to the root array (""). A writable open records
+    that unambiguous inference — even the empty-string path — so the foreign
+    write routes to metadata and the reopen reads from the recorded primary
+    rather than re-inferring. This keeps the root shard slot intact and the
+    foreign chunk readable from its own metadata entry.
     """
     cas, legacy_root_cid = await v1_root_primary_legacy_root()
     store = await ShardedZarrStore.open(
@@ -503,7 +506,7 @@ async def test_inferred_root_primary_is_not_rebound_by_foreign_write() -> None:
 
     await store.set(FOREIGN_SAME_RANK_KEY, buf(FOREIGN_SAME_RANK_CHUNK))
 
-    # The inferred root primary is neither rebound in memory nor sealed to disk.
+    # The inferred root primary is not rebound in memory and is recorded to disk.
     assert store._primary_array_path == ""
     flushed_root_cid = await store.flush()
     root_obj = await decoded_root(cas, flushed_root_cid)
@@ -511,7 +514,7 @@ async def test_inferred_root_primary_is_not_rebound_by_foreign_write() -> None:
     metadata = root_obj["metadata"]
     assert isinstance(chunk_info, dict)
     assert isinstance(metadata, dict)
-    assert "primary_array_path" not in chunk_info
+    assert chunk_info["primary_array_path"] == ""
     assert FOREIGN_SAME_RANK_KEY in metadata
 
     reopened = await ShardedZarrStore.open(
@@ -520,5 +523,44 @@ async def test_inferred_root_primary_is_not_rebound_by_foreign_write() -> None:
         root_cid=flushed_root_cid,
     )
     assert reopened._primary_array_path == ""
-    assert reopened._primary_inferred is True
+    # The reopen routes from the recorded primary; it does not re-infer.
+    assert reopened._primary_inferred is False
     assert await read_bytes(reopened, FOREIGN_SAME_RANK_KEY) == FOREIGN_SAME_RANK_CHUNK
+
+
+@pytest.mark.asyncio
+async def test_unrecorded_empty_primary_list_dir_is_consistent() -> None:
+    """list_dir("c") must surface chunks for an unrecorded empty-primary root.
+
+    Such a root emits its shard tree with a leading slash ("/c/...") to keep it
+    distinct from legacy metadata keys, but list_dir prefixes are slash-stripped.
+    list_dir("") advertises "c", so descending into list_dir("c") must return the
+    chunk components rather than an empty listing.
+    """
+    cas = CIDInMemoryCAS()
+    store = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=False,
+        array_shape=(4, 4),
+        chunk_shape=(2, 2),
+        chunks_per_shard=2,
+    )
+    await store.set("/c/0/0", buf(b"root-00"))
+    root_cid = await store.flush()
+
+    # Drop the sealed primary to model a legacy, unrecorded-primary root.
+    root_obj = await decoded_root(cas, root_cid)
+    chunk_info = root_obj["chunks"]
+    assert isinstance(chunk_info, dict)
+    chunk_info.pop("primary_array_path")
+    legacy_root_cid = await cas.save(dag_cbor.encode(root_obj), codec="dag-cbor")
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=str(legacy_root_cid),
+    )
+    assert reopened._primary_array_path == ""
+    top_level = {key async for key in reopened.list_dir("")}
+    assert "c" in top_level
+    assert [key async for key in reopened.list_dir("c")] == ["0"]
