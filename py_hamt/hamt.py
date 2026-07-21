@@ -14,11 +14,13 @@ from typing import (
 )
 
 import dag_cbor
+from blake3 import blake3
 from dag_cbor.ipld import IPLDKind
-from multiformats import multihash
 
 from . import instrumentation
 from .store_httpx import ContentAddressedStore
+
+_VACATE_CONCURRENCY = 16
 
 
 def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
@@ -48,18 +50,9 @@ def extract_bits(hash_bytes: bytes, depth: int, nbits: int) -> int:
     return result
 
 
-b3 = multihash.get("blake3")
-
-
 def blake3_hashfn(input_bytes: bytes) -> bytes:
-    """
-    This is the default blake3 hash function used for the `HAMT`, with a 32 byte hash size.
-
-    """
-    # 32 bytes is the recommended byte size for blake3 and the default, but multihash forces us to explicitly specify
-    digest: bytes = b3.digest(input_bytes, size=32)
-    raw_bytes: bytes = b3.unwrap(digest)
-    return raw_bytes
+    """Return the HAMT's default raw 32-byte BLAKE3 digest."""
+    return blake3(input_bytes).digest(length=32)
 
 
 class Node:
@@ -197,6 +190,32 @@ class InMemoryTreeStore(NodeStore):
         self.hamt: HAMT = hamt
         # The integer key is a uuidv4 128-bit integer, for (almost perfectly) guaranteeing uniqueness
         self.buffer: dict[int, Node] = {}
+        # CAS IDs identify immutable data, so clean nodes can be reused until the
+        # cache is explicitly vacated. Dirty nodes remain exclusively in buffer.
+        self.clean_cache: dict[IPLDKind, Node] = {}
+
+    def get_clean_node(self, node_id: IPLDKind) -> Node | None:
+        """Return a cached CAS node, or None for misses and unhashable IDs."""
+        try:
+            return self.clean_cache.get(node_id)
+        except TypeError:
+            return None
+
+    def cache_clean_node(self, node_id: IPLDKind, node: Node) -> None:
+        """Cache a CAS node when its IPLD identifier is hashable."""
+        try:
+            self.clean_cache[node_id] = node
+        except TypeError:
+            # CAS implementations normally use bytes or CID objects. Gracefully
+            # skip caching for a custom store that returns another IPLD kind.
+            pass
+
+    def remove_clean_node(self, node_id: IPLDKind) -> None:
+        """Stop serving a clean node once that object becomes dirty."""
+        try:
+            self.clean_cache.pop(node_id, None)
+        except TypeError:
+            pass
 
     def is_buffer_id(self, id: IPLDKind) -> bool:
         return id in self.buffer
@@ -223,54 +242,85 @@ class InMemoryTreeStore(NodeStore):
                     copied.set_link(link_index, InMemoryTreeStore._replaced_id_marker)
             total += len(copied.serialize())
 
+        # Clean cached nodes contain only serializable CAS links and therefore do
+        # not need the buffer-ID substitution used for dirty nodes above.
+        for node in self.clean_cache.values():
+            total += len(node.serialize())
+
         return total
 
-    # The HAMT must properly acquire a lock for this to run successfully! This is not async or thread safe
-    # This algorithm has an implicit assumption that the entire continuous line of branches up to an ancestor is in the memory buffer, which will happen because of the DFS style traversal in all HAMT operations
     async def vacate(self) -> None:
-        # node stack is a list of tuples that look like (parent_id, self_id, node)
-        node_stack: list[tuple[int | None, int, Node]] = []
+        """Flush the dirty tree in concurrent, bottom-up sibling waves.
+
+        The HAMT lock must be held by the caller. A node is not serialized until
+        every buffered child has been saved and relinked to its CAS ID, so only
+        independent subtrees overlap and the root is always saved last.
+        """
         # The root node may not be in the buffer, e.g. this is HAMT initialized with a specific root node id
         if self.is_buffer_id(self.hamt.root_node_id):
-            root_node: Node = self.buffer[cast(int, self.hamt.root_node_id)]
-            node_stack.append((None, cast(int, self.hamt.root_node_id), root_node))
+            root_buffer_id = cast(int, self.hamt.root_node_id)
+            parent_ids: dict[int, int | None] = {root_buffer_id: None}
+            buffered_children: dict[int, set[int]] = {}
+            traversal_order: list[int] = []
+            node_stack: list[int] = [root_buffer_id]
 
-        while len(node_stack) > 0:
-            parent_buffer_id, top_buffer_id, top_node = node_stack[-1]
-            new_nodes_on_stack: list[tuple[int, int, Node]] = []
-            for child_buffer_id in self.children_in_memory(top_node):
-                child_node: Node = self.buffer[child_buffer_id]
-                new_nodes_on_stack.append((top_buffer_id, child_buffer_id, child_node))
+            while node_stack:
+                buffer_id = node_stack.pop()
+                traversal_order.append(buffer_id)
+                child_ids = set(self.children_in_memory(self.buffer[buffer_id]))
+                buffered_children[buffer_id] = child_ids
+                for child_id in child_ids:
+                    parent_ids[child_id] = buffer_id
+                    node_stack.append(child_id)
 
-            no_children_in_memory: bool = len(new_nodes_on_stack) == 0
-            # Flush this node out and relink the rest of the tree
-            if no_children_in_memory:
-                is_root: bool = parent_buffer_id is None
-                old_id: int = top_buffer_id
-                new_id: IPLDKind = await self.hamt.cas.save(
-                    top_node.serialize(), codec="dag-cbor"
-                )
-                del self.buffer[old_id]
-                node_stack.pop()
+            remaining_ids = set(traversal_order)
+            while remaining_ids:
+                wave_ids = [
+                    buffer_id
+                    for buffer_id in traversal_order
+                    if buffer_id in remaining_ids
+                    and buffered_children[buffer_id].isdisjoint(remaining_ids)
+                ]
+                new_ids: list[IPLDKind] = [None] * len(wave_ids)
+                next_wave_index = 0
 
-                # If it's the root, we need to set the hamt's root node id once this is done sending to the backing store
-                if is_root:
-                    self.hamt.root_node_id = new_id
-                # Edit and properly relink the parent if this is not the root
-                else:
-                    # parent_buffer_id is never None in this branch
-                    assert parent_buffer_id is not None
-                    parent_node: Node = self.buffer[parent_buffer_id]
-                    parent_node.replace_link(old_id, new_id)
-            # Continue recursing down the tree
-            else:
-                node_stack.extend(new_nodes_on_stack)
+                async def save_nodes() -> None:
+                    nonlocal next_wave_index
+                    while next_wave_index < len(wave_ids):
+                        wave_index = next_wave_index
+                        next_wave_index += 1
+                        buffer_id = wave_ids[wave_index]
+                        new_ids[wave_index] = await self.hamt.cas.save(
+                            self.buffer[buffer_id].serialize(), codec="dag-cbor"
+                        )
+
+                save_tasks = [
+                    asyncio.ensure_future(save_nodes())
+                    for _ in range(min(_VACATE_CONCURRENCY, len(wave_ids)))
+                ]
+                try:
+                    await asyncio.gather(*save_tasks)
+                except BaseException:
+                    for save_task in save_tasks:
+                        save_task.cancel()
+                    await asyncio.gather(*save_tasks, return_exceptions=True)
+                    raise
+
+                for old_id, new_id in zip(wave_ids, new_ids):
+                    parent_id = parent_ids[old_id]
+                    del self.buffer[old_id]
+                    remaining_ids.remove(old_id)
+                    if parent_id is None:
+                        self.hamt.root_node_id = new_id
+                    else:
+                        self.buffer[parent_id].replace_link(old_id, new_id)
 
         # There are only two types of nodes left in the buffer:
         # 1. A bunch of nodes that seem "unlinked" to anything else, since Links used within the Nodes will reference the real underlying CAS
         # 2. A bunch of empty nodes leftover if the key values they contain are deleted, these would normally be consolidated by a content addressed system but will be leftover in the buffer
         # So we can just clear out everything since these nodes are not used by the rest of the tree
         self.buffer = {}
+        self.clean_cache = {}
 
     async def add_to_buffer(self, node: Node) -> IPLDKind:
         # This buffer_id is IPLDKind type since technically it's an int, but it's not dag_cbor serializable since that library can only do up to 64-bit ints. Thus this will throw errors early if a node is written with buffer_ids still in there
@@ -283,6 +333,10 @@ class InMemoryTreeStore(NodeStore):
         if self.is_buffer_id(original_id):
             return original_id
 
+        # The caller may have modified a node returned by load(). Do not leave
+        # that object cached under the CID of its original immutable contents.
+        self.remove_clean_node(original_id)
+
         # This node was not in the buffer, don't save it to the backing store but rather add to it to the in memory buffer
         buffer_id: IPLDKind = await self.add_to_buffer(node)
         return buffer_id
@@ -293,9 +347,13 @@ class InMemoryTreeStore(NodeStore):
             node: Node = self.buffer[cast(int, id)]  # we know all buffer ids are ints
             return node
 
-        # Something that isn't in the in memory tree, add it
+        clean_node = self.get_clean_node(id)
+        if clean_node is not None:
+            return clean_node
+
+        # CAS-loaded nodes are clean and keyed by their immutable content ID.
         node = Node.deserialize(await self.hamt.cas.load(id))
-        await self.add_to_buffer(node)
+        self.cache_clean_node(id, node)
         return node
 
 
@@ -424,9 +482,12 @@ class HAMT:
 
     async def enable_write(self) -> None:
         """
-        Enable both reads and writes. This creates an internal structure for performance optimizations which will result in the root node ID no longer being valid, in order to read that at the end of your operations you must first use `make_read_only`.
+        Enable both reads and writes. Calling this while writes are already enabled is a no-op that preserves any buffered changes. The read-only to writable transition creates an internal structure for performance optimizations which will result in the root node ID no longer being valid; to read it at the end of your operations, first use `make_read_only`.
         """
         async with self.lock:
+            if not self.read_only:
+                return
+
             # The read cache has no writes that need to be sent upstream so we can remove it without vacating
             self.read_only = False
             self.node_store = InMemoryTreeStore(self)
@@ -461,12 +522,16 @@ class HAMT:
                 await self.node_store.vacate()
 
     async def _reserialize_and_link(
-        self, node_stack: list[tuple[IPLDKind, Node]]
+        self,
+        node_stack: list[tuple[IPLDKind, Node]],
+        link_path: list[int],
     ) -> None:
         """
         This function starts from the node at the end of the list and reserializes so that each node holds valid new IDs after insertion into the store
         Takes a stack of nodes, we represent a stack with a list where the first element is the root element and the last element is the top of the stack
         Each element in the list is a tuple where the first element is the ID from the store and the second element is the Node in python
+        `link_path[i]` is the index in `node_stack[i - 1]` through which
+        `node_stack[i]` is linked. The root entry at index zero is a sentinel.
         If a node ends up being empty, then it is deleted entirely, unless it is the root node
         Modifies in place
         """
@@ -477,18 +542,13 @@ class HAMT:
             # If this node is empty, and it's not the root node, then we can delete it entirely from the list
             is_root: bool = stack_index == 0
             if node.is_empty() and not is_root:
-                # Unlink from the rest of the tree
+                # Unlink from the rest of the tree using the recorded parent slot.
                 _, prev_node = node_stack[stack_index - 1]
-                # When removing links, don't worry about two nodes having the same link since all nodes are guaranteed to be different by the removal of empty nodes after every single operation
-                for link_index in prev_node.iter_link_indices():
-                    link = prev_node.get_link(link_index)
-                    if link == old_id:
-                        # Delete the link by making it an empty bucket
-                        prev_node.data[link_index] = {}
-                        break
+                prev_node.data[link_path[stack_index]] = {}
 
                 # Remove from our stack, continue reserializing up the tree
                 node_stack.pop(stack_index)
+                link_path.pop(stack_index)
                 continue
 
             # If not an empty node, just reserialize like normal and replace this one
@@ -498,7 +558,54 @@ class HAMT:
             # If this is not the last i.e. root node, we need to change the linking of the node prior in the list since we just reserialized
             if not is_root:
                 _, prev_node = node_stack[stack_index - 1]
-                prev_node.replace_link(old_id, new_store_id)
+                prev_node.set_link(link_path[stack_index], new_store_id)
+
+    async def _collect_subtree_entries(
+        self, node: Node, limit: int
+    ) -> dict[str, IPLDKind] | None:
+        """Collect a subtree's entries when they fit in a single bucket."""
+        entries: dict[str, IPLDKind] = {}
+
+        for bucket in node.iter_buckets():
+            if len(entries) + len(bucket) > limit:
+                return None
+            entries.update(bucket)
+
+        for link in node.iter_links():
+            child = await self.node_store.load(link)
+            child_entries = await self._collect_subtree_entries(
+                child, limit - len(entries)
+            )
+            if child_entries is None:
+                return None
+            entries.update(child_entries)
+
+        return entries
+
+    async def _collapse_delete_path(
+        self,
+        node_stack: list[tuple[IPLDKind, Node]],
+        link_path: list[int],
+    ) -> None:
+        """Collapse small subtrees into parent buckets after a deletion.
+
+        Applying this bottom-up restores the same shape produced by a fresh build:
+        every linked subtree contains more entries than ``max_bucket_size``. This
+        can change CIDs only for trees that previously retained a non-canonical
+        post-delete shape.
+        """
+        node_store = cast(InMemoryTreeStore, self.node_store)
+        for stack_index in range(len(node_stack) - 1, 0, -1):
+            old_id, node = node_stack[stack_index]
+            entries = await self._collect_subtree_entries(node, self.max_bucket_size)
+            if entries is None:
+                continue
+
+            _, parent = node_stack[stack_index - 1]
+            parent.data[link_path[stack_index]] = entries
+            node_store.remove_clean_node(old_id)
+            node_stack.pop(stack_index)
+            link_path.pop(stack_index)
 
     # automatically skip encoding if the value provided is of the bytes variety
     async def set(self, key: str, val: IPLDKind) -> None:
@@ -517,55 +624,105 @@ class HAMT:
         pointer: IPLDKind = await self.cas.save(data, codec="raw")
         await self._set_pointer(key, pointer)
 
+    async def _build_overflow_subtree(
+        self,
+        kvs_queue: list[tuple[str, IPLDKind, bytes]],
+        depth: int,
+        key_hashes: dict[str, bytes],
+    ) -> IPLDKind:
+        """Build a detached subtree for a full bucket.
+
+        Every node touched here is new to the current write. Hash exhaustion can
+        therefore fail without exposing a partial mutation in the existing tree.
+        """
+        root_node = Node()
+        root_node_id = await self.node_store.save(None, root_node)
+        node_stack: list[tuple[IPLDKind, Node]] = [(root_node_id, root_node)]
+
+        while kvs_queue:
+            _, top_node = node_stack[-1]
+            curr_key, curr_val_ptr, raw_hash = kvs_queue[0]
+            map_key = extract_bits(raw_hash, depth + len(node_stack) - 1, 8)
+
+            item = top_node.data[map_key]
+            if isinstance(item, list):
+                next_node_id = item[0]
+                next_node = await self.node_store.load(next_node_id)
+                node_stack.append((next_node_id, next_node))
+                continue
+
+            bucket = cast(dict[str, IPLDKind], item)
+            if curr_key in bucket or len(bucket) < self.max_bucket_size:
+                bucket[curr_key] = curr_val_ptr
+                kvs_queue.pop(0)
+                continue
+
+            for bucket_key, bucket_value in bucket.items():
+                kvs_queue.append((bucket_key, bucket_value, key_hashes[bucket_key]))
+
+            new_node = Node()
+            new_node_id = await self.node_store.save(None, new_node)
+            top_node.set_link(map_key, new_node_id)
+
+        return root_node_id
+
     async def _set_pointer(self, key: str, val_ptr: IPLDKind) -> None:
+        """Set a value pointer without exposing partial tree mutations on failure."""
         async with self.lock:
+            node_store = cast(InMemoryTreeStore, self.node_store)
             node_stack: list[tuple[IPLDKind, Node]] = []
+            link_path: list[int] = [-1]
             root_node: Node = await self.node_store.load(self.root_node_id)
             node_stack.append((self.root_node_id, root_node))
 
-            # FIFO queue to keep track of all the KVs we need to insert
-            # This is needed if any buckets overflow and so we need to reinsert all those KVs
-            kvs_queue: list[tuple[str, IPLDKind]] = []
-            kvs_queue.append((key, val_ptr))
-
-            while len(kvs_queue) > 0:
+            raw_hash = self.hash_fn(key.encode())
+            while True:
                 _, top_node = node_stack[-1]
-                curr_key, curr_val_ptr = kvs_queue[0]
-
-                raw_hash: bytes = self.hash_fn(curr_key.encode())
-                map_key: int = extract_bits(raw_hash, len(node_stack) - 1, 8)
+                map_key = extract_bits(raw_hash, len(node_stack) - 1, 8)
 
                 item = top_node.data[map_key]
                 if isinstance(item, list):
-                    next_node_id: IPLDKind = item[0]
-                    next_node: Node = await self.node_store.load(next_node_id)
+                    next_node_id = item[0]
+                    next_node = await self.node_store.load(next_node_id)
                     node_stack.append((next_node_id, next_node))
-                elif isinstance(item, dict):
-                    bucket: dict[str, IPLDKind] = item
+                    link_path.append(map_key)
+                    continue
 
-                    # If this bucket already has this same key, or has space, just rewrite the value and then go work on the others in the queue
-                    if curr_key in bucket or len(bucket) < self.max_bucket_size:
-                        bucket[curr_key] = curr_val_ptr
-                        kvs_queue.pop(0)
-                        continue
+                bucket = cast(dict[str, IPLDKind], item)
+                if key in bucket or len(bucket) < self.max_bucket_size:
+                    bucket[key] = val_ptr
+                    break
 
-                    # The current key is not in the bucket and the bucket is too full, so empty KVs from the bucket and restart insertion
-                    for k in bucket:
-                        v_ptr = bucket[k]
-                        kvs_queue.append((k, v_ptr))
+                key_hashes = {key: raw_hash}
+                kvs_queue = [(key, val_ptr, raw_hash)]
+                for bucket_key, bucket_value in bucket.items():
+                    key_hashes[bucket_key] = self.hash_fn(bucket_key.encode())
+                    kvs_queue.append((bucket_key, bucket_value, key_hashes[bucket_key]))
 
-                    # Create a new link to a new node so that we can reflow these KVs into a new subtree
-                    new_node = Node()
-                    new_node_id: IPLDKind = await self.node_store.save(None, new_node)
-                    link: list[IPLDKind] = [new_node_id]
-                    top_node.data[map_key] = link
+                original_buffer_ids = set(node_store.buffer)
+                try:
+                    new_node_id = await self._build_overflow_subtree(
+                        kvs_queue, len(node_stack), key_hashes
+                    )
+                except BaseException:
+                    for buffer_id in set(node_store.buffer) - original_buffer_ids:
+                        del node_store.buffer[buffer_id]
+                    raise
 
-            # Finally, reserialize and fix all links, deleting empty nodes as needed
-            await self._reserialize_and_link(node_stack)
+                top_node.set_link(map_key, new_node_id)
+                break
+
+            # Finally, reserialize and fix all links.
+            await self._reserialize_and_link(node_stack, link_path)
             self.root_node_id = node_stack[0][0]
 
     async def delete(self, key: str) -> None:
-        """Delete a key-value mapping."""
+        """Delete a key-value mapping.
+
+        Failure-atomic with respect to storage errors: all fallible CAS loads
+        happen before any node is mutated, so if deletion raises, the
+        observable tree remains unchanged.
+        """
 
         # Also deletes the pointer at the same time so this doesn't have a _delete_pointer duo
         if self.read_only:
@@ -575,6 +732,7 @@ class HAMT:
             raw_hash: bytes = self.hash_fn(key.encode())
 
             node_stack: list[tuple[IPLDKind, Node]] = []
+            link_path: list[int] = [-1]
             root_node: Node = await self.node_store.load(self.root_node_id)
             node_stack.append((self.root_node_id, root_node))
 
@@ -587,6 +745,14 @@ class HAMT:
                 if isinstance(item, dict):
                     bucket = item
                     if key in bucket:
+                        # Collapse may inspect sibling subtrees after the bucket is
+                        # changed. Load them first so a CAS failure cannot leave a
+                        # shared cached node partially mutated. The pre-delete tree
+                        # has one extra entry along this path, hence the +1 budget.
+                        for _, path_node in node_stack[1:]:
+                            await self._collect_subtree_entries(
+                                path_node, self.max_bucket_size + 1
+                            )
                         del bucket[key]
                         created_change = True
                     # Break out since whether or not the key is in the bucket, it should have been here so either now reserialize or raise a KeyError
@@ -595,10 +761,12 @@ class HAMT:
                     link: IPLDKind = item[0]
                     next_node: Node = await self.node_store.load(link)
                     node_stack.append((link, next_node))
+                    link_path.append(map_key)
 
-            # Finally, reserialize and fix all links, deleting empty nodes as needed
+            # Finally, restore the canonical shape and fix all remaining links.
             if created_change:
-                await self._reserialize_and_link(node_stack)
+                await self._collapse_delete_path(node_stack, link_path)
+                await self._reserialize_and_link(node_stack, link_path)
                 self.root_node_id = node_stack[0][0]
             else:
                 # If we didn't make a change, then this key must not exist within the HAMT
@@ -710,7 +878,10 @@ class HAMT:
         """
         AsyncIterator returning all keys in the HAMT.
 
-        If the HAMT is write enabled, to maintain strong consistency this will obtain an async lock and not allow any other operations to proceed.
+        If the HAMT is write enabled, the keys present when iteration starts are
+        copied while holding the async lock. The lock is released before any key
+        is yielded, so reads and mutations are safe between iterations and do not
+        affect the keys returned by an iteration already in progress.
 
         When the HAMT is in read only mode however, this can be run concurrently with get operations.
         """
@@ -718,9 +889,12 @@ class HAMT:
             async for k in self._keys_no_locking():
                 yield k
         else:
+            # Buffered nodes are mutable, so copying only the root ID would not
+            # isolate iteration from mutations made after a caller-visible yield.
             async with self.lock:
-                async for k in self._keys_no_locking():
-                    yield k
+                keys_snapshot = [key async for key in self._keys_no_locking()]
+            for key in keys_snapshot:
+                yield key
 
     async def _keys_no_locking(self) -> AsyncIterator[str]:
         async for _, node in self._iter_nodes():
@@ -732,10 +906,17 @@ class HAMT:
         """
         Return the number of key value mappings in this HAMT.
 
-        When the HAMT is write enabled, to maintain strong consistency it will acquire a lock and thus not allow any other operations to proceed until the length is fully done being calculated. If read only, then this can be run concurrently with other operations.
+        When the HAMT is write enabled, keys are counted directly while holding
+        the async lock, without materializing a snapshot. If read only, counting
+        can run concurrently with other operations.
         """
         count: int = 0
-        async for _ in self.keys():
-            count += 1
+        if self.read_only:
+            async for _ in self._keys_no_locking():
+                count += 1
+        else:
+            async with self.lock:
+                async for _ in self._keys_no_locking():
+                    count += 1
 
         return count

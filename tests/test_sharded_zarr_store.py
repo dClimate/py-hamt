@@ -266,7 +266,7 @@ async def test_load_or_initialize_shard_cache_concurrent_loads(
             assert result == shard_data
 
         # Verify shard is cached and no pending loads remain
-        assert await store._shard_data_cache.__contains__(shard_idx)
+        assert shard_idx in store._shard_data_cache
         assert await store._shard_data_cache.get(shard_idx) == shard_data
         assert shard_idx not in store._pending_shard_loads
 
@@ -785,12 +785,15 @@ async def test_listing_and_metadata(
         prefixed_dir_keys = {key async for key in store_read.list_dir(prefix)}
         assert {"zarr.json"}.issubset(prefixed_dir_keys)
 
-        with pytest.raises(
-            ValueError, match="Byte range requests are not supported for metadata keys."
-        ):
-            proto = zarr.core.buffer.default_buffer_prototype()
-            byte_range = zarr.abc.store.RangeByteRequest(start=10, end=50)
-            await store_read.get("lat/zarr.json", proto, byte_range=byte_range)
+        proto = zarr.core.buffer.default_buffer_prototype()
+        byte_range = zarr.abc.store.RangeByteRequest(start=10, end=50)
+        full_metadata = await store_read.get("lat/zarr.json", proto)
+        ranged_metadata = await store_read.get(
+            "lat/zarr.json", proto, byte_range=byte_range
+        )
+        assert full_metadata is not None
+        assert ranged_metadata is not None
+        assert ranged_metadata.to_bytes() == full_metadata.to_bytes()[10:50]
 
 
 @pytest.mark.asyncio
@@ -988,7 +991,8 @@ async def test_sharded_zarr_store_parse_chunk_key(create_ipfs: tuple[str, str]):
         assert store._parse_chunk_key("lat/c/0/0") is None
         assert store._parse_chunk_key("lon/c/0/0") is None
 
-        # Test dimensionality mismatch
+        # A wrong-rank named key with no registered metadata for its array
+        # still fails coordinate validation loudly.
         with pytest.raises(IndexError, match="tuple index out of range"):
             store._parse_chunk_key("temp/c/0/0/0/0")
 
@@ -1355,7 +1359,7 @@ async def test_memory_bounded_lru_cache_basic():
     # Test basic put/get
     await cache.put(0, small_shard)
     assert await cache.get(0) == small_shard
-    assert await cache.__contains__(0)
+    assert 0 in cache
     assert cache.cache_size == 1
 
     # Test that get moves item to end (most recently used)

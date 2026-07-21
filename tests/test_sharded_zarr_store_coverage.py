@@ -300,6 +300,20 @@ async def test_memory_bounded_lru_cache_update_existing():
 
 
 @pytest.mark.asyncio
+async def test_memory_bounded_lru_cache_atomic_update_guards_and_marks_dirty() -> None:
+    from py_hamt.sharded_zarr_store import MemoryBoundedLRUCache
+
+    cache = MemoryBoundedLRUCache(max_memory_bytes=10000)
+
+    with pytest.raises(RuntimeError, match="Shard 999 not found in cache"):
+        await cache.update_entry(999, 0, None)
+
+    await cache.put(0, [None])
+    await cache.mark_dirty(0)
+    assert cache.dirty_cache_size == 1
+
+
+@pytest.mark.asyncio
 async def test_memory_bounded_lru_cache_eviction_break():
     """Test line 96: eviction break when no clean shards available"""
     from multiformats import CID

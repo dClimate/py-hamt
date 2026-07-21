@@ -1,6 +1,6 @@
 [project]
 name = "py-hamt"
-version = "3.4.1"
+version = "3.5.0"
 description = "HAMT implementation for a content-addressed storage system."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -36,6 +36,7 @@ dev = [
     "docker>=7.1.0",
     "types-docker>=7.1.0.20250523",
     "pre-commit>=4.2.0",
+    "trustme>=1.2.1",
 ]
 
 [tool.ruff]

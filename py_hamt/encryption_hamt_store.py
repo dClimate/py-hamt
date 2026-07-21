@@ -183,13 +183,13 @@ class SimpleEncryptedZarrHAMTStore(ZarrHAMTStore):
             return None
 
     async def set(self, key: str, value: zarr.core.buffer.Buffer) -> None:
-        """@private"""
+        """Encrypt and store a value, then update cached metadata."""
         if self.read_only:
             raise Exception("Cannot write to a read-only store.")
 
         raw_bytes = value.to_bytes()
-        if key in self.metadata_read_cache:
-            self.metadata_read_cache[key] = raw_bytes
         # Encrypt it
         encrypted_bytes = self._encrypt(raw_bytes)
         await self.hamt.set(key, encrypted_bytes)
+        if key in self.metadata_read_cache:
+            self.metadata_read_cache[key] = raw_bytes

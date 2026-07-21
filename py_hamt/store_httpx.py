@@ -1,8 +1,13 @@
 import asyncio
+import logging
 import random
 import re
+import threading
+import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Literal, Optional, Tuple, cast
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, Dict, Literal, Optional, Tuple, cast
 
 import httpx
 from dag_cbor.ipld import IPLDKind
@@ -10,6 +15,158 @@ from multiformats import CID, multihash
 from multiformats.multihash import Multihash
 
 from . import instrumentation
+
+logger = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+# Ceiling on server-directed waits so a broken or hostile gateway cannot make
+# a request sleep unbounded (e.g. ``Retry-After: inf`` or a far-future date).
+_MAX_RETRY_AFTER_SECONDS = 300.0
+
+
+def _retry_delay(
+    initial_delay: float,
+    backoff_factor: float,
+    retry_number: int,
+    response: Optional[httpx.Response] = None,
+) -> float:
+    """Return a valid ``Retry-After`` value, otherwise a jittered backoff."""
+    backoff_delay = initial_delay * (backoff_factor ** (retry_number - 1))
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after is not None:
+        try:
+            retry_after_seconds = float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                retry_after_seconds = (
+                    retry_at - datetime.now(timezone.utc)
+                ).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                retry_after_seconds = -1
+
+        if retry_after_seconds >= 0:
+            return min(retry_after_seconds, _MAX_RETRY_AFTER_SECONDS)
+
+    jitter = backoff_delay * 0.1 * (random.random() - 0.5)
+    return backoff_delay + jitter
+
+
+def _slice_requested_range(
+    data: bytes,
+    offset: Optional[int],
+    length: Optional[int],
+    suffix: Optional[int],
+) -> bytes:
+    """Apply content-store range arguments to a complete object body."""
+    if offset is not None:
+        if length is not None:
+            return data[offset : offset + length]
+        return data[offset:]
+    if suffix is not None:
+        if suffix == 0:
+            return b""
+        return data[-suffix:]
+    return data
+
+
+def _range_not_satisfiable_is_empty(
+    response: httpx.Response, offset: Optional[int], suffix: Optional[int]
+) -> bool:
+    """Whether a ``416`` response describes a read Python slicing treats as empty.
+
+    A spec-compliant gateway rejects an unsatisfiable range with ``416 Range Not
+    Satisfiable`` and a ``Content-Range: bytes */N`` header giving the object
+    size ``N``. Python slice semantics (and ``InMemoryCAS``) yield ``b""`` for
+    those same reads, so ``KuboCAS`` matches by treating them as empty instead of
+    surfacing the error:
+
+    * an ``offset`` read is empty when it starts at or past EOF (``offset >= N``);
+    * a ``suffix`` read is unsatisfiable only against a zero-length object
+      (``N == 0``); ``data[-suffix:]`` on an empty object is likewise ``b""``.
+      (For a non-empty object a suffix range is always satisfiable, so a ``416``
+      there is a genuine error and is surfaced.)
+    """
+    content_range = response.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes \*/(\d+)", content_range.strip())
+    if match is None:
+        return False
+    total = int(match.group(1))
+    if suffix is not None:
+        # A suffix range only fails against a zero-length object.
+        return total == 0
+    return offset is not None and offset >= total
+
+
+def _validate_partial_content(
+    response: httpx.Response,
+    offset: Optional[int],
+    length: Optional[int],
+    suffix: Optional[int],
+    body_len: int,
+) -> None:
+    """Reject a ``206`` whose byte window is missing or inconsistent.
+
+    ``raise_for_status`` accepts any 2xx, so a gateway can answer a Range request
+    with a malformed ``206`` -- an absent, unparseable, or ``*``-total
+    ``Content-Range``, a declared window that disagrees with the body length, or
+    a window that does not match what was requested -- and silently hand back the
+    wrong bytes. We recompute the exact window the request maps to (the object
+    size ``N`` is always known for content-addressed reads) and raise an
+    ``httpx.HTTPStatusError`` on any mismatch so a corrupt partial read fails
+    loudly rather than corrupting the caller's data.
+    """
+    content_range = response.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip())
+    if match is None:
+        raise httpx.HTTPStatusError(
+            f"malformed 206 Content-Range {content_range!r}",
+            request=response.request,
+            response=response,
+        )
+    start, end, total = (int(group) for group in match.groups())
+    # The declared inclusive window must match the number of bytes delivered.
+    if end - start + 1 != body_len:
+        raise httpx.HTTPStatusError(
+            f"206 Content-Range {content_range!r} declares "
+            f"{end - start + 1} bytes but body is {body_len}",
+            request=response.request,
+            response=response,
+        )
+    # Recompute the window the request maps to and demand an exact match, so a
+    # gateway cannot return a shifted or wrong-sized slice of the object.
+    if offset is not None:
+        expected_start = offset
+        expected_len = total - offset if length is None else min(length, total - offset)
+    else:
+        expected_start = max(total - cast(int, suffix), 0)
+        expected_len = min(cast(int, suffix), total)
+    if start != expected_start or body_len != expected_len:
+        raise httpx.HTTPStatusError(
+            f"206 Content-Range {content_range!r} (start={start}, {body_len} bytes) "
+            f"does not match the requested window "
+            f"(start={expected_start}, {expected_len} bytes)",
+            request=response.request,
+            response=response,
+        )
+
+
+# Upper bound on how long aclose() waits for a cross-loop client close that was
+# scheduled onto a *running* owner loop. Bounds the window where that loop stops
+# between the is_running() check and the coroutine executing, which would
+# otherwise leave the wrapped future pending forever. Module-level so tests can
+# shrink it; a healthy running loop closes near-instantly, well under this.
+_CROSS_LOOP_ACLOSE_TIMEOUT_S = 30.0
+
+
+def _close_client_on_stopped_loop(
+    owner_loop: asyncio.AbstractEventLoop, client: httpx.AsyncClient
+) -> None:
+    """Run client cleanup on its stopped but still usable owner loop."""
+    owner_loop.run_until_complete(client.aclose())
 
 
 class ContentAddressedStore(ABC):
@@ -85,6 +242,10 @@ class InMemoryCAS(ContentAddressedStore):
         suffix: Optional[int] = None,
     ) -> bytes:
         """
+        Retrieve all or part of an object using Python slice semantics.
+
+        A zero ``length`` or ``suffix`` returns an empty byte string.
+
         `ContentAddressedStore` allows any IPLD scalar key.  For the in-memory
         backend we *require* a `bytes` hash; anything else is rejected at run
         time. In OO type-checking, a subclass may widen (make more general) argument types,
@@ -93,6 +254,9 @@ class InMemoryCAS(ContentAddressedStore):
         This is why we use `cast` here, to tell mypy that we know what we are doing.
         h/t https://stackoverflow.com/questions/75209249/overriding-a-method-mypy-throws-an-incompatible-with-super-type-error-when-ch
         """
+        if (offset is not None and length == 0) or (offset is None and suffix == 0):
+            return b""
+
         key = cast(bytes, id)
         if not isinstance(key, (bytes, bytearray)):  # defensive guard
             raise TypeError(
@@ -104,17 +268,7 @@ class InMemoryCAS(ContentAddressedStore):
         except KeyError as exc:
             raise KeyError("Object not found in in-memory store") from exc
 
-        if offset is not None:
-            start = offset
-            if length is not None:
-                end = start + length
-                return data[start:end]
-            else:
-                return data[start:]
-        elif suffix is not None:  # If only length is given, assume start from 0
-            return data[-suffix:]
-        else:  # Full load
-            return data
+        return _slice_requested_range(data, offset, length, suffix)
 
 
 class KuboCAS(ContentAddressedStore):
@@ -131,12 +285,15 @@ class KuboCAS(ContentAddressedStore):
     ### Authentication / custom headers
     You have two options:
 
-    1. **Bring your own `httpx.AsyncClient`**
-       Pass it via `client=...` — any default headers or auth
-       configured on that client are reused for **every** request.
+    1. **Bring your own `httpx.AsyncClient` or client factory**
+       Pass a client via `client=...` for use on one event loop, or pass
+       `client_factory=...` to build a fully configured client for each event
+       loop. Reusing a supplied client from a later loop emits a warning and
+       falls back to an internal client that preserves only headers, auth,
+       timeout, redirect policy, and event hooks.
     2. **Let `KuboCAS` build the client** but pass
        `headers=` *and*/or `auth=` kwargs; they are forwarded to the
-       internally–created `AsyncClient`.
+       internally-created `AsyncClient`.
 
     ```python
     import httpx
@@ -146,6 +303,7 @@ class KuboCAS(ContentAddressedStore):
     client = httpx.AsyncClient(
         headers={"Authorization": "Bearer <token>"},
         auth=("user", "pass"),
+        follow_redirects=True,
     )
     cas = KuboCAS(client=client)
 
@@ -159,13 +317,22 @@ class KuboCAS(ContentAddressedStore):
     ### Parameters
     - **hasher** (str): multihash name (defaults to *blake3*).
     - **client** (`httpx.AsyncClient | None`): reuse an existing
-      client; if *None* KuboCAS will create one lazily.
+      client and its configured timeout and redirect policy. User-supplied
+      clients should set ``follow_redirects=True`` when gateways may redirect.
+      If *None*, KuboCAS will create one lazily with a 60-second timeout and
+      redirect following and HTTP/2 enabled. Plaintext endpoints continue to
+      use HTTP/1.1 because HTTP/2 negotiation requires TLS/ALPN.
+    - **client_factory** (`Callable[[], httpx.AsyncClient] | None`): create a
+      separate, fully configured client for each event loop. KuboCAS owns and
+      closes clients returned by the factory. Mutually exclusive with
+      **client**.
     - **headers** (dict[str, str] | None): default headers for the
       internally-created client.
     - **auth** (`tuple[str, str] | None`): authentication tuple (username, password)
       for the internally-created client.
     - **rpc_base_url / gateway_base_url** (str | None): override daemon
-      endpoints (defaults match the local daemon ports).
+      endpoints (defaults match the local daemon ports). Gateway URLs may end
+      with `/ipfs` and may include a trailing slash.
     - **chunker** (str): chunking algorithm specification for Kubo's `add`
       RPC. Accepted formats are `"size-<positive int>"`, `"rabin"`, or
       `"rabin-<min>-<avg>-<max>"`.
@@ -188,6 +355,7 @@ class KuboCAS(ContentAddressedStore):
         gateway_base_url: str | None = None,
         concurrency: int = 32,
         *,
+        client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
         pin_on_add: bool = False,
@@ -202,6 +370,17 @@ class KuboCAS(ContentAddressedStore):
         ### `httpx.AsyncClient` Management
         If `client` is not provided, it will be automatically initialized. It is the responsibility of the user to close this at an appropriate time, using `await cas.aclose()`
         as a class instance cannot know when it will no longer be in use, unless explicitly told to do so.
+
+        A supplied client is associated with the running event loop lazily on
+        first use, so constructing ``KuboCAS`` does not require an async
+        context. On a later event loop, KuboCAS warns and uses an internally
+        created fallback that preserves only the supplied client's headers,
+        auth, timeout, redirect policy, and event hooks. Pass
+        ``client_factory`` instead when every event loop needs the client's
+        full configuration. Factory clients are owned and closed by KuboCAS.
+        Clients created internally by ``KuboCAS`` use a 60-second timeout,
+        follow redirects, and negotiate HTTP/2 for HTTPS endpoints that
+        support it.
 
         If you are using the `KuboCAS` instance in an `async with` block, it will automatically close the client when the block is exited which is what we suggest below:
         ```python
@@ -232,11 +411,25 @@ class KuboCAS(ContentAddressedStore):
         These are the first part of the url, defaults that refer to the default that kubo launches with on a local machine are provided.
         """
 
+        if client is not None and client_factory is not None:
+            raise ValueError("client and client_factory are mutually exclusive")
+        if client_factory is not None and (headers is not None or auth is not None):
+            raise ValueError(
+                "client_factory is mutually exclusive with headers/auth; "
+                "configure them on the clients the factory builds"
+            )
+
         self._owns_client: bool = False
         self._closed: bool = True
         self._client_per_loop: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
-        self._default_headers = headers
-        self._default_auth = auth
+        self._internally_created_clients: set[httpx.AsyncClient] = set()
+        # Serializes first-use client binding so concurrent event loops on
+        # different threads cannot both consume ``_supplied_client`` and bind
+        # one httpx.AsyncClient to two loops.
+        self._first_use_lock: threading.Lock = threading.Lock()
+        self._semaphore_per_loop: Dict[
+            asyncio.AbstractEventLoop, asyncio.Semaphore
+        ] = {}
 
         # Now, perform validation that might raise an exception
         chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
@@ -252,14 +445,10 @@ class KuboCAS(ContentAddressedStore):
         if gateway_base_url is None:
             gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
-        if "/ipfs/" in gateway_base_url:
-            gateway_base_url = gateway_base_url.split("/ipfs/")[0]
-
-        # Standard gateway URL construction with proper path handling
-        if gateway_base_url.endswith("/"):
-            gateway_base_url = f"{gateway_base_url}ipfs/"
-        else:
-            gateway_base_url = f"{gateway_base_url}/ipfs/"
+        gateway_base_url = gateway_base_url.rstrip("/")
+        if not gateway_base_url.endswith("/ipfs"):
+            gateway_base_url = f"{gateway_base_url}/ipfs"
+        gateway_base_url = f"{gateway_base_url}/"
 
         pin_string: str = "true" if pin_on_add else "false"
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pin_string}"
@@ -268,19 +457,40 @@ class KuboCAS(ContentAddressedStore):
         """@private"""
 
         if client is not None:
-            # A client was supplied by the user. We don't own it.
+            # Bind the user-supplied client lazily on first async use.
             self._owns_client = False
-            self._client_per_loop = {asyncio.get_running_loop(): client}
+            self._supplied_client: httpx.AsyncClient | None = client
+            self._user_client: httpx.AsyncClient | None = client
+            self._default_headers: httpx.Headers | dict[str, str] | None = (
+                httpx.Headers(client.headers)
+            )
+            self._default_auth: httpx.Auth | Tuple[str, str] | None = client.auth
+            self._default_timeout: httpx.Timeout | float = client.timeout
+            self._default_limits = self._copy_client_limits(client)
+            self._default_follow_redirects: bool = client.follow_redirects
+            # Snapshot the hooks like the headers above: later mutations of the
+            # supplied client must not leak into fallback clients.
+            self._default_event_hooks: dict[str, list[Callable[..., Any]]] | None = {
+                event: list(hooks) for event, hooks in client.event_hooks.items()
+            }
         else:
             # No client supplied. We will own any clients we create.
             self._owns_client = True
-            self._client_per_loop = {}
+            self._supplied_client = None
+            self._user_client = None
+            self._default_headers = headers
+            self._default_auth = auth
+            self._default_timeout = 60.0
+            self._default_limits = httpx.Limits(
+                max_connections=64, max_keepalive_connections=32
+            )
+            self._default_follow_redirects = True
+            self._default_event_hooks = None
+        self._client_factory: Optional[Callable[[], httpx.AsyncClient]] = client_factory
 
-        # store for later use by _loop_client()
-        self._default_headers = headers
-        self._default_auth = auth
-
-        self._sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
+        if concurrency <= 0:
+            raise ValueError("concurrency must be a positive integer")
+        self._concurrency: int = concurrency
         self._closed = False
 
         # Validate retry parameters
@@ -295,16 +505,55 @@ class KuboCAS(ContentAddressedStore):
         self.initial_delay = initial_delay
         self.backoff_factor = backoff_factor
 
+    @staticmethod
+    def _copy_client_limits(client: httpx.AsyncClient) -> httpx.Limits:
+        """Copy connection limits from a standard HTTPX async transport.
+
+        HTTPX does not expose client limits publicly, so custom transports fall
+        back to the limits KuboCAS uses for its own clients.
+        """
+        transport: Any = client._transport
+        pool: Any = getattr(transport, "_pool", None)
+        return httpx.Limits(
+            max_connections=getattr(pool, "_max_connections", 64),
+            max_keepalive_connections=getattr(pool, "_max_keepalive_connections", 32),
+            keepalive_expiry=getattr(pool, "_keepalive_expiry", 5.0),
+        )
+
     # --------------------------------------------------------------------- #
     # helper: get or create the client bound to the current running loop    #
     # --------------------------------------------------------------------- #
+    def _loop_semaphore(self) -> asyncio.Semaphore:
+        """Get or create the concurrency semaphore for the running event loop.
+
+        Semaphores cannot be shared safely across event loops once contended,
+        so their lifecycle mirrors the per-loop HTTP clients.
+        """
+        if self._closed:
+            if not self._owns_client:
+                raise RuntimeError("KuboCAS is closed; create a new instance")
+            self._closed = False
+            self._client_per_loop = {}
+            self._internally_created_clients = set()
+            self._semaphore_per_loop = {}
+
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        try:
+            return self._semaphore_per_loop[loop]
+        except KeyError:
+            semaphore = asyncio.Semaphore(self._concurrency)
+            self._semaphore_per_loop[loop] = semaphore
+            return semaphore
+
     def _loop_client(self) -> httpx.AsyncClient:
         """Get or create a client for the current event loop.
 
+        A user-supplied client is bound to the first loop that requests it.
         If the instance was previously closed but owns its clients, a fresh
-        client mapping is lazily created on demand.  Users that supplied their
+        client mapping is lazily created on demand. Users that supplied their
         own ``httpx.AsyncClient`` still receive an error when the instance has
-        been closed, as we cannot safely recreate their client.
+        been closed, as we cannot safely recreate their client. Internally
+        created clients enable HTTP/2 negotiation for HTTPS endpoints.
         """
         if self._closed:
             if not self._owns_client:
@@ -313,43 +562,122 @@ class KuboCAS(ContentAddressedStore):
             # state so that new clients can be created lazily.
             self._closed = False
             self._client_per_loop = {}
+            self._semaphore_per_loop = {}
 
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
             return self._client_per_loop[loop]
         except KeyError:
-            # Create a new client
-            client = httpx.AsyncClient(
-                timeout=60.0,
-                headers=self._default_headers,
-                auth=self._default_auth,
-                limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
-                # Uncomment when they finally support Robust HTTP/2 GOAWAY responses
-                # http2=True,
-            )
-            self._client_per_loop[loop] = client
-            return client
+            # First use on this loop. Hold the lock across supplied-client
+            # consumption, client creation, and the per-loop assignment so two
+            # loops racing on different threads cannot bind the same client.
+            with self._first_use_lock:
+                if self._supplied_client is not None:
+                    client = self._supplied_client
+                    self._supplied_client = None
+                elif self._client_factory is not None:
+                    client = self._client_factory()
+                    self._internally_created_clients.add(client)
+                else:
+                    if self._user_client is not None:
+                        warnings.warn(
+                            "A user-supplied httpx.AsyncClient cannot be reused "
+                            "across event loops; falling back to an internally "
+                            "created client that preserves only headers, auth, "
+                            "timeout, limits, redirect policy, and event hooks. "
+                            "Pass client_factory to preserve full configuration.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    client = httpx.AsyncClient(
+                        timeout=self._default_timeout,
+                        headers=self._default_headers,
+                        auth=self._default_auth,
+                        limits=self._default_limits,
+                        follow_redirects=self._default_follow_redirects,
+                        event_hooks=self._default_event_hooks,
+                        http2=True,
+                    )
+                    self._internally_created_clients.add(client)
+                self._client_per_loop[loop] = client
+                return client
 
     # --------------------------------------------------------------------- #
     # graceful shutdown: close **all** clients we own                       #
     # --------------------------------------------------------------------- #
     async def aclose(self) -> None:
         """
-        Closes all internally-created clients. Must be called from an async context.
-        """
-        if self._owns_client is False:  # external client → caller closes
-            return
+        Close every internally-created client, leaving a supplied client open.
 
-        # This method is async, so we can reliably await the async close method.
-        # The complex sync/async logic is handled by __del__.
-        for client in list(self._client_per_loop.values()):
-            if not client.is_closed:
+        Must be called from an async context.
+
+        For clients owned by closed loops with stock async-only transports,
+        cleanup degenerates to a warning. The OS-level socket is shut down
+        with a FIN, but its local file descriptor is released at garbage
+        collection. Callers that require deterministic release should call
+        ``aclose()`` on the owning loop before it exits.
+        """
+        try:
+            current_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        for owner_loop, client in list(self._client_per_loop.items()):
+            if client not in self._internally_created_clients:
+                continue
+
+            try:
+                if owner_loop is current_loop:
+                    await client.aclose()
+                    continue
+
+                if not owner_loop.is_closed():
+                    if owner_loop.is_running():
+                        close_future = asyncio.run_coroutine_threadsafe(
+                            client.aclose(), owner_loop
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.wrap_future(close_future),
+                                timeout=_CROSS_LOOP_ACLOSE_TIMEOUT_S,
+                            )
+                        except TimeoutError:
+                            # The owner loop stopped (or stalled) after
+                            # is_running() succeeded, so the scheduled close can
+                            # never complete. Cancel it and fall through to the
+                            # synchronous transport shutdown below.
+                            close_future.cancel()
+                        else:
+                            continue
+                    else:
+                        await asyncio.to_thread(
+                            _close_client_on_stopped_loop, owner_loop, client
+                        )
+                        continue
+
+                # AsyncClient marks itself closed before awaiting its transport.
+                # A dead owner loop therefore needs the transport's sync fallback.
+                transport: Any = client._transport
+                close_transport = getattr(transport, "close", None)
+                if close_transport is None:
+                    await client.aclose()
+                    continue
+
+                close_transport()
                 try:
                     await client.aclose()
                 except Exception:
-                    pass  # best-effort cleanup
+                    pass  # The transport was already closed synchronously.
+            except Exception as exc:
+                warnings.warn(
+                    f"Failed to close an internally created HTTP client: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         self._client_per_loop.clear()
+        self._internally_created_clients.clear()
+        self._semaphore_per_loop.clear()
         self._closed = True
 
     # At this point, _client_per_loop should be empty or only contain
@@ -365,7 +693,10 @@ class KuboCAS(ContentAddressedStore):
         if not hasattr(self, "_owns_client") or not hasattr(self, "_closed"):
             return
 
-        if not self._owns_client or self._closed:
+        if (
+            not self._owns_client
+            and not getattr(self, "_internally_created_clients", set())
+        ) or self._closed:
             return
 
         # Attempt proper cleanup if possible
@@ -378,6 +709,7 @@ class KuboCAS(ContentAddressedStore):
                 # We can't await client.aclose() without a loop,
                 # so just clear the references
                 self._client_per_loop.clear()
+                self._semaphore_per_loop.clear()
                 self._closed = True
             return
 
@@ -399,50 +731,58 @@ class KuboCAS(ContentAddressedStore):
             # If all else fails, just clear references
             if hasattr(self, "_client_per_loop"):
                 self._client_per_loop.clear()
+                self._semaphore_per_loop.clear()
                 self._closed = True
 
     # --------------------------------------------------------------------- #
-    # save() – now uses the per-loop client                                 #
+    # save() - now uses the per-loop client                                 #
     # --------------------------------------------------------------------- #
     async def save(self, data: bytes, codec: ContentAddressedStore.CodecInput) -> CID:
-        async with self._sem:
-            files = {"file": data}
-            client = self._loop_client()
-            retry_count = 0
+        """Add data to Kubo and return its CID.
 
-            while retry_count <= self.max_retries:
-                try:
-                    response = await client.post(
-                        self.rpc_url, files=files, timeout=60.0
-                    )
-                    response.raise_for_status()
-                    cid_str: str = response.json()["Hash"]
-                    cid: CID = CID.decode(cid_str)
-                    if cid.codec.code != self.DAG_PB_MARKER:
-                        cid = cid.set(codec=codec)
-                    return cid
+        Transient request failures and gateway statuses are retried. Retrying
+        the ``/api/v0/add`` POST is safe because the uploaded content is
+        content-addressed, making repeated additions idempotent. Concurrency
+        slots are held per HTTP attempt and released during retry backoff.
+        """
+        files = {"file": data}
+        client = self._loop_client()
+        semaphore = self._loop_semaphore()
+        retry_count = 0
 
-                except (httpx.TimeoutException, httpx.RequestError) as e:
-                    retry_count += 1
-                    if retry_count > self.max_retries:
-                        raise httpx.TimeoutException(
-                            f"Failed to save data after {self.max_retries} retries: {str(e)}",
-                            request=e.request
-                            if isinstance(e, httpx.RequestError)
-                            else None,
-                        )
+        while retry_count <= self.max_retries:
+            try:
+                async with semaphore:
+                    response = await client.post(self.rpc_url, files=files)
+                response.raise_for_status()
+                cid_str: str = response.json()["Hash"]
+                cid: CID = CID.decode(cid_str)
+                if cid.codec.code != self.DAG_PB_MARKER:
+                    cid = cid.set(codec=codec)
+                return cid
 
-                    # Calculate backoff delay
-                    delay = self.initial_delay * (
-                        self.backoff_factor ** (retry_count - 1)
-                    )
-                    # Add some jitter to prevent thundering herd
-                    jitter = delay * 0.1 * (random.random() - 0.5)
-                    await asyncio.sleep(delay + jitter)
-
-                except httpx.HTTPStatusError:
-                    # Re-raise non-timeout HTTP errors immediately
+            except httpx.RequestError:
+                if retry_count >= self.max_retries:
                     raise
+                retry_count += 1
+                await asyncio.sleep(
+                    _retry_delay(self.initial_delay, self.backoff_factor, retry_count)
+                )
+
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code not in _RETRYABLE_STATUS_CODES:
+                    raise
+                if retry_count >= self.max_retries:
+                    raise
+                retry_count += 1
+                await asyncio.sleep(
+                    _retry_delay(
+                        self.initial_delay,
+                        self.backoff_factor,
+                        retry_count,
+                        error.response,
+                    )
+                )
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     async def load(
@@ -452,7 +792,18 @@ class KuboCAS(ContentAddressedStore):
         length: Optional[int] = None,
         suffix: Optional[int] = None,
     ) -> bytes:
-        """Load data from a CID using the IPFS gateway with optional Range requests."""
+        """Load all or part of a CID using the IPFS gateway.
+
+        Gateways that ignore a Range header and return a complete ``200`` body
+        are handled by applying the requested byte window locally. Transient
+        request failures, rate limits, and gateway server errors are retried;
+        other HTTP errors fail immediately. Zero-length and zero-suffix reads
+        return immediately without a gateway request. Concurrency slots are
+        held per HTTP attempt and released during retry backoff.
+        """
+        if (offset is not None and length == 0) or (offset is None and suffix == 0):
+            return b""
+
         cid = cast(CID, id)
         url: str = f"{self.gateway_base_url + str(cid)}"
         headers: Dict[str, str] = {}
@@ -476,45 +827,85 @@ class KuboCAS(ContentAddressedStore):
         final_status = "ok"
         final_retry_count = 0
         try:
-            async with self._sem:  # Throttle gateway
-                client = self._loop_client()
-                retry_count = 0
+            client = self._loop_client()
+            semaphore = self._loop_semaphore()
+            retry_count = 0
 
-                while retry_count <= self.max_retries:
-                    try:
-                        response = await client.get(
-                            url, headers=headers or None, timeout=60.0
-                        )
-                        response.raise_for_status()
-                        content = response.content
-                        response_bytes = len(content)
+            while retry_count <= self.max_retries:
+                try:
+                    async with semaphore:  # Throttle each gateway attempt
+                        response = await client.get(url, headers=headers or None)
+                    # An unsatisfiable range is answered with 416 by a compliant
+                    # gateway; return b"" to match Python-slice semantics (and
+                    # InMemoryCAS) instead of raising.
+                    if (
+                        response.status_code
+                        == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE
+                        and _range_not_satisfiable_is_empty(response, offset, suffix)
+                    ):
                         final_retry_count = retry_count
-                        return content
-
-                    except (httpx.TimeoutException, httpx.RequestError) as e:
-                        retry_count += 1
-                        if retry_count > self.max_retries:
-                            final_status = "timeout"
-                            final_retry_count = retry_count
-                            raise httpx.TimeoutException(
-                                f"Failed to load data after {self.max_retries} retries: {str(e)}",
-                                request=e.request
-                                if isinstance(e, httpx.RequestError)
-                                else None,
+                        return b""
+                    response.raise_for_status()
+                    content = response.content
+                    response_bytes = len(content)
+                    final_retry_count = retry_count
+                    if headers:
+                        if response.status_code == httpx.codes.OK:
+                            logger.debug(
+                                "Gateway ignored Range request for CID %s; "
+                                "slicing the complete response locally",
+                                cid,
                             )
-
-                        # Calculate backoff delay with jitter
-                        delay = self.initial_delay * (
-                            self.backoff_factor ** (retry_count - 1)
+                            return _slice_requested_range(
+                                content, offset, length, suffix
+                            )
+                        if response.status_code == httpx.codes.PARTIAL_CONTENT:
+                            # Trust the partial body only after proving its
+                            # Content-Range matches the requested byte window.
+                            _validate_partial_content(
+                                response, offset, length, suffix, response_bytes
+                            )
+                            return content
+                        # Any other 2xx to a Range request is unexpected: we
+                        # cannot know which bytes it carries, so fail rather than
+                        # return a possibly-wrong window.
+                        raise httpx.HTTPStatusError(
+                            f"unexpected {response.status_code} response to a "
+                            "Range request",
+                            request=response.request,
+                            response=response,
                         )
-                        jitter = delay * 0.1 * (random.random() - 0.5)
-                        await asyncio.sleep(delay + jitter)
+                    return content
 
-                    except httpx.HTTPStatusError:
-                        # Re-raise non-timeout HTTP errors immediately
+                except httpx.RequestError:
+                    if retry_count >= self.max_retries:
+                        final_status = "request_error"
+                        final_retry_count = retry_count
+                        raise
+                    retry_count += 1
+                    await asyncio.sleep(
+                        _retry_delay(
+                            self.initial_delay, self.backoff_factor, retry_count
+                        )
+                    )
+
+                except httpx.HTTPStatusError as error:
+                    if (
+                        error.response.status_code not in _RETRYABLE_STATUS_CODES
+                        or retry_count >= self.max_retries
+                    ):
                         final_status = "http_error"
                         final_retry_count = retry_count
                         raise
+                    retry_count += 1
+                    await asyncio.sleep(
+                        _retry_delay(
+                            self.initial_delay,
+                            self.backoff_factor,
+                            retry_count,
+                            error.response,
+                        )
+                    )
         finally:
             instrumentation.end_cas_load(
                 trace_started_at,
@@ -525,7 +916,7 @@ class KuboCAS(ContentAddressedStore):
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     # --------------------------------------------------------------------- #
-    # pin_cid() – method to pin a CID                                       #
+    # pin_cid() - method to pin a CID                                       #
     # --------------------------------------------------------------------- #
     async def pin_cid(
         self,
@@ -544,7 +935,7 @@ class KuboCAS(ContentAddressedStore):
         params = {"arg": str(cid), "recursive": "true"}
         pin_add_url_base: str = f"{target_rpc}/api/v0/pin/add"
 
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(pin_add_url_base, params=params)
             response.raise_for_status()
@@ -560,7 +951,7 @@ class KuboCAS(ContentAddressedStore):
         """
         params = {"arg": str(cid), "recursive": "true"}
         unpin_url_base: str = f"{target_rpc}/api/v0/pin/rm"
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(unpin_url_base, params=params)
             response.raise_for_status()
@@ -580,7 +971,7 @@ class KuboCAS(ContentAddressedStore):
         """
         params = {"arg": [str(old_id), str(new_id)]}
         pin_update_url_base: str = f"{target_rpc}/api/v0/pin/update"
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(pin_update_url_base, params=params)
             response.raise_for_status()
@@ -598,7 +989,7 @@ class KuboCAS(ContentAddressedStore):
             List[CID]: A list of pinned CIDs.
         """
         pin_ls_url_base: str = f"{target_rpc}/api/v0/pin/ls"
-        async with self._sem:  # throttle RPC
+        async with self._loop_semaphore():  # throttle RPC
             client = self._loop_client()
             response = await client.post(pin_ls_url_base)
             response.raise_for_status()

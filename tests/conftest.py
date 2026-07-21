@@ -5,9 +5,11 @@ import pytest
 from testing_utils import create_ipfs, ipld_strategy  # noqa: F401
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 async def global_client_session():
-    """One httpx.AsyncClient shared by the whole test run."""
+    """A fresh httpx.AsyncClient per test (function-scoped to match the
+    function-scoped event loop; a session-scoped client bound to one test's
+    loop breaks later tests once that loop closes)."""
     async with httpx.AsyncClient() as client:
         yield client
     # httpx's async context manager awaits client.aclose() for us

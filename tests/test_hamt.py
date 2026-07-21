@@ -133,9 +133,11 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]) -> None:
         assert (await read_hamt.get(k)) == v
         if (await read_hamt.cache_size()) > small_cache_size_bytes:
             await read_hamt.cache_vacate()
-            assert (await read_hamt.cache_size()) == 0
 
     await asyncio.gather(*[get_and_vacate(k, v) for k, v in kvs])
+    # A sibling coroutine may repopulate the cache after another vacate returns.
+    await read_hamt.cache_vacate()
+    assert (await read_hamt.cache_size()) == 0
 
     # In memory tree while writing
     # set small max bucket size to force more linking and more nodes
@@ -146,10 +148,12 @@ async def test_fuzz(kvs: list[tuple[str, IPLDKind]]) -> None:
         assert (await small_memory_tree.get(k)) == v
         if (await small_memory_tree.cache_size()) > small_cache_size_bytes:
             await small_memory_tree.cache_vacate()
-            assert (await small_memory_tree.cache_size()) == 0
         assert (await small_memory_tree.get(k)) == v
 
     await asyncio.gather(*[set_and_vacate(k, v) for k, v in kvs])
+    # Check cache emptiness only after concurrent writers have finished.
+    await small_memory_tree.cache_vacate()
+    assert (await small_memory_tree.cache_size()) == 0
 
 
 @pytest.mark.asyncio

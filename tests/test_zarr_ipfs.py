@@ -56,7 +56,7 @@ def random_zarr_dataset():
 
 
 # This test also collects miscellaneous statistics about performance, run with pytest -s to see these statistics being printed out
-@pytest.mark.asyncio(loop_scope="session")  # ← match the loop of the fixture
+@pytest.mark.asyncio
 async def test_write_read(
     create_ipfs: tuple[str, str],
     random_zarr_dataset: xr.Dataset,

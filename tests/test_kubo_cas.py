@@ -6,7 +6,7 @@ import dag_cbor
 import httpx
 import pytest
 from dag_cbor import IPLDKind
-from hypothesis import given, settings
+from hypothesis import HealthCheck, given, settings
 from testing_utils import ipld_strategy  # noqa
 
 from py_hamt import InMemoryCAS, KuboCAS
@@ -46,9 +46,13 @@ async def test_memory_store_invalid_key_type():
 
 # Test that always works with Docker or local daemon
 @pytest.mark.ipfs
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 @given(data=ipld_strategy())
-@settings(deadline=1000, print_blob=True)
+@settings(
+    deadline=1000,
+    print_blob=True,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
 async def test_kubo_urls_explicit(create_ipfs, global_client_session, data: IPLDKind):
     """
     Tests KuboCAS functionality with explicitly provided URLs.
@@ -72,9 +76,13 @@ async def test_kubo_urls_explicit(create_ipfs, global_client_session, data: IPLD
 
 
 @pytest.mark.ipfs
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 @given(data=ipld_strategy())
-@settings(deadline=1000, print_blob=True)
+@settings(
+    deadline=1000,
+    print_blob=True,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
 async def test_kubo_default_urls(global_client_session, data: IPLDKind):
     """
     Tests KuboCAS using its default URLs and when None is passed for URLs.
@@ -248,13 +256,13 @@ async def test_kubo_timeout_retries():
                         ):
                             with pytest.raises(
                                 httpx.TimeoutException,
-                                match="Failed to save data after 3 retries",
+                                match="Simulated timeout",
                             ):
                                 await kubo_cas.save(test_data, codec="dag-cbor")
 
                             with pytest.raises(
                                 httpx.TimeoutException,
-                                match="Failed to load data after 3 retries",
+                                match="Simulated timeout",
                             ):
                                 await kubo_cas.load(cid)
 
@@ -305,9 +313,9 @@ async def test_kubo_backoff_timing():
 
 
 @pytest.mark.asyncio
-async def test_kubo_http_status_error_no_retry():
+async def test_kubo_http_status_error_retries_transient_status():
     """
-    Tests that KuboCAS immediately raises HTTPStatusError without retrying.
+    Tests that KuboCAS retries HTTP 500 before raising HTTPStatusError.
     """
 
     # This mock simulates a server error by returning a 500 status code.
@@ -321,7 +329,7 @@ async def test_kubo_http_status_error_no_retry():
     with patch.object(
         httpx.AsyncClient, "post", new=AsyncMock(side_effect=mock_post_server_error)
     ):
-        # Also patch asyncio.sleep to verify it's not called (i.e., no retries).
+        # Patch asyncio.sleep so retry backoff does not slow the test.
         with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
             async with httpx.AsyncClient() as client:
                 async with KuboCAS(client=client) as kubo_cas:
@@ -331,8 +339,8 @@ async def test_kubo_http_status_error_no_retry():
 
                     # Verify that the response in the exception has the correct status code.
                     assert exc_info.value.response.status_code == 500
-                    # Verify that no retry was attempted.
-                    mock_sleep.assert_not_called()
+                    # The initial attempt is followed by three retries.
+                    assert mock_sleep.await_count == kubo_cas.max_retries
 
 
 @pytest.mark.asyncio

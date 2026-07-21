@@ -48,7 +48,7 @@ def converter_test_dataset():
     yield ds
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_converter_produces_identical_dataset(
     create_ipfs: tuple[str, str],
     converter_test_dataset: xr.Dataset,
@@ -141,7 +141,7 @@ async def test_converter_produces_identical_dataset(
         print("=" * 80)
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_hamt_to_sharded_cli_success(
     create_ipfs: tuple[str, str], converter_test_dataset: xr.Dataset, capsys
 ):
@@ -192,7 +192,7 @@ async def test_hamt_to_sharded_cli_success(
         xr.testing.assert_identical(test_ds, ds_from_sharded)
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_hamt_to_sharded_cli_default_args(
     create_ipfs: tuple[str, str], converter_test_dataset: xr.Dataset, capsys
 ):
@@ -238,7 +238,7 @@ async def test_hamt_to_sharded_cli_default_args(
         xr.testing.assert_identical(test_ds, ds_from_sharded)
 
 
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 async def test_hamt_to_sharded_cli_invalid_cid(create_ipfs: tuple[str, str], capsys):
     """
     Tests the CLI with an invalid hamt_cid.
