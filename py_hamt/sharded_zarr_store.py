@@ -1894,6 +1894,29 @@ class ShardedZarrStore(zarr.abc.store.Store):
         clone._dirty_root = self._dirty_root
         clone._v2_pending_root_group_write = self._v2_pending_root_group_write
 
+        # A V1 primary that was inferred against a read-only open never reached
+        # the persistence branch in _infer_v1_legacy_primary_array_path (that
+        # branch is gated on `not self.read_only`), so it lives only in the
+        # in-memory `_primary_inferred` flag. Making a writable clone would carry
+        # that flag forward while leaving the shared root unrecorded: the first
+        # chunk write skips its seal-on-write (it is gated on
+        # `not self._primary_inferred`), so a same-geometry secondary array could
+        # flush with no recorded primary. On reopen inference would then be
+        # ambiguous and misroute the secondary's metadata chunk into the primary
+        # shard slot. Perform the deferred persistence the read-only open
+        # skipped, reproducing the state a writable open would have produced.
+        if (
+            not read_only
+            and clone._manifest_version == SHARDED_ZARR_V1
+            and clone._primary_inferred
+            and isinstance(clone._root_obj.get("chunks"), dict)
+            and "primary_array_path" not in clone._root_obj["chunks"]
+        ):
+            clone._root_obj["chunks"]["primary_array_path"] = (
+                clone._primary_array_path or ""
+            )
+            clone._dirty_root = True
+
         zarr.abc.store.Store.__init__(clone, read_only=read_only)
         return clone
 

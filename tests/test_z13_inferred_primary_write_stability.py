@@ -529,6 +529,64 @@ async def test_inferred_root_primary_is_recorded_and_not_rebound() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_only_to_writable_clone_seals_inferred_primary() -> None:
+    """with_read_only(False) must persist a primary inferred under a RO open.
+
+    A read-only open infers the primary but never reaches the persistence
+    branch (gated on ``not self.read_only``), so the path lives only in the
+    in-memory ``_primary_inferred`` flag. A writable clone inherits that flag
+    while sharing an unrecorded root; its first chunk write then skips its own
+    seal (gated on ``not self._primary_inferred``), so a same-geometry secondary
+    array could flush with no recorded primary and misroute on reopen. The
+    clone must perform the deferred seal so it behaves like a writable open.
+    """
+    cas, _, legacy_root_cid = await v1_recorded_and_legacy_roots()
+
+    read_only = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=legacy_root_cid,
+    )
+    assert read_only._primary_array_path == "temp"
+    assert read_only._primary_inferred is True
+    # The read-only open never records the inference.
+    assert "primary_array_path" not in read_only._root_obj["chunks"]
+
+    writable = read_only.with_read_only(False)
+    assert writable.read_only is False
+    # The clone seals the inferred primary so routing is deterministic on reopen.
+    assert writable._root_obj["chunks"]["primary_array_path"] == "temp"
+    assert writable._dirty_root is True
+
+    await writable.set(
+        "precip2/zarr.json",
+        buf(array_metadata(shape=(4, 4), chunk_shape=(2, 2))),
+    )
+    secondary_key = "precip2/c/0/0"
+    secondary_chunk = b"precip2-00"
+    await writable.set(secondary_key, buf(secondary_chunk))
+    assert writable._primary_array_path == "temp"
+
+    flushed_root_cid = await writable.flush()
+    root_obj = await decoded_root(cas, flushed_root_cid)
+    chunk_info = root_obj["chunks"]
+    metadata = root_obj["metadata"]
+    assert isinstance(chunk_info, dict)
+    assert isinstance(metadata, dict)
+    assert chunk_info["primary_array_path"] == "temp"
+    assert secondary_key in metadata
+
+    reopened = await ShardedZarrStore.open(
+        cas=cas,
+        read_only=True,
+        root_cid=flushed_root_cid,
+    )
+    assert await read_temp_chunks(reopened) == TEMP_CHUNKS
+    # The corruption fix: the secondary reads its OWN bytes, not temp's slot.
+    assert await read_bytes(reopened, secondary_key) == secondary_chunk
+
+
+@pytest.mark.asyncio
 async def test_unrecorded_empty_primary_list_dir_is_consistent() -> None:
     """list_dir("c") must surface chunks for an unrecorded empty-primary root.
 
