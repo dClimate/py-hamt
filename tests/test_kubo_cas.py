@@ -6,7 +6,7 @@ import dag_cbor
 import httpx
 import pytest
 from dag_cbor import IPLDKind
-from hypothesis import given, settings
+from hypothesis import HealthCheck, given, settings
 from testing_utils import ipld_strategy  # noqa
 
 from py_hamt import InMemoryCAS, KuboCAS
@@ -46,9 +46,13 @@ async def test_memory_store_invalid_key_type():
 
 # Test that always works with Docker or local daemon
 @pytest.mark.ipfs
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 @given(data=ipld_strategy())
-@settings(deadline=1000, print_blob=True)
+@settings(
+    deadline=1000,
+    print_blob=True,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
 async def test_kubo_urls_explicit(create_ipfs, global_client_session, data: IPLDKind):
     """
     Tests KuboCAS functionality with explicitly provided URLs.
@@ -72,9 +76,13 @@ async def test_kubo_urls_explicit(create_ipfs, global_client_session, data: IPLD
 
 
 @pytest.mark.ipfs
-@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.asyncio
 @given(data=ipld_strategy())
-@settings(deadline=1000, print_blob=True)
+@settings(
+    deadline=1000,
+    print_blob=True,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
 async def test_kubo_default_urls(global_client_session, data: IPLDKind):
     """
     Tests KuboCAS using its default URLs and when None is passed for URLs.
