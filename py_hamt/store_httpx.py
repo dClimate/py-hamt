@@ -73,18 +73,85 @@ def _slice_requested_range(
     return data
 
 
-def _range_not_satisfiable_is_empty(response: httpx.Response, offset: int) -> bool:
-    """Whether a ``416`` response describes an empty read at ``offset``.
+def _range_not_satisfiable_is_empty(
+    response: httpx.Response, offset: Optional[int], suffix: Optional[int]
+) -> bool:
+    """Whether a ``416`` response describes a read Python slicing treats as empty.
 
-    A spec-compliant gateway rejects a range whose first byte is at or past
-    the end of the object with ``416 Range Not Satisfiable`` and a
-    ``Content-Range: bytes */N`` header. Python slice semantics (and
-    ``InMemoryCAS``) return ``b""`` for that same read, so ``KuboCAS`` matches
-    by treating it as empty rather than surfacing the error.
+    A spec-compliant gateway rejects an unsatisfiable range with ``416 Range Not
+    Satisfiable`` and a ``Content-Range: bytes */N`` header giving the object
+    size ``N``. Python slice semantics (and ``InMemoryCAS``) yield ``b""`` for
+    those same reads, so ``KuboCAS`` matches by treating them as empty instead of
+    surfacing the error:
+
+    * an ``offset`` read is empty when it starts at or past EOF (``offset >= N``);
+    * a ``suffix`` read is unsatisfiable only against a zero-length object
+      (``N == 0``); ``data[-suffix:]`` on an empty object is likewise ``b""``.
+      (For a non-empty object a suffix range is always satisfiable, so a ``416``
+      there is a genuine error and is surfaced.)
     """
     content_range = response.headers.get("Content-Range", "")
     match = re.fullmatch(r"bytes \*/(\d+)", content_range.strip())
-    return match is not None and offset >= int(match.group(1))
+    if match is None:
+        return False
+    total = int(match.group(1))
+    if suffix is not None:
+        # A suffix range only fails against a zero-length object.
+        return total == 0
+    return offset is not None and offset >= total
+
+
+def _validate_partial_content(
+    response: httpx.Response,
+    offset: Optional[int],
+    length: Optional[int],
+    suffix: Optional[int],
+    body_len: int,
+) -> None:
+    """Reject a ``206`` whose byte window is missing or inconsistent.
+
+    ``raise_for_status`` accepts any 2xx, so a gateway can answer a Range request
+    with a malformed ``206`` -- an absent, unparseable, or ``*``-total
+    ``Content-Range``, a declared window that disagrees with the body length, or
+    a window that does not match what was requested -- and silently hand back the
+    wrong bytes. We recompute the exact window the request maps to (the object
+    size ``N`` is always known for content-addressed reads) and raise an
+    ``httpx.HTTPStatusError`` on any mismatch so a corrupt partial read fails
+    loudly rather than corrupting the caller's data.
+    """
+    content_range = response.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip())
+    if match is None:
+        raise httpx.HTTPStatusError(
+            f"malformed 206 Content-Range {content_range!r}",
+            request=response.request,
+            response=response,
+        )
+    start, end, total = (int(group) for group in match.groups())
+    # The declared inclusive window must match the number of bytes delivered.
+    if end - start + 1 != body_len:
+        raise httpx.HTTPStatusError(
+            f"206 Content-Range {content_range!r} declares "
+            f"{end - start + 1} bytes but body is {body_len}",
+            request=response.request,
+            response=response,
+        )
+    # Recompute the window the request maps to and demand an exact match, so a
+    # gateway cannot return a shifted or wrong-sized slice of the object.
+    if offset is not None:
+        expected_start = offset
+        expected_len = total - offset if length is None else min(length, total - offset)
+    else:
+        expected_start = max(total - cast(int, suffix), 0)
+        expected_len = min(cast(int, suffix), total)
+    if start != expected_start or body_len != expected_len:
+        raise httpx.HTTPStatusError(
+            f"206 Content-Range {content_range!r} (start={start}, {body_len} bytes) "
+            f"does not match the requested window "
+            f"(start={expected_start}, {expected_len} bytes)",
+            request=response.request,
+            response=response,
+        )
 
 
 # Upper bound on how long aclose() waits for a cross-loop client close that was
@@ -768,14 +835,13 @@ class KuboCAS(ContentAddressedStore):
                 try:
                     async with semaphore:  # Throttle each gateway attempt
                         response = await client.get(url, headers=headers or None)
-                    # A range starting at/past EOF is answered with 416 by a
-                    # compliant gateway; return b"" to match Python-slice
-                    # semantics (and InMemoryCAS) instead of raising.
+                    # An unsatisfiable range is answered with 416 by a compliant
+                    # gateway; return b"" to match Python-slice semantics (and
+                    # InMemoryCAS) instead of raising.
                     if (
-                        offset is not None
-                        and response.status_code
+                        response.status_code
                         == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE
-                        and _range_not_satisfiable_is_empty(response, offset)
+                        and _range_not_satisfiable_is_empty(response, offset, suffix)
                     ):
                         final_retry_count = retry_count
                         return b""
@@ -783,13 +849,32 @@ class KuboCAS(ContentAddressedStore):
                     content = response.content
                     response_bytes = len(content)
                     final_retry_count = retry_count
-                    if headers and response.status_code == httpx.codes.OK:
-                        logger.debug(
-                            "Gateway ignored Range request for CID %s; "
-                            "slicing the complete response locally",
-                            cid,
+                    if headers:
+                        if response.status_code == httpx.codes.OK:
+                            logger.debug(
+                                "Gateway ignored Range request for CID %s; "
+                                "slicing the complete response locally",
+                                cid,
+                            )
+                            return _slice_requested_range(
+                                content, offset, length, suffix
+                            )
+                        if response.status_code == httpx.codes.PARTIAL_CONTENT:
+                            # Trust the partial body only after proving its
+                            # Content-Range matches the requested byte window.
+                            _validate_partial_content(
+                                response, offset, length, suffix, response_bytes
+                            )
+                            return content
+                        # Any other 2xx to a Range request is unexpected: we
+                        # cannot know which bytes it carries, so fail rather than
+                        # return a possibly-wrong window.
+                        raise httpx.HTTPStatusError(
+                            f"unexpected {response.status_code} response to a "
+                            "Range request",
+                            request=response.request,
+                            response=response,
                         )
-                        return _slice_requested_range(content, offset, length, suffix)
                     return content
 
                 except httpx.RequestError:

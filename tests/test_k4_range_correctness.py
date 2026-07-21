@@ -39,12 +39,57 @@ def range_gateway() -> Iterator[tuple[str, RecordedRanges]]:
                 self.end_headers()
                 return
 
-            if cid == "honors-range" and range_header is not None:
+            if cid == "empty-suffix-416" and range_header is not None:
+                # Zero-length object: a suffix range is unsatisfiable, so a
+                # compliant gateway answers 416 + ``Content-Range: bytes */0``.
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */0")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            if cid == "unexpected-2xx" and range_header is not None:
+                # A non-206/200 success (203) carrying the full body: the byte
+                # window is unknowable, so KuboCAS must reject it.
+                self.send_response(203)
+                self.send_header("Content-Length", str(len(BODY)))
+                self.end_headers()
+                self.wfile.write(BODY)
+                return
+
+            if cid.startswith("bad-206") and range_header is not None:
+                # A 206 whose Content-Range is absent, garbled, or inconsistent
+                # with the body/request. httpx's raise_for_status accepts these,
+                # so KuboCAS must validate them itself.
+                self.send_response(206)
+                if cid == "bad-206-no-range":
+                    body = BODY[5:15]  # no Content-Range header at all
+                elif cid == "bad-206-star-total":
+                    body = BODY[5:15]
+                    self.send_header("Content-Range", "bytes 5-14/*")
+                elif cid == "bad-206-bad-length":
+                    body = BODY[5:10]  # 5 bytes...
+                    self.send_header("Content-Range", "bytes 5-14/100")  # claims 10
+                else:  # bad-206-wrong-start
+                    body = BODY[0:10]  # consistent window, but wrong start
+                    self.send_header("Content-Range", "bytes 0-9/100")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if cid in ("honors-range", "honors-suffix") and range_header is not None:
                 unit, requested_range = range_header.split("=", 1)
                 start_text, end_text = requested_range.split("-", 1)
                 assert unit == "bytes"
-                start = int(start_text)
-                end = int(end_text)
+                if cid == "honors-suffix":
+                    # bytes=-N maps to the last N bytes of the object.
+                    start = len(BODY) - int(end_text)
+                    end = len(BODY) - 1
+                else:
+                    start = int(start_text)
+                    # bytes=start- (open-ended) runs to the end of the object.
+                    end = int(end_text) if end_text else len(BODY) - 1
                 response_body = BODY[start : end + 1]
                 self.send_response(206)
                 self.send_header("Content-Range", f"bytes {start}-{end}/{len(BODY)}")
@@ -247,5 +292,101 @@ async def test_kubocas_416_without_content_range_is_surfaced_as_error(
     try:
         with pytest.raises(httpx.HTTPStatusError):
             await cas.load("malformed-416", offset=len(BODY) + 10)
+    finally:
+        await cas.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kubocas_suffix_on_empty_object_returns_empty(
+    range_gateway: tuple[str, RecordedRanges],
+) -> None:
+    # A suffix range against a zero-length object is unsatisfiable (416 bytes
+    # */0). Python slicing of b"" yields b"", so KuboCAS must too rather than
+    # raising -- mirroring InMemoryCAS and the offset-past-EOF case.
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        actual = await cas.load("empty-suffix-416", suffix=7)
+    finally:
+        await cas.aclose()
+
+    assert actual == b"", (
+        f"suffix read of an empty object returned {len(actual)} bytes; "
+        "expected b'' to match Python-slice / InMemoryCAS semantics"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inmemorycas_suffix_on_empty_object_returns_empty() -> None:
+    cas = InMemoryCAS()
+    key = await cas.save(b"", "raw")
+
+    assert await cas.load(key, suffix=7) == b""
+
+
+@pytest.mark.asyncio
+async def test_kubocas_honored_open_ended_and_suffix_206(
+    range_gateway: tuple[str, RecordedRanges],
+) -> None:
+    # Valid 206 responses for an open-ended offset read and a suffix read must
+    # pass validation and return the exact requested window.
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        open_ended = await cas.load("honors-range", offset=5)
+        suffix = await cas.load("honors-suffix", suffix=7)
+    finally:
+        await cas.aclose()
+
+    assert open_ended == BODY[5:]
+    assert suffix == BODY[-7:]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cid",
+    ["bad-206-no-range", "bad-206-star-total", "bad-206-bad-length"],
+)
+async def test_kubocas_rejects_inconsistent_206(
+    range_gateway: tuple[str, RecordedRanges], cid: str
+) -> None:
+    # A 206 with a missing/unparseable Content-Range, or one whose declared
+    # window disagrees with the body length, is untrustworthy and must raise
+    # rather than silently corrupt the read.
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await cas.load(cid, offset=5, length=10)
+    finally:
+        await cas.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kubocas_rejects_206_with_wrong_window(
+    range_gateway: tuple[str, RecordedRanges],
+) -> None:
+    # An internally-consistent 206 whose window does not start where we asked
+    # would hand back the wrong bytes; it must be rejected.
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await cas.load("bad-206-wrong-start", offset=5, length=10)
+    finally:
+        await cas.aclose()
+
+
+@pytest.mark.asyncio
+async def test_kubocas_rejects_unexpected_success_status_for_range(
+    range_gateway: tuple[str, RecordedRanges],
+) -> None:
+    # A non-200/206 success (here 203) to a Range request carries an unknown
+    # byte window and must be rejected rather than returned as-is.
+    gateway_url, _ = range_gateway
+    cas = make_kubo_cas(gateway_url)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await cas.load("unexpected-2xx", offset=5, length=10)
     finally:
         await cas.aclose()
