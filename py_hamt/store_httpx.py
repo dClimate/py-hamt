@@ -3,11 +3,13 @@ import logging
 import random
 import re
 import threading
+import time
 import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Literal, Optional, Tuple, cast
+from urllib.parse import urlsplit
 
 import httpx
 from dag_cbor.ipld import IPLDKind
@@ -23,6 +25,133 @@ _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 # Ceiling on server-directed waits so a broken or hostile gateway cannot make
 # a request sleep unbounded (e.g. ``Retry-After: inf`` or a far-future date).
 _MAX_RETRY_AFTER_SECONDS = 300.0
+
+# Consecutive failures before a gateway is considered unhealthy and moved to the
+# back of the rotation, and how long it stays there before being retried. A
+# tripped gateway is never permanently removed: after the cooldown it is probed
+# again by ordinary traffic, so a gateway that recovers rejoins on its own.
+_GATEWAY_FAILURE_THRESHOLD = 3
+_GATEWAY_COOLDOWN_SECONDS = 30.0
+
+# Headers forwarded to a gateway outside the credentialed origin. This is an
+# allowlist, not a denylist: KuboCAS documents arbitrary headers as a supported
+# way to authenticate ("set whatever headers ... they need"), so any header the
+# caller configured may be a credential -- ``X-API-Key`` and ``X-Auth-Token``
+# name themselves, but a bearer token can live under any name at all. Only
+# httpx's own content-negotiation defaults are safe to send to a foreign
+# gateway; anything else is dropped rather than guessed about.
+#
+# ``Host`` is deliberately absent: it is derived from the request URL, and
+# forwarding the primary's value would misroute the fallback request.
+_FORWARDABLE_HEADERS = frozenset({
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "user-agent",
+})
+
+
+def _carries_credentials(client: httpx.AsyncClient) -> bool:
+    """Whether this client would send anything worth withholding.
+
+    A client with no auth and only content-negotiation headers has no secret to
+    leak to a foreign gateway, so reads through it can take httpx's ordinary
+    request path instead of the origin-scoping one.
+    """
+    if client.auth is not None:
+        return True
+    # "connection" is a hop-by-hop header httpx sets itself. It is not
+    # forwardable (it describes this connection, not the request), but its
+    # presence does not mean the caller configured a credential.
+    benign = _FORWARDABLE_HEADERS | {"connection"}
+    return any(
+        name.decode("latin-1").lower() not in benign for name, _ in client.headers.raw
+    )
+
+
+# Ports implied by a scheme, so ``https://h`` and ``https://h:443`` compare
+# equal rather than looking like two different origins.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_of(url: str) -> tuple[str, str, int | None]:
+    """Scheme/host/port triple used to decide if two URLs share an origin.
+
+    The port falls back to the scheme default so a gateway written without a
+    port in config and reached with an explicit one (or vice versa) is treated
+    as the same origin, rather than silently losing its credentials.
+    """
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    port = parsed.port or _DEFAULT_PORTS.get(scheme)
+    return (scheme, (parsed.hostname or "").lower(), port)
+
+
+def _normalize_gateway_base_url(gateway_base_url: str) -> str:
+    """Normalize a gateway base URL to a ``.../ipfs/`` prefix.
+
+    Accepts a bare host (``https://example.com``), an explicit path
+    (``https://example.com/ipfs``), and either with a trailing slash.
+    """
+    gateway_base_url = gateway_base_url.rstrip("/")
+    if not gateway_base_url.endswith("/ipfs"):
+        gateway_base_url = f"{gateway_base_url}/ipfs"
+    return f"{gateway_base_url}/"
+
+
+class _GatewayHealth:
+    """Consecutive-failure circuit breaker for a single gateway.
+
+    Gateways are never removed from the rotation permanently. Once
+    ``_GATEWAY_FAILURE_THRESHOLD`` consecutive failures trip the breaker, the
+    gateway is deprioritized (tried only after every healthy gateway) until
+    ``_GATEWAY_COOLDOWN_SECONDS`` elapse, after which ordinary traffic probes it
+    again. Any success resets the counter.
+
+    Times are ``time.monotonic()`` readings. That clock is process-wide, so a
+    trip recorded while one event loop is running stays comparable from another
+    -- unlike ``loop.time()``, whose epoch is only meaningful within a single
+    loop and would make the cooldown expire instantly or never once this shared
+    state is touched from a second loop.
+    """
+
+    __slots__ = ("consecutive_failures", "tripped_at")
+
+    def __init__(self) -> None:
+        self.consecutive_failures: int = 0
+        self.tripped_at: float | None = None
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.tripped_at = None
+
+    def record_failure(self, now: float) -> None:
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= _GATEWAY_FAILURE_THRESHOLD:
+            self.tripped_at = now
+
+    def is_healthy(self, now: float) -> bool:
+        """Whether this gateway should still be preferred.
+
+        Deliberately time-based rather than a single-probe half-open gate. Once
+        the cooldown elapses, concurrent loads may all retry a gateway that is
+        still down -- but that costs a handful of wasted requests once per
+        cooldown, and each still fails over. Gating it behind one in-flight
+        probe means tracking that probe's outcome across cancellation and
+        never-attempted gateways, which is materially more machinery than the
+        thundering herd it avoids is worth here.
+        """
+        if self.tripped_at is None:
+            return True
+        if now - self.tripped_at >= _GATEWAY_COOLDOWN_SECONDS:
+            # Cooldown elapsed. Clear the trip so a single probe failure does
+            # not immediately re-trip on a stale counter, but keep the gateway
+            # on probation by leaving the failure count one short of the
+            # threshold: one more failure re-trips it right away.
+            self.tripped_at = None
+            self.consecutive_failures = _GATEWAY_FAILURE_THRESHOLD - 1
+            return True
+        return False
 
 
 def _retry_delay(
@@ -53,6 +182,99 @@ def _retry_delay(
 
     jitter = backoff_delay * 0.1 * (random.random() - 0.5)
     return backoff_delay + jitter
+
+
+class _LoadStats:
+    """Mutable trace counters shared across the gateways one load attempts."""
+
+    __slots__ = ("response_bytes", "retries", "status")
+
+    def __init__(self) -> None:
+        self.response_bytes: int = 0
+        self.retries: int = 0
+        self.status: str = "ok"
+
+
+class GatewayContentMismatch(Exception):
+    """A gateway returned bytes that do not hash to the requested CID.
+
+    Raised only when content verification is enabled. Treated as a per-gateway
+    failure, so a multi-gateway ``KuboCAS`` fails over to the next gateway
+    rather than returning corrupt data to the caller.
+    """
+
+
+class GatewayContentUnverifiable(GatewayContentMismatch):
+    """Verification was requested but could not be carried out.
+
+    Subclasses ``GatewayContentMismatch`` so it fails over and is caught by
+    existing handlers. Distinct because the cause differs: the content is not
+    known to be wrong, only unproven. ``verify_content=True`` must still fail
+    closed here -- returning unverified bytes would silently downgrade the
+    guarantee exactly when the hashing backend is broken or the algorithm is
+    unavailable.
+    """
+
+
+def _cid_is_verifiable(cid: CID, offset: Optional[int], suffix: Optional[int]) -> bool:
+    """Whether a gateway response for ``cid`` can be checked against its digest.
+
+    Verification requires hashing the *complete* block, which holds only for:
+
+    * **Full-body reads.** A Range request yields a slice, which does not hash
+      to the CID.
+    * **Non-``dag-pb`` CIDs.** A gateway serving a ``dag-pb`` CID returns the
+      reassembled UnixFS file, not the encoded block the CID commits to, so the
+      digest legitimately differs. ``raw`` and ``dag-cbor`` blocks -- what the
+      HAMT itself stores -- are returned verbatim and do hash correctly.
+    """
+    if offset is not None or suffix is not None:
+        return False
+    # An identity multihash inlines the block in the CID, but load() still
+    # fetches and returns whatever the gateway sends, so the response is
+    # verifiable -- by direct comparison rather than rehashing.
+    return cid.codec.code != KuboCAS.DAG_PB_MARKER
+
+
+def _verify_cid_content(cid: CID, data: bytes) -> None:
+    """Raise ``GatewayContentMismatch`` if ``data`` does not hash to ``cid``.
+
+    An ``identity`` multihash inlines the block in the CID itself, so the bytes
+    are compared directly rather than rehashed.
+
+    The digest is computed at the CID's own digest length. That is required for
+    correctness in both directions: variable-output functions (blake3, the
+    default hasher here) *reject* a call that omits the size, and a legitimately
+    truncated digest would never match one computed at full length.
+
+    If the digest cannot be computed at all -- an algorithm the local
+    ``multiformats`` build does not support, or a hashing backend that fails --
+    this raises ``GatewayContentUnverifiable`` rather than returning the bytes.
+    Verification fails closed: a caller who asked for ``verify_content`` gets
+    either proven content or an error, never unverified bytes presented as
+    though they had been checked.
+    """
+    raw_digest = bytes(cid.raw_digest)
+    if cid.hashfun.name == "identity":
+        # Nothing was hashed: the CID carries the content verbatim.
+        if data != raw_digest:
+            raise GatewayContentMismatch(
+                f"gateway returned {len(data)} bytes that do not match the "
+                f"content inlined in identity CID {cid}"
+            )
+        return
+
+    try:
+        computed = multihash.digest(data, cid.hashfun.name, size=len(raw_digest))
+    except Exception as error:
+        raise GatewayContentUnverifiable(
+            f"cannot verify {cid}: computing {cid.hashfun.name} at "
+            f"{len(raw_digest)} bytes failed ({error})"
+        ) from error
+    if bytes(multihash.unwrap(computed)) != raw_digest:
+        raise GatewayContentMismatch(
+            f"gateway returned {len(data)} bytes that do not hash to {cid}"
+        )
 
 
 def _slice_requested_range(
@@ -333,6 +555,26 @@ class KuboCAS(ContentAddressedStore):
     - **rpc_base_url / gateway_base_url** (str | None): override daemon
       endpoints (defaults match the local daemon ports). Gateway URLs may end
       with `/ipfs` and may include a trailing slash.
+    - **gateway_base_urls** (list[str] | None): read from several gateways with
+      automatic failover. Mutually exclusive with `gateway_base_url`. Each read
+      tries one gateway at a time, healthy gateways first, until one succeeds;
+      requests are not raced in parallel. A gateway that fails three times in a
+      row is moved to the back of the rotation for 30 seconds and then probed
+      again. `concurrency` applies per gateway. If every gateway fails, an
+      `ExceptionGroup` of the underlying errors is raised.
+    - **verify_content** (bool): check that returned bytes hash to the
+      requested CID, raising `GatewayContentMismatch` (and failing over to the
+      next gateway) when they do not. Worth enabling when reading from public
+      gateways you do not control. Only full-body reads of non-`dag-pb` CIDs
+      can be verified; Range reads and `dag-pb` reads are passed through
+      unchecked because neither returns the exact bytes the CID commits to.
+      Requests to a gateway outside the origin of
+      `gateway_base_url`/`rpc_base_url` forward only content-negotiation
+      headers (`Accept`, `Accept-Encoding`, `Accept-Language`, `User-Agent`)
+      and drop client-level `auth`. Because any header name may carry a
+      credential, everything else is withheld -- so a private primary can
+      safely be paired with public fallbacks, but a foreign gateway that needs
+      its own custom header will not receive one.
     - **chunker** (str): chunking algorithm specification for Kubo's `add`
       RPC. Accepted formats are `"size-<positive int>"`, `"rabin"`, or
       `"rabin-<min>-<avg>-<max>"`.
@@ -355,6 +597,8 @@ class KuboCAS(ContentAddressedStore):
         gateway_base_url: str | None = None,
         concurrency: int = 32,
         *,
+        gateway_base_urls: list[str] | None = None,
+        verify_content: bool = False,
         client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
         headers: dict[str, str] | None = None,
         auth: Tuple[str, str] | None = None,
@@ -430,6 +674,13 @@ class KuboCAS(ContentAddressedStore):
         self._semaphore_per_loop: Dict[
             asyncio.AbstractEventLoop, asyncio.Semaphore
         ] = {}
+        # Gateway reads get a semaphore per (loop, gateway) so ``concurrency``
+        # means "in-flight requests per gateway". Sharing one budget across
+        # gateways would divide effective parallelism by the gateway count and
+        # let a slow gateway starve the healthy ones of slots.
+        self._gateway_semaphore_per_loop: Dict[
+            Tuple[asyncio.AbstractEventLoop, str], asyncio.Semaphore
+        ] = {}
 
         # Now, perform validation that might raise an exception
         chunker_pattern = r"(?:size-[1-9]\d*|rabin(?:-[1-9]\d*-[1-9]\d*-[1-9]\d*)?)"
@@ -442,19 +693,46 @@ class KuboCAS(ContentAddressedStore):
 
         if rpc_base_url is None:
             rpc_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_RPC_BASE_URL  # pragma
-        if gateway_base_url is None:
-            gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
 
-        gateway_base_url = gateway_base_url.rstrip("/")
-        if not gateway_base_url.endswith("/ipfs"):
-            gateway_base_url = f"{gateway_base_url}/ipfs"
-        gateway_base_url = f"{gateway_base_url}/"
+        if gateway_base_urls is not None:
+            if gateway_base_url is not None:
+                raise ValueError(
+                    "gateway_base_url and gateway_base_urls are mutually "
+                    "exclusive; pass every gateway in gateway_base_urls"
+                )
+            if not gateway_base_urls:
+                raise ValueError("gateway_base_urls must not be empty")
+            normalized = [_normalize_gateway_base_url(url) for url in gateway_base_urls]
+            # Preserve caller order while dropping duplicates: a repeated
+            # gateway would otherwise get several rotation slots and several
+            # independent concurrency budgets pointed at one host.
+            self.gateway_base_urls: list[str] = list(dict.fromkeys(normalized))
+        else:
+            if gateway_base_url is None:
+                gateway_base_url = KuboCAS.KUBO_DEFAULT_LOCAL_GATEWAY_BASE_URL
+            self.gateway_base_urls = [_normalize_gateway_base_url(gateway_base_url)]
 
         pin_string: str = "true" if pin_on_add else "false"
         self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pin_string}"
         """@private"""
-        self.gateway_base_url: str = gateway_base_url
+        self.gateway_base_url: str = self.gateway_base_urls[0]
         """@private"""
+
+        # Origins the caller's credentials were configured for: the primary
+        # gateway and the RPC endpoint. Reads to any other gateway drop
+        # credentialed headers and client auth (see _load_from_gateway).
+        self._credentialed_origins: set[tuple[str, str, int | None]] = {
+            _origin_of(self.gateway_base_url),
+            _origin_of(rpc_base_url),
+        }
+
+        self.verify_content: bool = verify_content
+        """@private"""
+        # Health is per gateway but shared across event loops: a gateway that is
+        # rate-limiting or down is doing so regardless of which loop observed it.
+        self._gateway_health: Dict[str, _GatewayHealth] = {
+            url: _GatewayHealth() for url in self.gateway_base_urls
+        }
 
         if client is not None:
             # Bind the user-supplied client lazily on first async use.
@@ -536,6 +814,7 @@ class KuboCAS(ContentAddressedStore):
             self._client_per_loop = {}
             self._internally_created_clients = set()
             self._semaphore_per_loop = {}
+            self._gateway_semaphore_per_loop = {}
 
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
@@ -544,6 +823,49 @@ class KuboCAS(ContentAddressedStore):
             semaphore = asyncio.Semaphore(self._concurrency)
             self._semaphore_per_loop[loop] = semaphore
             return semaphore
+
+    def _gateway_semaphore(self, gateway_base_url: str) -> asyncio.Semaphore:
+        """Get or create the concurrency semaphore for one gateway on this loop.
+
+        With a single gateway this is equivalent to ``_loop_semaphore``; with
+        several it keeps each gateway's ``concurrency`` budget independent.
+        """
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        key = (loop, gateway_base_url)
+        try:
+            return self._gateway_semaphore_per_loop[key]
+        except KeyError:
+            semaphore = asyncio.Semaphore(self._concurrency)
+            self._gateway_semaphore_per_loop[key] = semaphore
+            return semaphore
+
+    def _ordered_gateways(self) -> list[str]:
+        """Gateways to try, best first.
+
+        Ordered by health, then by whether a concurrency slot is free right now.
+        The second key avoids head-of-line blocking: attempts wait on their
+        gateway's semaphore, so without it a read queued behind a saturated
+        gateway would stall even when an idle gateway could serve it
+        immediately -- precisely the case multiple gateways exist to handle.
+
+        Deprioritizing rather than dropping unhealthy gateways means a run where
+        every gateway has tripped still attempts them all instead of failing
+        with nothing tried.
+        """
+        if len(self.gateway_base_urls) == 1:
+            return self.gateway_base_urls
+
+        now = time.monotonic()
+        # is_healthy() clears an expired trip, so evaluate it exactly once per
+        # gateway rather than inside a sort key, which may call it repeatedly.
+        ranks: Dict[str, tuple[int, int]] = {}
+        for url in self.gateway_base_urls:
+            unhealthy = 0 if self._gateway_health[url].is_healthy(now) else 1
+            busy = 1 if self._gateway_semaphore(url).locked() else 0
+            ranks[url] = (unhealthy, busy)
+
+        # Stable sort, so configured order breaks ties within a rank.
+        return sorted(self.gateway_base_urls, key=lambda url: ranks[url])
 
     def _loop_client(self) -> httpx.AsyncClient:
         """Get or create a client for the current event loop.
@@ -563,6 +885,7 @@ class KuboCAS(ContentAddressedStore):
             self._closed = False
             self._client_per_loop = {}
             self._semaphore_per_loop = {}
+            self._gateway_semaphore_per_loop = {}
 
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         try:
@@ -678,6 +1001,7 @@ class KuboCAS(ContentAddressedStore):
         self._client_per_loop.clear()
         self._internally_created_clients.clear()
         self._semaphore_per_loop.clear()
+        self._gateway_semaphore_per_loop.clear()
         self._closed = True
 
     # At this point, _client_per_loop should be empty or only contain
@@ -710,6 +1034,7 @@ class KuboCAS(ContentAddressedStore):
                 # so just clear the references
                 self._client_per_loop.clear()
                 self._semaphore_per_loop.clear()
+                self._gateway_semaphore_per_loop.clear()
                 self._closed = True
             return
 
@@ -732,6 +1057,7 @@ class KuboCAS(ContentAddressedStore):
             if hasattr(self, "_client_per_loop"):
                 self._client_per_loop.clear()
                 self._semaphore_per_loop.clear()
+                self._gateway_semaphore_per_loop.clear()
                 self._closed = True
 
     # --------------------------------------------------------------------- #
@@ -785,6 +1111,199 @@ class KuboCAS(ContentAddressedStore):
                 )
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
+    def _request_headers_for(
+        self, client: httpx.AsyncClient, url: str, headers: Dict[str, str]
+    ) -> Tuple[Dict[str, str], bool]:
+        """Build headers for ``url``, dropping credentials on a foreign origin.
+
+        Returns the headers and whether credentials were withheld (which also
+        means client-level ``auth`` must be suppressed).
+
+        httpx merges client-level headers into every request and offers no way
+        to drop one per-request: ``Client._merge_headers`` starts from
+        ``self.headers`` and only ``update()``s, so an omitted or blanked entry
+        is reinstated. Building the ``Request`` explicitly is the only reliable
+        way to withhold a credential.
+        """
+        # Read from .raw: httpx.Headers.items() lower-cases names, and building
+        # a Request from that would silently rewrite every outgoing header name
+        # compared with the client.get() path this replaces.
+        client_headers = [
+            (name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in client.headers.raw
+        ]
+
+        if _origin_of(url) in self._credentialed_origins:
+            merged = dict(client_headers)
+            merged.update(headers)
+            return merged, False
+
+        safe_headers = {
+            name: value
+            for name, value in client_headers
+            if name.lower() in _FORWARDABLE_HEADERS
+        }
+        # Range headers are computed by load() for this request, never
+        # caller-supplied credentials, so they are always safe to send.
+        safe_headers.update(headers)
+        return safe_headers, True
+
+    async def _get_with_origin_scoped_credentials(
+        self, client: httpx.AsyncClient, url: str, headers: Dict[str, str]
+    ) -> httpx.Response:
+        """GET ``url``, re-deciding credential scope at every redirect hop.
+
+        Redirects are followed manually because httpx's own redirect handling
+        strips only ``Authorization`` and ``Cookie`` when crossing origins (see
+        ``Client._redirect_headers``). Custom credentials -- ``X-API-Key`` and
+        friends, which ``KuboCAS`` documents as a supported way to
+        authenticate -- survive its stripping, so a gateway could redirect to an
+        origin of its choosing and harvest them. Following each hop ourselves
+        re-applies the full origin check to the *redirect target*.
+        """
+        if not _carries_credentials(client):
+            # Nothing to withhold: no credentialed header and no client auth, so
+            # no origin can harvest anything by redirecting. Keep the plain
+            # client.get() path, which preserves httpx's own redirect, auth, and
+            # header-casing behaviour for the overwhelmingly common case.
+            return await client.get(url, headers=headers or None)
+
+        redirects_remaining = client.max_redirects if client.follow_redirects else 0
+        current_url = url
+
+        while True:
+            request_headers, stripped = self._request_headers_for(
+                client, current_url, headers
+            )
+            # auth=None also suppresses client-level httpx.Auth, which would
+            # otherwise re-add an Authorization header after our filtering.
+            response = await client.send(
+                httpx.Request("GET", current_url, headers=request_headers),
+                auth=None if stripped else httpx.USE_CLIENT_DEFAULT,
+                follow_redirects=False,
+            )
+
+            location = response.headers.get("Location")
+            if not (response.is_redirect and location):
+                return response
+            if redirects_remaining <= 0:
+                # Mirror httpx's own behaviour rather than silently returning
+                # the 3xx as if it were the block.
+                raise httpx.TooManyRedirects(
+                    "Exceeded maximum allowed redirects.", request=response.request
+                )
+
+            redirects_remaining -= 1
+            await response.aread()
+            await response.aclose()
+            current_url = str(response.url.join(location))
+
+    async def _load_from_gateway(
+        self,
+        gateway_base_url: str,
+        cid: CID,
+        headers: Dict[str, str],
+        offset: Optional[int],
+        length: Optional[int],
+        suffix: Optional[int],
+        stats: "_LoadStats",
+    ) -> bytes:
+        """Fetch ``cid`` from one gateway, retrying that gateway's transients.
+
+        Raises on failure so the caller can fail over. ``stats`` accumulates the
+        byte count and retry total across every gateway attempted, so the trace
+        emitted by ``load`` reflects the whole operation rather than the last leg.
+
+        Credentials configured for the primary gateway or the RPC endpoint are
+        stripped when this gateway is on a different origin, so failing over to
+        a public fallback cannot disclose a private gateway's token.
+        """
+        url = f"{gateway_base_url}{cid}"
+        client = self._loop_client()
+        semaphore = self._gateway_semaphore(gateway_base_url)
+        retry_count = 0
+
+        while retry_count <= self.max_retries:
+            try:
+                async with semaphore:  # Throttle each gateway attempt
+                    response = await self._get_with_origin_scoped_credentials(
+                        client, url, headers
+                    )
+                # An unsatisfiable range is answered with 416 by a compliant
+                # gateway; return b"" to match Python-slice semantics (and
+                # InMemoryCAS) instead of raising.
+                if (
+                    response.status_code == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE
+                    and _range_not_satisfiable_is_empty(response, offset, suffix)
+                ):
+                    return b""
+                response.raise_for_status()
+                content = response.content
+                stats.response_bytes = len(content)
+                if headers:
+                    if response.status_code == httpx.codes.OK:
+                        logger.debug(
+                            "Gateway ignored Range request for CID %s; "
+                            "slicing the complete response locally",
+                            cid,
+                        )
+                        return _slice_requested_range(content, offset, length, suffix)
+                    if response.status_code == httpx.codes.PARTIAL_CONTENT:
+                        # Trust the partial body only after proving its
+                        # Content-Range matches the requested byte window.
+                        _validate_partial_content(
+                            response, offset, length, suffix, stats.response_bytes
+                        )
+                        return content
+                    # Any other 2xx to a Range request is unexpected: we
+                    # cannot know which bytes it carries, so fail rather than
+                    # return a possibly-wrong window.
+                    raise httpx.HTTPStatusError(
+                        f"unexpected {response.status_code} response to a "
+                        "Range request",
+                        request=response.request,
+                        response=response,
+                    )
+                if self.verify_content and _cid_is_verifiable(cid, offset, suffix):
+                    # A mismatch means this gateway served wrong bytes. Raising
+                    # here routes it through the caller's failover path like any
+                    # other per-gateway failure.
+                    try:
+                        _verify_cid_content(cid, content)
+                    except GatewayContentMismatch:
+                        stats.status = "content_mismatch"
+                        raise
+                return content
+
+            except httpx.RequestError:
+                if retry_count >= self.max_retries:
+                    stats.status = "request_error"
+                    raise
+                retry_count += 1
+                stats.retries += 1
+                await asyncio.sleep(
+                    _retry_delay(self.initial_delay, self.backoff_factor, retry_count)
+                )
+
+            except httpx.HTTPStatusError as error:
+                if (
+                    error.response.status_code not in _RETRYABLE_STATUS_CODES
+                    or retry_count >= self.max_retries
+                ):
+                    stats.status = "http_error"
+                    raise
+                retry_count += 1
+                stats.retries += 1
+                await asyncio.sleep(
+                    _retry_delay(
+                        self.initial_delay,
+                        self.backoff_factor,
+                        retry_count,
+                        error.response,
+                    )
+                )
+        raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
+
     async def load(
         self,
         id: IPLDKind,
@@ -800,12 +1319,20 @@ class KuboCAS(ContentAddressedStore):
         other HTTP errors fail immediately. Zero-length and zero-suffix reads
         return immediately without a gateway request. Concurrency slots are
         held per HTTP attempt and released during retry backoff.
+
+        When several gateways are configured, each is tried in turn -- healthy
+        ones first -- until one succeeds. Requests are *not* raced in parallel:
+        fanning every read out to every gateway would multiply egress and burn
+        each gateway's rate-limit budget N times over, which is the opposite of
+        what helps when rate limiting is the problem being solved. A gateway
+        that fails ``_GATEWAY_FAILURE_THRESHOLD`` times consecutively is moved
+        to the back of the rotation for a cooldown. If every gateway fails, the
+        collected errors are raised together as an ``ExceptionGroup``.
         """
         if (offset is not None and length == 0) or (offset is None and suffix == 0):
             return b""
 
         cid = cast(CID, id)
-        url: str = f"{self.gateway_base_url + str(cid)}"
         headers: Dict[str, str] = {}
 
         # Construct the Range header if required
@@ -823,97 +1350,49 @@ class KuboCAS(ContentAddressedStore):
             headers["Range"] = f"bytes=-{suffix}"
 
         trace_started_at = instrumentation.begin_cas_load(cid, bool(headers))
-        response_bytes = 0
-        final_status = "ok"
-        final_retry_count = 0
+        stats = _LoadStats()
+        gateways = self._ordered_gateways()
+        failures: list[Exception] = []
         try:
-            client = self._loop_client()
-            semaphore = self._loop_semaphore()
-            retry_count = 0
-
-            while retry_count <= self.max_retries:
+            for gateway_base_url in gateways:
+                health = self._gateway_health[gateway_base_url]
                 try:
-                    async with semaphore:  # Throttle each gateway attempt
-                        response = await client.get(url, headers=headers or None)
-                    # An unsatisfiable range is answered with 416 by a compliant
-                    # gateway; return b"" to match Python-slice semantics (and
-                    # InMemoryCAS) instead of raising.
-                    if (
-                        response.status_code
-                        == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE
-                        and _range_not_satisfiable_is_empty(response, offset, suffix)
-                    ):
-                        final_retry_count = retry_count
-                        return b""
-                    response.raise_for_status()
-                    content = response.content
-                    response_bytes = len(content)
-                    final_retry_count = retry_count
-                    if headers:
-                        if response.status_code == httpx.codes.OK:
-                            logger.debug(
-                                "Gateway ignored Range request for CID %s; "
-                                "slicing the complete response locally",
-                                cid,
-                            )
-                            return _slice_requested_range(
-                                content, offset, length, suffix
-                            )
-                        if response.status_code == httpx.codes.PARTIAL_CONTENT:
-                            # Trust the partial body only after proving its
-                            # Content-Range matches the requested byte window.
-                            _validate_partial_content(
-                                response, offset, length, suffix, response_bytes
-                            )
-                            return content
-                        # Any other 2xx to a Range request is unexpected: we
-                        # cannot know which bytes it carries, so fail rather than
-                        # return a possibly-wrong window.
-                        raise httpx.HTTPStatusError(
-                            f"unexpected {response.status_code} response to a "
-                            "Range request",
-                            request=response.request,
-                            response=response,
+                    content = await self._load_from_gateway(
+                        gateway_base_url, cid, headers, offset, length, suffix, stats
+                    )
+                except (httpx.HTTPError, GatewayContentMismatch) as error:
+                    health.record_failure(time.monotonic())
+                    failures.append(error)
+                    if len(gateways) > 1:
+                        logger.debug(
+                            "Gateway %s failed for CID %s (%s); trying the next one",
+                            gateway_base_url,
+                            cid,
+                            error,
                         )
+                    continue
+                else:
+                    health.record_success()
+                    # A gateway leg may have set a failure status before a later
+                    # gateway succeeded; the operation as a whole is a success.
+                    stats.status = "ok"
                     return content
 
-                except httpx.RequestError:
-                    if retry_count >= self.max_retries:
-                        final_status = "request_error"
-                        final_retry_count = retry_count
-                        raise
-                    retry_count += 1
-                    await asyncio.sleep(
-                        _retry_delay(
-                            self.initial_delay, self.backoff_factor, retry_count
-                        )
-                    )
-
-                except httpx.HTTPStatusError as error:
-                    if (
-                        error.response.status_code not in _RETRYABLE_STATUS_CODES
-                        or retry_count >= self.max_retries
-                    ):
-                        final_status = "http_error"
-                        final_retry_count = retry_count
-                        raise
-                    retry_count += 1
-                    await asyncio.sleep(
-                        _retry_delay(
-                            self.initial_delay,
-                            self.backoff_factor,
-                            retry_count,
-                            error.response,
-                        )
-                    )
+            # Every gateway failed. With one configured, re-raise its error
+            # unchanged so existing single-gateway callers keep seeing the exact
+            # httpx exception type they handle today.
+            if len(failures) == 1:
+                raise failures[0]
+            raise ExceptionGroup(
+                f"all {len(gateways)} gateways failed for CID {cid}", failures
+            )
         finally:
             instrumentation.end_cas_load(
                 trace_started_at,
-                byte_count=response_bytes,
-                retries=final_retry_count,
-                status=final_status,
+                byte_count=stats.response_bytes,
+                retries=stats.retries,
+                status=stats.status,
             )
-        raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
     # --------------------------------------------------------------------- #
     # pin_cid() - method to pin a CID                                       #
