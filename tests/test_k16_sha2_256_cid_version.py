@@ -18,6 +18,9 @@ CIDv0-representable -- was never affected, so it is asserted alongside as a
 control.
 """
 
+import os
+import warnings
+
 import httpx
 import pytest
 from multiformats import CID, multihash
@@ -157,3 +160,65 @@ async def test_hamt_roundtrips_under_sha2_256(create_ipfs: tuple[str, str]) -> N
         assert await read.len() == 64
         for index in range(64):
             assert await read.get(f"key-{index}") == index
+
+
+@pytest.mark.ipfs
+@pytest.mark.parametrize("hasher", ["sha2-256", "blake3"])
+async def test_payload_over_chunker_returns_dag_pb_and_warns(
+    create_ipfs: tuple[str, str], hasher: str
+) -> None:
+    """A payload larger than ``chunker`` still yields an unverifiable dag-pb CID.
+
+    ``cid-version=1`` only makes *leaf* blocks raw. Once the payload exceeds the
+    chunker size Kubo builds a UnixFS dag-pb tree, so the root block is the
+    protobuf node rather than the bytes handed in. The requested codec cannot be
+    applied and ``_cid_is_verifiable()`` skips dag-pb, so ``verify_content``
+    cannot check the object.
+
+    This is a pre-existing limitation, not a regression from the cid-version
+    fix, and it affects both hashers equally -- ``blake3`` is not special here.
+    The data still round-trips; only verification is unavailable. ``save()``
+    now warns instead of failing silently.
+    """
+    rpc, gw = create_ipfs
+    # Comfortably over the small chunker configured below.
+    payload = os.urandom(300_000)
+
+    async with KuboCAS(
+        hasher=hasher,
+        rpc_base_url=rpc,
+        gateway_base_url=gw,
+        chunker="size-65536",
+        verify_content=True,
+    ) as cas:
+        with pytest.warns(RuntimeWarning, match="dag-pb"):
+            cid = await cas.save(payload, codec="raw")
+
+        assert cid.codec.code == KuboCAS.DAG_PB_MARKER
+        assert not _cid_is_verifiable(cid, None, None)
+        # Data integrity is unaffected -- only verifiability is lost.
+        assert await cas.load(cid) == payload
+
+
+@pytest.mark.ipfs
+async def test_payload_under_chunker_stays_raw_and_verifiable(
+    create_ipfs: tuple[str, str],
+) -> None:
+    """The companion case: within the chunker, CIDs stay raw and checkable."""
+    rpc, gw = create_ipfs
+    payload = os.urandom(10_000)
+
+    async with KuboCAS(
+        hasher="sha2-256",
+        rpc_base_url=rpc,
+        gateway_base_url=gw,
+        chunker="size-65536",
+        verify_content=True,
+    ) as cas:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            cid = await cas.save(payload, codec="raw")
+
+        assert cid.codec.name == "raw"
+        assert _cid_is_verifiable(cid, None, None)
+        assert await cas.load(cid) == payload

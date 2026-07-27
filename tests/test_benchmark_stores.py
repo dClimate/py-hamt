@@ -29,10 +29,12 @@ Run:
     pytest tests/test_benchmark_stores.py --ipfs --benchmark-report -s
 """
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import httpx
 import numpy as np
 import pandas as pd
 import pytest
@@ -69,7 +71,13 @@ class BenchmarkResult:
 
     @property
     def shard_loads(self) -> float:
+        """Shard cache accesses, hits and misses together."""
         return self.counters.get("sharded_store.shard_cache.total", 0.0)
+
+    @property
+    def shard_fetches(self) -> float:
+        """Shard cache misses -- i.e. shards actually fetched over the network."""
+        return self.counters.get("sharded_store.shard_cache.miss", 0.0)
 
     @property
     def work_units(self) -> float:
@@ -188,6 +196,62 @@ def _appended_shape(ds: xr.Dataset) -> tuple[int, ...]:
     return tuple(size * 2 if dim == "time" else size for dim, size in ds.sizes.items())
 
 
+@dataclass
+class Tally:
+    """Request counts shared across per-loop transport instances."""
+
+    adds: int = 0
+    gets: int = 0
+    in_flight: int = 0
+    peak_in_flight: int = 0
+
+
+class CountingTransport(httpx.AsyncHTTPTransport):
+    """Wraps the real transport to count requests and observe parallelism.
+
+    Two things the ``instrumentation`` module cannot report:
+
+    * **Saves.** It records ``cas_load.*`` but has no save-side counters, so
+      ``/api/v0/add`` POSTs are invisible to it. Asserting on load counts would
+      say nothing about write amplification.
+    * **Concurrency.** Passing ``concurrency=N`` proves nothing unless something
+      observes how many requests are actually in flight at once.
+    """
+
+    def __init__(self, tally: Optional["Tally"] = None) -> None:
+        super().__init__()
+        # Counts live in a shared Tally so several transport instances -- one
+        # per event loop, since httpx clients are not loop-portable -- can
+        # aggregate into a single set of numbers.
+        self.tally = tally if tally is not None else Tally()
+
+    @property
+    def adds(self) -> int:
+        return self.tally.adds
+
+    @property
+    def gets(self) -> int:
+        return self.tally.gets
+
+    @property
+    def peak_in_flight(self) -> int:
+        return self.tally.peak_in_flight
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        tally = self.tally
+        if request.method == "POST" and "/api/v0/add" in request.url.path:
+            tally.adds += 1
+        else:
+            tally.gets += 1
+
+        tally.in_flight += 1
+        tally.peak_in_flight = max(tally.peak_in_flight, tally.in_flight)
+        try:
+            return await super().handle_async_request(request)
+        finally:
+            tally.in_flight -= 1
+
+
 # --------------------------------------------------------------------------
 # Benchmarks
 # --------------------------------------------------------------------------
@@ -199,8 +263,18 @@ async def test_benchmark_hamt_store(
     """Write-then-append-then-read through ZarrHAMTStore."""
     rpc, gateway = create_ipfs
     ds = hamt_dataset
+    n_chunks = math.prod(len(chunks) for chunks in ds.chunks.values())
+    tally = Tally()
 
-    async with KuboCAS(rpc_base_url=rpc, gateway_base_url=gateway) as cas:
+    async with KuboCAS(
+        rpc_base_url=rpc,
+        gateway_base_url=gateway,
+        # client_factory, not client: a user-supplied client is not reused
+        # across event loops, and the replacement would drop this transport
+        # (and with it the counts). A fresh transport per call keeps httpx's
+        # loop-bound state per-loop while the shared Tally aggregates counts.
+        client_factory=lambda: httpx.AsyncClient(transport=CountingTransport(tally)),
+    ) as cas:
         with _Phase("ZarrHAMTStore write+append") as phase:
             hamt = await HAMT.build(cas=cas, values_are_bytes=True)
             store = ZarrHAMTStore(hamt)
@@ -221,7 +295,17 @@ async def test_benchmark_hamt_store(
 
     xr.testing.assert_identical(xr.concat([ds, ds], dim="time"), actual)
 
-    assert write.cas_loads > 0, "write did no content-store work"
+    # Write amplification, bounded rather than merely non-zero. A two-pass write
+    # of this fixture currently costs 32 POSTs for 5 chunks -- chunk bodies plus
+    # metadata and interior HAMT nodes, which dominate at this size. The bound
+    # has ~50% headroom for tree-shape churn while still failing long before a
+    # per-chunk or per-node blowup.
+    max_adds = 48
+    assert 0 < tally.adds <= max_adds, (
+        f"{tally.adds} /api/v0/add POSTs for a two-pass write of "
+        f"{n_chunks} chunks (bound {max_adds}); writes are amplifying"
+    )
+
     assert read.cas_loads > 0, "read did no content-store work"
     # A clean local daemon should never need to retry.
     assert write.retries == 0
@@ -280,13 +364,17 @@ async def test_sharded_full_mode_read_batches_chunks_into_shard_fetches(
     is deliberately the opposite trade-off -- see
     ``test_sparse_mode_trades_scan_cost_for_point_read_latency``.
 
-    The dataset is deliberately larger than ``chunks_per_shard``; below that
-    threshold everything fits in one shard and the comparison proves nothing.
+    ``chunks_per_shard`` is set low enough to force several shards. With a
+    single shard the assertion below would hold even if every chunk triggered
+    its own fetch, so the multi-shard setup is what gives it teeth.
     """
     rpc, gateway = create_ipfs
-    # 100 time steps at a chunk of 5 => 80 chunks, comfortably above the
-    # chunks_per_shard=50 used below.
+    # 100 steps chunked by 5 along a single chunk of lat/lon => 20 chunks.
     ds = _make_dataset("temp", periods=100, time_chunk=5)
+    n_chunks = math.prod(len(chunks) for chunks in ds.chunks.values())
+    chunks_per_shard = 5
+    expected_shards = math.ceil(n_chunks / chunks_per_shard)
+    assert expected_shards > 1, "setup must span multiple shards to be meaningful"
 
     async with KuboCAS(rpc_base_url=rpc, gateway_base_url=gateway) as cas:
         hamt = await HAMT.build(cas=cas, values_are_bytes=True)
@@ -309,7 +397,7 @@ async def test_sharded_full_mode_read_batches_chunks_into_shard_fetches(
             read_only=False,
             array_shape=tuple(ds.sizes.values()),
             chunk_shape=_chunk_shape(ds),
-            chunks_per_shard=50,
+            chunks_per_shard=chunks_per_shard,
         )
         ds.to_zarr(store=sharded, mode="w")
         root_cid = await sharded.flush()
@@ -328,12 +416,15 @@ async def test_sharded_full_mode_read_batches_chunks_into_shard_fetches(
     # Both must return the same data, or the comparison is meaningless.
     xr.testing.assert_identical(hamt_result, sharded_result)
 
-    n_chunks = sum(len(chunks) for chunks in ds.chunks.values())
-
-    # The batching claim: a handful of shard fetches, not one per chunk.
-    assert 0 < sharded_read.shard_loads < n_chunks, (
-        f"{sharded_read.shard_loads:.0f} shard loads for ~{n_chunks} chunks; "
-        "full mode is supposed to batch chunk references into shard fetches"
+    # The batching claim, pinned to an exact count rather than a loose bound:
+    # each shard is fetched once and serves every chunk it covers. Asserted on
+    # misses (actual network fetches) rather than shard_cache.total, which also
+    # counts cache hits and so would not distinguish batching from per-chunk
+    # refetching that happened to be cached.
+    assert sharded_read.shard_fetches == expected_shards, (
+        f"{sharded_read.shard_fetches:.0f} shard fetches for {n_chunks} chunks "
+        f"across {expected_shards} shards; full mode should fetch each shard "
+        "exactly once and batch every chunk reference it covers"
     )
     # Batching should also mean no block is pulled twice.
     assert sharded_read.duplicate_requests == 0, (
@@ -457,9 +548,14 @@ async def test_benchmark_concurrency_levels(
 ) -> None:
     """Read throughput across concurrency settings (also covers issue #59).
 
-    Correctness must hold at every level, and the work done -- the number of
-    distinct blocks fetched -- must not depend on how many requests are allowed
-    in flight. Wall-clock is reported but not asserted on.
+    Correctness must hold at every level, the work done must not depend on how
+    many requests are allowed in flight, and -- measured via
+    ``CountingTransport`` -- the configured ceiling must actually be respected.
+    Without that last check the parametrization proves nothing: a ``KuboCAS``
+    that ignored the argument and serialized everything would still satisfy data
+    identity and a zero retry count at every level.
+
+    Wall-clock is reported but not asserted on.
     """
     rpc, gateway = create_ipfs
     ds = _make_dataset("temp", periods=40)
@@ -470,8 +566,12 @@ async def test_benchmark_concurrency_levels(
         await hamt.make_read_only()
         root = hamt.root_node_id
 
+    tally = Tally()
     async with KuboCAS(
-        rpc_base_url=rpc, gateway_base_url=gateway, concurrency=concurrency
+        rpc_base_url=rpc,
+        gateway_base_url=gateway,
+        concurrency=concurrency,
+        client_factory=lambda: httpx.AsyncClient(transport=CountingTransport(tally)),
     ) as cas:
         with _Phase(f"read @ concurrency={concurrency}") as phase:
             read_hamt = await HAMT.build(
@@ -486,3 +586,26 @@ async def test_benchmark_concurrency_levels(
     assert result.retries == 0, (
         f"concurrency={concurrency} forced {result.retries:.0f} retries"
     )
+
+    # The ceiling is honoured: never more requests in flight than configured.
+    assert tally.peak_in_flight <= concurrency, (
+        f"peak {tally.peak_in_flight} concurrent requests exceeded the "
+        f"configured concurrency={concurrency}"
+    )
+    if concurrency == 1:
+        # The floor case proves the semaphore is enforced at all: a peak of 1
+        # is only reachable if requests are genuinely serialized.
+        assert tally.peak_in_flight == 1, (
+            "concurrency=1 should serialize requests, but peak in-flight was "
+            f"{tally.peak_in_flight}"
+        )
+    else:
+        # Above the floor, prove requests actually overlap -- otherwise a
+        # KuboCAS that silently serialized everything would pass the ceiling
+        # check above. Not asserted equal to `concurrency`: this fixture only
+        # exposes ~4 independent fetches, so the limit is not the binding
+        # constraint at 8 or 32.
+        assert tally.peak_in_flight > 1, (
+            f"concurrency={concurrency} never ran two requests at once "
+            "(peak in-flight was 1); reads appear to be serialized"
+        )

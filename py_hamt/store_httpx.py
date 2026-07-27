@@ -1097,6 +1097,23 @@ class KuboCAS(ContentAddressedStore):
                 cid: CID = CID.decode(cid_str)
                 if cid.codec.code != self.DAG_PB_MARKER:
                     cid = cid.set(codec=codec)
+                elif self.verify_content:
+                    # Kubo splits payloads larger than ``chunker`` into a UnixFS
+                    # dag-pb tree, so the root block is the protobuf node rather
+                    # than the bytes handed in. The requested codec cannot be
+                    # applied (the digest would stop matching the block), and
+                    # _cid_is_verifiable() skips dag-pb, so verify_content
+                    # silently does nothing for this object. Warn rather than
+                    # fail: the data still round-trips correctly, and the
+                    # threshold depends on the caller's chunker setting.
+                    warnings.warn(
+                        f"Saved {len(data)} bytes exceeded the '{self.chunker}' "
+                        f"chunker, so Kubo returned a dag-pb CID ({cid}). "
+                        "Content verification is not possible for this object; "
+                        "raise the chunker size to keep payloads in one block.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 return cid
 
             except httpx.RequestError:
