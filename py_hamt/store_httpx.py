@@ -3,11 +3,13 @@ import logging
 import random
 import re
 import threading
+import time
 import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, Literal, Optional, Tuple, cast
+from urllib.parse import urlsplit
 
 import httpx
 from dag_cbor.ipld import IPLDKind
@@ -31,6 +33,18 @@ _MAX_RETRY_AFTER_SECONDS = 300.0
 _GATEWAY_FAILURE_THRESHOLD = 3
 _GATEWAY_COOLDOWN_SECONDS = 30.0
 
+# Request headers that carry credentials. When a read falls over to a gateway
+# on a different origin than the one the credentials were configured for, these
+# are stripped: a token minted for a private gateway must not be handed to a
+# public fallback simply because the private one returned 503.
+_SENSITIVE_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
+
+
+def _origin_of(url: str) -> tuple[str, str, int | None]:
+    """Scheme/host/port triple used to decide if two URLs share an origin."""
+    parsed = urlsplit(url)
+    return (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port)
+
 
 def _normalize_gateway_base_url(gateway_base_url: str) -> str:
     """Normalize a gateway base URL to a ``.../ipfs/`` prefix.
@@ -53,8 +67,11 @@ class _GatewayHealth:
     ``_GATEWAY_COOLDOWN_SECONDS`` elapse, after which ordinary traffic probes it
     again. Any success resets the counter.
 
-    The event-loop clock is read lazily so instances remain constructible
-    outside async context; a gateway that has never been used is healthy.
+    Times are ``time.monotonic()`` readings. That clock is process-wide, so a
+    trip recorded while one event loop is running stays comparable from another
+    -- unlike ``loop.time()``, whose epoch is only meaningful within a single
+    loop and would make the cooldown expire instantly or never once this shared
+    state is touched from a second loop.
     """
 
     __slots__ = ("consecutive_failures", "tripped_at")
@@ -150,28 +167,51 @@ def _cid_is_verifiable(cid: CID, offset: Optional[int], suffix: Optional[int]) -
     """
     if offset is not None or suffix is not None:
         return False
-    if cid.codec.code == KuboCAS.DAG_PB_MARKER:
-        return False
-    # An identity multihash inlines its content in the CID; nothing was fetched.
-    return cid.hashfun.name != "identity"
+    # An identity multihash inlines the block in the CID, but load() still
+    # fetches and returns whatever the gateway sends, so the response is
+    # verifiable -- by direct comparison rather than rehashing.
+    return cid.codec.code != KuboCAS.DAG_PB_MARKER
 
 
 def _verify_cid_content(cid: CID, data: bytes) -> None:
     """Raise ``GatewayContentMismatch`` if ``data`` does not hash to ``cid``.
 
-    A hash function the local ``multiformats`` build cannot compute is not a
-    mismatch; we cannot prove the content wrong, so the read is allowed through.
+    An ``identity`` multihash inlines the block in the CID itself, so the bytes
+    are compared directly rather than rehashed.
+
+    The digest is computed at the CID's own digest length. That is required for
+    correctness in both directions: variable-output functions (blake3, the
+    default hasher here) *reject* a call that omits the size, and a legitimately
+    truncated digest would never match one computed at full length.
+
+    Verification is skipped only when the local ``multiformats`` build cannot
+    compute the function at all -- we cannot prove the content wrong, so the
+    read is allowed through with a warning. That path must stay narrow: silently
+    skipping is indistinguishable from passing, which would make
+    ``verify_content`` worthless exactly when it matters.
     """
+    raw_digest = bytes(cid.raw_digest)
+    if cid.hashfun.name == "identity":
+        # Nothing was hashed: the CID carries the content verbatim.
+        if data != raw_digest:
+            raise GatewayContentMismatch(
+                f"gateway returned {len(data)} bytes that do not match the "
+                f"content inlined in identity CID {cid}"
+            )
+        return
+
     try:
-        computed = multihash.digest(data, cid.hashfun.name)
+        computed = multihash.digest(data, cid.hashfun.name, size=len(raw_digest))
     except Exception:  # pragma: no cover - depends on multiformats build
-        logger.debug(
-            "Cannot verify CID %s: unsupported hash function %s",
+        logger.warning(
+            "Cannot verify CID %s: local multiformats cannot compute %s at "
+            "%d bytes; returning unverified gateway content",
             cid,
             cid.hashfun.name,
+            len(raw_digest),
         )
         return
-    if computed != cid.digest:
+    if bytes(multihash.unwrap(computed)) != raw_digest:
         raise GatewayContentMismatch(
             f"gateway returned {len(data)} bytes that do not hash to {cid}"
         )
@@ -468,6 +508,9 @@ class KuboCAS(ContentAddressedStore):
       gateways you do not control. Only full-body reads of non-`dag-pb` CIDs
       can be verified; Range reads and `dag-pb` reads are passed through
       unchecked because neither returns the exact bytes the CID commits to.
+      Credentials are never sent to a gateway outside the origin of
+      `gateway_base_url`/`rpc_base_url`, so a private primary can safely be
+      paired with public fallbacks.
     - **chunker** (str): chunking algorithm specification for Kubo's `add`
       RPC. Accepted formats are `"size-<positive int>"`, `"rabin"`, or
       `"rabin-<min>-<avg>-<max>"`.
@@ -611,6 +654,14 @@ class KuboCAS(ContentAddressedStore):
         self.gateway_base_url: str = self.gateway_base_urls[0]
         """@private"""
 
+        # Origins the caller's credentials were configured for: the primary
+        # gateway and the RPC endpoint. Reads to any other gateway drop
+        # credentialed headers and client auth (see _load_from_gateway).
+        self._credentialed_origins: set[tuple[str, str, int | None]] = {
+            _origin_of(self.gateway_base_url),
+            _origin_of(rpc_base_url),
+        }
+
         self.verify_content: bool = verify_content
         """@private"""
         # Health is per gateway but shared across event loops: a gateway that is
@@ -740,7 +791,7 @@ class KuboCAS(ContentAddressedStore):
         if len(self.gateway_base_urls) == 1:
             return self.gateway_base_urls
 
-        now = asyncio.get_running_loop().time()
+        now = time.monotonic()
         # is_healthy() clears an expired trip, so evaluate it exactly once per
         # gateway rather than inside a sort key, which may call it repeatedly.
         ranks: Dict[str, tuple[int, int]] = {}
@@ -1011,16 +1062,46 @@ class KuboCAS(ContentAddressedStore):
         Raises on failure so the caller can fail over. ``stats`` accumulates the
         byte count and retry total across every gateway attempted, so the trace
         emitted by ``load`` reflects the whole operation rather than the last leg.
+
+        Credentials configured for the primary gateway or the RPC endpoint are
+        stripped when this gateway is on a different origin, so failing over to
+        a public fallback cannot disclose a private gateway's token.
         """
         url = f"{gateway_base_url}{cid}"
         client = self._loop_client()
         semaphore = self._gateway_semaphore(gateway_base_url)
         retry_count = 0
 
+        # httpx merges client-level headers into every request and offers no way
+        # to drop one per-request (Client._merge_headers starts from
+        # self.headers and only update()s, so an omitted or blanked entry is
+        # reinstated). Building the Request explicitly and calling send()
+        # bypasses that merge, which is the only reliable way to withhold a
+        # credential from a foreign origin.
+        strip_credentials = (
+            _origin_of(gateway_base_url) not in self._credentialed_origins
+        )
+        request: httpx.Request | None = None
+        if strip_credentials:
+            safe_headers = {
+                name: value
+                for name, value in client.headers.items()
+                if name.lower() not in _SENSITIVE_HEADERS
+            }
+            safe_headers.update(headers)
+            request = httpx.Request("GET", url, headers=safe_headers)
+
         while retry_count <= self.max_retries:
             try:
                 async with semaphore:  # Throttle each gateway attempt
-                    response = await client.get(url, headers=headers or None)
+                    if request is not None:
+                        # auth=None also suppresses client-level httpx.Auth,
+                        # which would otherwise re-add an Authorization header.
+                        response = await client.send(
+                            request, auth=None, follow_redirects=client.follow_redirects
+                        )
+                    else:
+                        response = await client.get(url, headers=headers or None)
                 # An unsatisfiable range is answered with 416 by a compliant
                 # gateway; return b"" to match Python-slice semantics (and
                 # InMemoryCAS) instead of raising.
@@ -1060,7 +1141,11 @@ class KuboCAS(ContentAddressedStore):
                     # A mismatch means this gateway served wrong bytes. Raising
                     # here routes it through the caller's failover path like any
                     # other per-gateway failure.
-                    _verify_cid_content(cid, content)
+                    try:
+                        _verify_cid_content(cid, content)
+                    except GatewayContentMismatch:
+                        stats.status = "content_mismatch"
+                        raise
                 return content
 
             except httpx.RequestError:
@@ -1149,7 +1234,7 @@ class KuboCAS(ContentAddressedStore):
                         gateway_base_url, cid, headers, offset, length, suffix, stats
                     )
                 except (httpx.HTTPError, GatewayContentMismatch) as error:
-                    health.record_failure(asyncio.get_running_loop().time())
+                    health.record_failure(time.monotonic())
                     failures.append(error)
                     if len(gateways) > 1:
                         logger.debug(

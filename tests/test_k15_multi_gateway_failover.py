@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,8 @@ class FakeGateway:
 
     url: str
     hits: list[str] = field(default_factory=list)
+    # Lower-cased request headers, one dict per request served.
+    headers_seen: list[dict[str, str]] = field(default_factory=list)
     # Set by tests to control responses; returns (status, body).
     responder: Callable[[str], tuple[int, bytes]] = lambda _cid: (200, BODY)
     max_concurrent: int = 0
@@ -46,6 +49,11 @@ def _serve(gateway_holder: list[FakeGateway]) -> Iterator[FakeGateway]:
             cid = self.path.rsplit("/", 1)[-1].split("?", 1)[0]
             with gw._lock:
                 gw.hits.append(cid)
+                # Header names are case-insensitive on the wire; normalize so
+                # assertions cannot pass or fail on casing alone.
+                gw.headers_seen.append({
+                    name.lower(): value for name, value in self.headers.items()
+                })
                 gw._inflight += 1
                 gw.max_concurrent = max(gw.max_concurrent, gw._inflight)
             try:
@@ -297,9 +305,21 @@ async def test_recovered_gateway_resumes_priority(
         assert await cas.load(GOOD_CID) == BODY
         health = cas._gateway_health[cas.gateway_base_urls[0]]
         assert health.consecutive_failures == 0
-        # A further failure does not immediately trip a stale counter.
-        assert await cas.load(GOOD_CID) == BODY
+
+        # Loads 1 and 2 failed over; load 3 was served by A itself.
         assert len(gateway_b.hits) == 2
+
+        # A further failure must not trip the breaker on a stale count: the
+        # reset means this is failure 1 of 3, not 3 of 3.
+        responses.append((500, b""))
+        assert await cas.load(GOOD_CID) == BODY
+        assert len(gateway_b.hits) == 3, "load 4 should have failed over"
+        assert health.consecutive_failures == 1
+        assert health.tripped_at is None, "breaker tripped on a stale count"
+
+        # Untripped, A stays in the rotation and serves the next read itself.
+        assert await cas.load(GOOD_CID) == BODY
+        assert len(gateway_b.hits) == 3, "A should have served this without failover"
 
 
 @pytest.mark.asyncio
@@ -484,6 +504,257 @@ async def test_range_reads_are_not_verified(gateway_a: FakeGateway) -> None:
         assert await cas.load(GOOD_CID, offset=0, length=5) == BODY[:5]
 
 
+@pytest.mark.asyncio
+async def test_failed_load_is_not_traced_as_a_success(
+    gateway_a: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raised load must not be recorded as ``status="ok"``.
+
+    Verification runs outside the ``except`` blocks that set a failure status,
+    so without an explicit assignment a mismatch would raise to the caller
+    while the trace reported success.
+    """
+    seen: list[str] = []
+    original = store_module.instrumentation.end_cas_load
+
+    def spy(trace: object, *, byte_count: int, retries: int, status: str) -> None:
+        seen.append(status)
+        return original(trace, byte_count=byte_count, retries=retries, status=status)
+
+    monkeypatch.setattr(store_module.instrumentation, "end_cas_load", spy)
+    gateway_a.responder = lambda _cid: (200, b"corrupted payload")
+
+    async with make_cas(gateway_a, verify_content=True, max_retries=0) as cas:
+        with pytest.raises(GatewayContentMismatch):
+            await cas.load(GOOD_CID)
+
+    assert seen == ["content_mismatch"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_after_a_failed_gateway_traces_as_success(
+    gateway_a: FakeGateway, gateway_b: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed leg followed by a successful one is one successful load."""
+    seen: list[str] = []
+    original = store_module.instrumentation.end_cas_load
+
+    def spy(trace: object, *, byte_count: int, retries: int, status: str) -> None:
+        seen.append(status)
+        return original(trace, byte_count=byte_count, retries=retries, status=status)
+
+    monkeypatch.setattr(store_module.instrumentation, "end_cas_load", spy)
+    gateway_a.responder = lambda _cid: (500, b"")
+
+    async with make_cas(gateway_a, gateway_b, max_retries=0) as cas:
+        assert await cas.load(GOOD_CID) == BODY
+
+    assert seen == ["ok"]
+
+
+def test_gateway_health_uses_a_process_wide_clock() -> None:
+    """Health must be timed by a process-wide clock, not a per-loop one.
+
+    ``_gateway_health`` is shared across event loops, so a trip recorded under
+    one loop is later compared against a reading taken under another.
+    ``asyncio`` documents ``loop.time()`` as having an epoch that "may differ
+    per event loop", so pairing it with this shared state would make the
+    cooldown expire instantly or never.
+
+    CPython's default loop happens to implement ``time()`` as
+    ``time.monotonic()``, which would hide the bug, so this pins the property
+    against a loop whose epoch genuinely differs -- exactly what a custom or
+    uvloop-style event loop is permitted to do.
+    """
+    cas = KuboCAS(
+        gateway_base_urls=["http://127.0.0.1:1", "http://127.0.0.1:2"],
+        rpc_base_url="http://127.0.0.1:1",
+    )
+    tripped_url = cas.gateway_base_urls[0]
+    health = cas._gateway_health[tripped_url]
+    for _ in range(store_module._GATEWAY_FAILURE_THRESHOLD):
+        health.record_failure(time.monotonic())
+    assert health.tripped_at is not None
+
+    class SkewedEpochLoop(asyncio.SelectorEventLoop):
+        """A conforming loop whose clock epoch is far from ``monotonic()``."""
+
+        def time(self) -> float:
+            # Legal per the asyncio contract: monotonic, unspecified epoch.
+            return time.monotonic() + 1_000_000.0
+
+    loop = SkewedEpochLoop()
+    try:
+        ordering = loop.run_until_complete(_ordered_on(cas))
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+    # Under loop.time() the trip would look ~1e6 seconds old and the cooldown
+    # long expired, floating the dead gateway back to the front.
+    assert ordering == [cas.gateway_base_urls[1], tripped_url], (
+        "cooldown must not be measured against a per-loop clock epoch"
+    )
+
+
+async def _ordered_on(cas: KuboCAS) -> list[str]:
+    return cas._ordered_gateways()
+
+
+# --------------------------------------------------------------------------- #
+# credential scoping                                                           #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_credentials_are_not_leaked_to_a_fallback_gateway(
+    gateway_a: FakeGateway, gateway_b: FakeGateway
+) -> None:
+    """A private gateway's token must not reach a public fallback.
+
+    Credentials live on the shared httpx client, so without explicit scoping a
+    503 from the private gateway would hand its bearer token to whatever
+    gateway is next in the rotation.
+    """
+    gateway_a.responder = lambda _cid: (503, b"")
+
+    async with make_cas(
+        gateway_a,
+        gateway_b,
+        max_retries=0,
+        headers={"Authorization": "Bearer SECRET", "X-Trace": "keepme"},
+    ) as cas:
+        assert await cas.load(GOOD_CID) == BODY
+
+    primary = gateway_a.headers_seen[0]
+    fallback = gateway_b.headers_seen[0]
+    assert primary["authorization"] == "Bearer SECRET"
+    assert "authorization" not in fallback, "credential leaked to fallback gateway"
+    # Only credentialed headers are dropped; ordinary ones still travel.
+    assert fallback["x-trace"] == "keepme"
+
+
+@pytest.mark.asyncio
+async def test_credentials_are_withheld_on_every_retry_to_a_foreign_origin(
+    gateway_a: FakeGateway, gateway_b: FakeGateway
+) -> None:
+    """Retries against the fallback must not re-add the credential."""
+    gateway_a.responder = lambda _cid: (503, b"")
+    attempts = {"n": 0}
+
+    def flaky(_cid: str) -> tuple[int, bytes]:
+        attempts["n"] += 1
+        return (200, BODY) if attempts["n"] > 2 else (503, b"")
+
+    gateway_b.responder = flaky
+
+    async with make_cas(
+        gateway_a,
+        gateway_b,
+        max_retries=2,
+        headers={"Authorization": "Bearer SECRET"},
+    ) as cas:
+        assert await cas.load(GOOD_CID) == BODY
+
+    assert len(gateway_b.headers_seen) == 3
+    assert all("authorization" not in seen for seen in gateway_b.headers_seen)
+
+
+@pytest.mark.asyncio
+async def test_client_level_auth_is_also_withheld(
+    gateway_a: FakeGateway, gateway_b: FakeGateway
+) -> None:
+    """``auth=`` builds an httpx.Auth flow, which must not run on a fallback."""
+    gateway_a.responder = lambda _cid: (503, b"")
+
+    async with make_cas(
+        gateway_a, gateway_b, max_retries=0, auth=("user", "hunter2")
+    ) as cas:
+        assert await cas.load(GOOD_CID) == BODY
+
+    assert "authorization" in gateway_a.headers_seen[0]
+    assert "authorization" not in gateway_b.headers_seen[0]
+
+
+@pytest.mark.asyncio
+async def test_credentials_are_kept_for_a_same_origin_gateway(
+    gateway_a: FakeGateway,
+) -> None:
+    """Scoping must not strip credentials from the gateway they belong to."""
+    async with make_cas(gateway_a, headers={"Authorization": "Bearer SECRET"}) as cas:
+        assert await cas.load(GOOD_CID) == BODY
+
+    assert gateway_a.headers_seen[0]["authorization"] == "Bearer SECRET"
+
+
+# --------------------------------------------------------------------------- #
+# digest computation                                                           #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_blake3_cids_are_actually_verified(gateway_a: FakeGateway) -> None:
+    """blake3 is this library's default hasher and must not skip verification.
+
+    ``multihash.digest`` *raises* for variable-output functions when no size is
+    given, so computing at the default length would send every blake3 check
+    into the unsupported-function path and silently accept substituted content.
+    """
+    body = b"blake3 addressed block"
+    cid = CID("base32", 1, "raw", multihash.digest(body, "blake3", size=32))
+    gateway_a.responder = lambda _cid: (200, b"substituted by the gateway")
+
+    async with make_cas(gateway_a, verify_content=True, max_retries=0) as cas:
+        with pytest.raises(GatewayContentMismatch):
+            await cas.load(cid)
+
+    gateway_a.responder = lambda _cid: (200, body)
+    async with make_cas(gateway_a, verify_content=True) as cas:
+        assert await cas.load(cid) == body
+
+
+@pytest.mark.asyncio
+async def test_truncated_digests_are_verified_at_their_own_length(
+    gateway_a: FakeGateway,
+) -> None:
+    """A legitimately truncated digest must not be rejected as a mismatch."""
+    body = b"truncated digest block"
+    cid = CID("base32", 1, "raw", multihash.digest(body, "sha2-256", size=20))
+    assert len(bytes(cid.raw_digest)) == 20
+
+    gateway_a.responder = lambda _cid: (200, body)
+    async with make_cas(gateway_a, verify_content=True) as cas:
+        assert await cas.load(cid) == body, "correct content rejected"
+
+    gateway_a.responder = lambda _cid: (200, b"wrong")
+    async with make_cas(gateway_a, verify_content=True, max_retries=0) as cas:
+        with pytest.raises(GatewayContentMismatch):
+            await cas.load(cid)
+
+
+@pytest.mark.asyncio
+async def test_identity_cids_are_verified_against_inlined_content(
+    gateway_a: FakeGateway,
+) -> None:
+    """load() returns gateway bytes for identity CIDs, so they must be checked.
+
+    The content is inlined in the CID itself, so a mismatch is provable by
+    direct comparison -- skipping it would let a gateway substitute content
+    that the caller could have validated locally.
+    """
+    body = b"inlined block"
+    cid = CID("base32", 1, "raw", multihash.digest(body, "identity"))
+
+    gateway_a.responder = lambda _cid: (200, b"substituted")
+    async with make_cas(gateway_a, verify_content=True, max_retries=0) as cas:
+        with pytest.raises(GatewayContentMismatch, match="inlined"):
+            await cas.load(cid)
+
+    gateway_a.responder = lambda _cid: (200, body)
+    async with make_cas(gateway_a, verify_content=True) as cas:
+        assert await cas.load(cid) == body
+
+
 def test_dag_pb_cids_are_not_verifiable() -> None:
     """Gateways return reassembled UnixFS files for dag-pb, not the block."""
     dag_pb_cid = CID("base32", 1, "dag-pb", multihash.digest(BODY, "sha2-256"))
@@ -491,6 +762,11 @@ def test_dag_pb_cids_are_not_verifiable() -> None:
     assert store_module._cid_is_verifiable(GOOD_CID, None, None)
     assert not store_module._cid_is_verifiable(GOOD_CID, 0, None)
     assert not store_module._cid_is_verifiable(GOOD_CID, None, 4)
+
+    # Identity CIDs inline their content but load() still returns gateway
+    # bytes, so the response is verifiable by direct comparison.
+    identity_cid = CID("base32", 1, "raw", multihash.digest(BODY, "identity"))
+    assert store_module._cid_is_verifiable(identity_cid, None, None)
 
 
 def test_unsupported_hash_function_is_not_a_mismatch(
