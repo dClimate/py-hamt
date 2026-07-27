@@ -713,7 +713,19 @@ class KuboCAS(ContentAddressedStore):
             self.gateway_base_urls = [_normalize_gateway_base_url(gateway_base_url)]
 
         pin_string: str = "true" if pin_on_add else "false"
-        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pin_string}"
+        # cid-version=1 is required, not cosmetic. Kubo returns a CIDv0 for any
+        # add that does not ask for v1, and a CIDv0 is dag-pb by definition --
+        # so with sha2-256 (a CIDv0-representable hasher) the daemon would wrap
+        # the payload in a UnixFS dag-pb node and hand back Qm... regardless of
+        # the codec this store asked for. That breaks two things:
+        #   * save() cannot relabel the CID's codec, because the stored block is
+        #     the protobuf wrapper rather than the bytes passed in, so the digest
+        #     would no longer match the block.
+        #   * _cid_is_verifiable() declines to check dag-pb responses, so
+        #     verify_content would silently pass every block through unverified.
+        # Requesting v1 makes Kubo store the raw bytes under the codec asked
+        # for, which is what blake3 (not CIDv0-representable) already got.
+        self.rpc_url: str = f"{rpc_base_url}/api/v0/add?hash={self.hasher}&chunker={self.chunker}&pin={pin_string}&cid-version=1"
         """@private"""
         self.gateway_base_url: str = self.gateway_base_urls[0]
         """@private"""
