@@ -14,6 +14,7 @@ from multiformats import CID, multihash
 
 from py_hamt import GatewayContentMismatch, KuboCAS
 from py_hamt import store_httpx as store_module
+from py_hamt.instrumentation import TraceContext
 
 BODY = b"multi gateway body"
 # raw + sha2-256 CID over BODY, so verify_content can check it for real.
@@ -517,7 +518,9 @@ async def test_failed_load_is_not_traced_as_a_success(
     seen: list[str] = []
     original = store_module.instrumentation.end_cas_load
 
-    def spy(trace: object, *, byte_count: int, retries: int, status: str) -> None:
+    def spy(
+        trace: TraceContext | None, *, byte_count: int, retries: int, status: str
+    ) -> None:
         seen.append(status)
         return original(trace, byte_count=byte_count, retries=retries, status=status)
 
@@ -539,7 +542,9 @@ async def test_recovery_after_a_failed_gateway_traces_as_success(
     seen: list[str] = []
     original = store_module.instrumentation.end_cas_load
 
-    def spy(trace: object, *, byte_count: int, retries: int, status: str) -> None:
+    def spy(
+        trace: TraceContext | None, *, byte_count: int, retries: int, status: str
+    ) -> None:
         seen.append(status)
         return original(trace, byte_count=byte_count, retries=retries, status=status)
 
@@ -617,21 +622,30 @@ async def test_credentials_are_not_leaked_to_a_fallback_gateway(
     gateway is next in the rotation.
     """
     gateway_a.responder = lambda _cid: (503, b"")
+    # KuboCAS documents arbitrary headers as a way to authenticate, so a
+    # credential can carry any name. A denylist of well-known header names
+    # would forward every one of these but the first.
+    secrets = {
+        "Authorization": "Bearer SECRET",
+        "Cookie": "session=abc",
+        "X-API-Key": "key-123",
+        "X-Auth-Token": "token-456",
+        "X-Custom-Corp-Secret": "nobody-guesses-this",
+    }
 
-    async with make_cas(
-        gateway_a,
-        gateway_b,
-        max_retries=0,
-        headers={"Authorization": "Bearer SECRET", "X-Trace": "keepme"},
-    ) as cas:
+    async with make_cas(gateway_a, gateway_b, max_retries=0, headers=secrets) as cas:
         assert await cas.load(GOOD_CID) == BODY
 
     primary = gateway_a.headers_seen[0]
     fallback = gateway_b.headers_seen[0]
-    assert primary["authorization"] == "Bearer SECRET"
-    assert "authorization" not in fallback, "credential leaked to fallback gateway"
-    # Only credentialed headers are dropped; ordinary ones still travel.
-    assert fallback["x-trace"] == "keepme"
+    for name, value in secrets.items():
+        assert primary[name.lower()] == value, f"{name} lost on its own gateway"
+        assert name.lower() not in fallback, f"{name} leaked to fallback gateway"
+
+    # The fallback still gets ordinary content negotiation, and a Host derived
+    # from its own URL rather than the primary's.
+    assert "accept" in fallback
+    assert fallback["host"] not in gateway_a.url
 
 
 @pytest.mark.asyncio
@@ -652,12 +666,14 @@ async def test_credentials_are_withheld_on_every_retry_to_a_foreign_origin(
         gateway_a,
         gateway_b,
         max_retries=2,
-        headers={"Authorization": "Bearer SECRET"},
+        headers={"Authorization": "Bearer SECRET", "X-API-Key": "key-123"},
     ) as cas:
         assert await cas.load(GOOD_CID) == BODY
 
     assert len(gateway_b.headers_seen) == 3
-    assert all("authorization" not in seen for seen in gateway_b.headers_seen)
+    for seen in gateway_b.headers_seen:
+        assert "authorization" not in seen
+        assert "x-api-key" not in seen
 
 
 @pytest.mark.asyncio
@@ -674,6 +690,31 @@ async def test_client_level_auth_is_also_withheld(
 
     assert "authorization" in gateway_a.headers_seen[0]
     assert "authorization" not in gateway_b.headers_seen[0]
+
+
+def test_forwardable_headers_is_an_allowlist_of_non_credentials() -> None:
+    """The forwarding rule must be allow-by-name, not deny-by-name.
+
+    A denylist cannot work here: a credential may use any header name, so
+    anything not explicitly known to be safe must be dropped. ``Host`` is
+    excluded too -- it is derived from the target URL, and forwarding the
+    primary's value would misroute the fallback.
+    """
+    assert store_module._FORWARDABLE_HEADERS == frozenset({
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "user-agent",
+    })
+    for credential_name in (
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+        "x-auth-token",
+        "host",
+    ):
+        assert credential_name not in store_module._FORWARDABLE_HEADERS
 
 
 @pytest.mark.asyncio

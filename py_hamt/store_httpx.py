@@ -33,11 +33,22 @@ _MAX_RETRY_AFTER_SECONDS = 300.0
 _GATEWAY_FAILURE_THRESHOLD = 3
 _GATEWAY_COOLDOWN_SECONDS = 30.0
 
-# Request headers that carry credentials. When a read falls over to a gateway
-# on a different origin than the one the credentials were configured for, these
-# are stripped: a token minted for a private gateway must not be handed to a
-# public fallback simply because the private one returned 503.
-_SENSITIVE_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
+# Headers forwarded to a gateway outside the credentialed origin. This is an
+# allowlist, not a denylist: KuboCAS documents arbitrary headers as a supported
+# way to authenticate ("set whatever headers ... they need"), so any header the
+# caller configured may be a credential -- ``X-API-Key`` and ``X-Auth-Token``
+# name themselves, but a bearer token can live under any name at all. Only
+# httpx's own content-negotiation defaults are safe to send to a foreign
+# gateway; anything else is dropped rather than guessed about.
+#
+# ``Host`` is deliberately absent: it is derived from the request URL, and
+# forwarding the primary's value would misroute the fallback request.
+_FORWARDABLE_HEADERS = frozenset({
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "user-agent",
+})
 
 
 def _origin_of(url: str) -> tuple[str, str, int | None]:
@@ -508,9 +519,13 @@ class KuboCAS(ContentAddressedStore):
       gateways you do not control. Only full-body reads of non-`dag-pb` CIDs
       can be verified; Range reads and `dag-pb` reads are passed through
       unchecked because neither returns the exact bytes the CID commits to.
-      Credentials are never sent to a gateway outside the origin of
-      `gateway_base_url`/`rpc_base_url`, so a private primary can safely be
-      paired with public fallbacks.
+      Requests to a gateway outside the origin of
+      `gateway_base_url`/`rpc_base_url` forward only content-negotiation
+      headers (`Accept`, `Accept-Encoding`, `Accept-Language`, `User-Agent`)
+      and drop client-level `auth`. Because any header name may carry a
+      credential, everything else is withheld -- so a private primary can
+      safely be paired with public fallbacks, but a foreign gateway that needs
+      its own custom header will not receive one.
     - **chunker** (str): chunking algorithm specification for Kubo's `add`
       RPC. Accepted formats are `"size-<positive int>"`, `"rabin"`, or
       `"rabin-<min>-<avg>-<max>"`.
@@ -1086,8 +1101,10 @@ class KuboCAS(ContentAddressedStore):
             safe_headers = {
                 name: value
                 for name, value in client.headers.items()
-                if name.lower() not in _SENSITIVE_HEADERS
+                if name.lower() in _FORWARDABLE_HEADERS
             }
+            # Range headers are computed by load() for this request, never
+            # caller-supplied credentials, so they are always safe to send.
             safe_headers.update(headers)
             request = httpx.Request("GET", url, headers=safe_headers)
 
