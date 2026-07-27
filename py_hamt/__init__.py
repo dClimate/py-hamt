@@ -6,13 +6,19 @@ from .sharded_zarr_store import (
     ShardedZarrV1DeprecationWarning,
     ShardReadMode,
 )
-from .store_httpx import ContentAddressedStore, InMemoryCAS, KuboCAS
+from .store_httpx import (
+    ContentAddressedStore,
+    GatewayContentMismatch,
+    InMemoryCAS,
+    KuboCAS,
+)
 from .zarr_hamt_store import ZarrHAMTStore
 
 __all__ = [
     "blake3_hashfn",
     "HAMT",
     "ContentAddressedStore",
+    "GatewayContentMismatch",
     "InMemoryCAS",
     "KuboCAS",
     "ZarrHAMTStore",
