@@ -31,6 +31,8 @@ class FakeGateway:
     headers_seen: list[dict[str, str]] = field(default_factory=list)
     # Set by tests to control responses; returns (status, body).
     responder: Callable[[str], tuple[int, bytes]] = lambda _cid: (200, BODY)
+    # When the responder returns a 3xx, redirect here (the CID is appended).
+    redirect_to: str | None = None
     max_concurrent: int = 0
     _inflight: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -63,6 +65,8 @@ def _serve(gateway_holder: list[FakeGateway]) -> Iterator[FakeGateway]:
                 with gw._lock:
                     gw._inflight -= 1
             self.send_response(status)
+            if 300 <= status < 400 and gw.redirect_to:
+                self.send_header("Location", f"{gw.redirect_to}{cid}")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if body:
@@ -354,6 +358,60 @@ def test_health_cooldown_leaves_gateway_on_probation() -> None:
     assert health.is_healthy(now=store_module._GATEWAY_COOLDOWN_SECONDS + 1.0)
     health.record_failure(now=store_module._GATEWAY_COOLDOWN_SECONDS + 1.0)
     assert not health.is_healthy(now=store_module._GATEWAY_COOLDOWN_SECONDS + 1.0)
+
+
+def test_only_one_probe_is_admitted_after_cooldown() -> None:
+    """Half-open, not merely time-based.
+
+    Clearing the trip on a timer would let every concurrent load through at
+    once and dogpile a gateway that is still down. Exactly one caller gets a
+    probe slot; the rest stay deprioritized until it reports back.
+    """
+    health = store_module._GatewayHealth()
+    for _ in range(store_module._GATEWAY_FAILURE_THRESHOLD):
+        health.record_failure(now=0.0)
+    after = store_module._GATEWAY_COOLDOWN_SECONDS + 1.0
+
+    assert health.is_healthy(now=after), "the first caller should get the probe"
+    assert [health.is_healthy(now=after) for _ in range(8)] == [False] * 8
+
+    # A failed probe keeps it tripped without re-crossing the threshold.
+    health.record_failure(now=after)
+    assert not health.is_healthy(now=after + 1.0)
+
+    # A successful probe restores it for everyone.
+    later = after + store_module._GATEWAY_COOLDOWN_SECONDS + 1.0
+    assert health.is_healthy(now=later)
+    health.record_success()
+    assert all(health.is_healthy(now=later) for _ in range(5))
+
+
+@pytest.mark.asyncio
+async def test_unused_probe_claim_is_released(
+    gateway_a: FakeGateway, gateway_b: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gateway ranked but never tried must not keep its probe slot.
+
+    Ranking claims the slot, but the loop stops at the first success, so a
+    lower-ranked gateway is usually never attempted. Without releasing the
+    claim it would never report back and would be locked out forever.
+    """
+    monkeypatch.setattr(store_module, "_GATEWAY_COOLDOWN_SECONDS", 0.0)
+
+    async with make_cas(gateway_a, gateway_b, max_retries=0) as cas:
+        health_b = cas._gateway_health[cas.gateway_base_urls[1]]
+        for _ in range(store_module._GATEWAY_FAILURE_THRESHOLD):
+            health_b.record_failure(time.monotonic())
+
+        # gateway_a serves this, so gateway_b is ranked but never attempted.
+        assert await cas.load(GOOD_CID) == BODY
+        assert gateway_b.hits == []
+        assert not health_b.probe_in_flight, "probe slot leaked on an unused gateway"
+
+        # gateway_b is therefore still reachable on a later read.
+        gateway_a.responder = lambda _cid: (500, b"")
+        assert await cas.load(GOOD_CID) == BODY
+        assert len(gateway_b.hits) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -692,6 +750,95 @@ async def test_client_level_auth_is_also_withheld(
     assert "authorization" not in gateway_b.headers_seen[0]
 
 
+@pytest.mark.asyncio
+async def test_redirect_to_a_foreign_origin_does_not_carry_credentials(
+    gateway_a: FakeGateway, gateway_b: FakeGateway
+) -> None:
+    """A gateway must not be able to harvest credentials via a redirect.
+
+    httpx's own redirect handling strips only ``Authorization`` and ``Cookie``
+    across origins, so custom credentials would survive a 302 that the gateway
+    itself chooses the target of -- bypassing the origin check entirely. This
+    affects single-gateway users too, not just multi-gateway ones.
+    """
+
+    # gateway_a is the configured (credentialed) gateway; it redirects to
+    # gateway_b, which is a different origin and must receive nothing.
+    def redirect(cid: str) -> tuple[int, bytes]:
+        return (302, b"")
+
+    gateway_a.responder = redirect
+    gateway_a.redirect_to = f"{gateway_b.url}/ipfs/"
+
+    async with KuboCAS(
+        gateway_base_urls=[gateway_a.url],
+        rpc_base_url=gateway_a.url,
+        max_retries=0,
+        headers={
+            "Authorization": "Bearer SECRET",
+            "Cookie": "session=abc",
+            "X-API-Key": "key-123",
+        },
+    ) as cas:
+        assert await cas.load(GOOD_CID) == BODY
+
+    primary = gateway_a.headers_seen[0]
+    target = gateway_b.headers_seen[0]
+    assert primary["authorization"] == "Bearer SECRET"
+    assert primary["x-api-key"] == "key-123"
+    for name in ("authorization", "cookie", "x-api-key"):
+        assert name not in target, f"{name} leaked across a redirect"
+
+
+@pytest.mark.asyncio
+async def test_redirect_within_the_credentialed_origin_keeps_credentials(
+    gateway_a: FakeGateway,
+) -> None:
+    """Same-origin redirects must not lose the credentials they need."""
+    hits = {"n": 0}
+
+    def redirect_once(_cid: str) -> tuple[int, bytes]:
+        hits["n"] += 1
+        return (302, b"") if hits["n"] == 1 else (200, BODY)
+
+    gateway_a.responder = redirect_once
+    gateway_a.redirect_to = f"{gateway_a.url}/ipfs/"
+
+    async with KuboCAS(
+        gateway_base_urls=[gateway_a.url],
+        rpc_base_url=gateway_a.url,
+        max_retries=0,
+        headers={"X-API-Key": "key-123"},
+    ) as cas:
+        assert await cas.load(GOOD_CID) == BODY
+
+    assert len(gateway_a.headers_seen) == 2
+    assert all(seen["x-api-key"] == "key-123" for seen in gateway_a.headers_seen)
+
+
+@pytest.mark.asyncio
+async def test_redirect_loop_is_bounded(gateway_a: FakeGateway) -> None:
+    """Manual redirect following must still honour a redirect limit.
+
+    Following hops ourselves means httpx's own cap no longer applies, so a
+    gateway that redirects to itself forever would otherwise hang the read.
+    """
+    gateway_a.responder = lambda _cid: (302, b"")
+    gateway_a.redirect_to = f"{gateway_a.url}/ipfs/"
+
+    async with KuboCAS(
+        gateway_base_urls=[gateway_a.url],
+        rpc_base_url=gateway_a.url,
+        max_retries=0,
+        headers={"X-API-Key": "key-123"},
+    ) as cas:
+        with pytest.raises(httpx.TooManyRedirects):
+            await cas.load(GOOD_CID)
+
+    # Bounded, not infinite: it gave up rather than looping forever.
+    assert len(gateway_a.hits) <= 21
+
+
 def test_forwardable_headers_is_an_allowlist_of_non_credentials() -> None:
     """The forwarding rule must be allow-by-name, not deny-by-name.
 
@@ -810,13 +957,49 @@ def test_dag_pb_cids_are_not_verifiable() -> None:
     assert store_module._cid_is_verifiable(identity_cid, None, None)
 
 
-def test_unsupported_hash_function_is_not_a_mismatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """We cannot prove content wrong with a hash we cannot compute."""
+def test_uncomputable_hash_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verification that cannot run must raise, not pass the bytes through.
+
+    Returning unverified content here would be the worst outcome for the
+    feature: a caller who asked for ``verify_content`` would receive arbitrary
+    gateway bytes indistinguishable from checked ones, precisely when the
+    hashing backend is broken or the algorithm is unavailable.
+    """
 
     def unsupported(*_args: object, **_kwargs: object) -> bytes:
         raise KeyError("unsupported multihash")
 
     monkeypatch.setattr(store_module.multihash, "digest", unsupported)
-    store_module._verify_cid_content(GOOD_CID, b"anything at all")
+    with pytest.raises(store_module.GatewayContentUnverifiable):
+        store_module._verify_cid_content(GOOD_CID, b"anything at all")
+
+
+def test_unverifiable_is_caught_as_a_content_mismatch() -> None:
+    """It must subclass GatewayContentMismatch so failover still catches it."""
+    assert issubclass(store_module.GatewayContentUnverifiable, GatewayContentMismatch)
+
+
+@pytest.mark.asyncio
+async def test_uncomputable_hash_fails_over_then_raises(
+    gateway_a: FakeGateway, gateway_b: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unverifiable read is a per-gateway failure, not a silent success."""
+
+    def unsupported(*_args: object, **_kwargs: object) -> bytes:
+        raise KeyError("unsupported multihash")
+
+    monkeypatch.setattr(store_module.multihash, "digest", unsupported)
+
+    async with make_cas(
+        gateway_a, gateway_b, verify_content=True, max_retries=0
+    ) as cas:
+        with pytest.raises(ExceptionGroup) as excinfo:
+            await cas.load(GOOD_CID)
+
+    # Both gateways were tried; neither could be verified, so neither won.
+    assert len(gateway_a.hits) == 1
+    assert len(gateway_b.hits) == 1
+    assert all(
+        isinstance(exc, store_module.GatewayContentUnverifiable)
+        for exc in excinfo.value.exceptions
+    )

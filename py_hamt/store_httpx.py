@@ -51,6 +51,24 @@ _FORWARDABLE_HEADERS = frozenset({
 })
 
 
+def _carries_credentials(client: httpx.AsyncClient) -> bool:
+    """Whether this client would send anything worth withholding.
+
+    A client with no auth and only content-negotiation headers has no secret to
+    leak to a foreign gateway, so reads through it can take httpx's ordinary
+    request path instead of the origin-scoping one.
+    """
+    if client.auth is not None:
+        return True
+    # "connection" is a hop-by-hop header httpx sets itself. It is not
+    # forwardable (it describes this connection, not the request), but its
+    # presence does not mean the caller configured a credential.
+    benign = _FORWARDABLE_HEADERS | {"connection"}
+    return any(
+        name.decode("latin-1").lower() not in benign for name, _ in client.headers.raw
+    )
+
+
 def _origin_of(url: str) -> tuple[str, str, int | None]:
     """Scheme/host/port triple used to decide if two URLs share an origin."""
     parsed = urlsplit(url)
@@ -85,31 +103,45 @@ class _GatewayHealth:
     state is touched from a second loop.
     """
 
-    __slots__ = ("consecutive_failures", "tripped_at")
+    __slots__ = ("consecutive_failures", "probe_in_flight", "tripped_at")
 
     def __init__(self) -> None:
         self.consecutive_failures: int = 0
         self.tripped_at: float | None = None
+        # True between handing out a post-cooldown probe slot and learning how
+        # that probe went. Keeps the gateway closed to everyone else meanwhile.
+        self.probe_in_flight: bool = False
 
     def record_success(self) -> None:
         self.consecutive_failures = 0
         self.tripped_at = None
+        self.probe_in_flight = False
 
     def record_failure(self, now: float) -> None:
         self.consecutive_failures += 1
+        self.probe_in_flight = False
         if self.consecutive_failures >= _GATEWAY_FAILURE_THRESHOLD:
             self.tripped_at = now
 
     def is_healthy(self, now: float) -> bool:
+        """Whether this gateway should be preferred, claiming a probe if due.
+
+        Half-open, not merely time-based: exactly one caller past the cooldown
+        is let through as a probe, and the gateway stays deprioritized for
+        everyone else until that probe reports back via ``record_success`` or
+        ``record_failure``. Clearing the trip on a timer instead would let every
+        concurrent load in at once and dogpile a gateway that is still down.
+        """
         if self.tripped_at is None:
             return True
+        if self.probe_in_flight:
+            # A probe is already out; nobody else gets through on its coattails.
+            return False
         if now - self.tripped_at >= _GATEWAY_COOLDOWN_SECONDS:
-            # Cooldown elapsed. Clear the trip so a single probe failure does
-            # not immediately re-trip on a stale counter, but keep the gateway
-            # on probation by leaving the failure count one short of the
-            # threshold: one more failure re-trips it right away.
-            self.tripped_at = None
-            self.consecutive_failures = _GATEWAY_FAILURE_THRESHOLD - 1
+            # Claim the probe slot. tripped_at stays set so that if this probe
+            # fails, the gateway remains tripped without needing to re-cross the
+            # failure threshold; record_failure refreshes the cooldown window.
+            self.probe_in_flight = True
             return True
         return False
 
@@ -164,6 +196,18 @@ class GatewayContentMismatch(Exception):
     """
 
 
+class GatewayContentUnverifiable(GatewayContentMismatch):
+    """Verification was requested but could not be carried out.
+
+    Subclasses ``GatewayContentMismatch`` so it fails over and is caught by
+    existing handlers. Distinct because the cause differs: the content is not
+    known to be wrong, only unproven. ``verify_content=True`` must still fail
+    closed here -- returning unverified bytes would silently downgrade the
+    guarantee exactly when the hashing backend is broken or the algorithm is
+    unavailable.
+    """
+
+
 def _cid_is_verifiable(cid: CID, offset: Optional[int], suffix: Optional[int]) -> bool:
     """Whether a gateway response for ``cid`` can be checked against its digest.
 
@@ -195,11 +239,12 @@ def _verify_cid_content(cid: CID, data: bytes) -> None:
     default hasher here) *reject* a call that omits the size, and a legitimately
     truncated digest would never match one computed at full length.
 
-    Verification is skipped only when the local ``multiformats`` build cannot
-    compute the function at all -- we cannot prove the content wrong, so the
-    read is allowed through with a warning. That path must stay narrow: silently
-    skipping is indistinguishable from passing, which would make
-    ``verify_content`` worthless exactly when it matters.
+    If the digest cannot be computed at all -- an algorithm the local
+    ``multiformats`` build does not support, or a hashing backend that fails --
+    this raises ``GatewayContentUnverifiable`` rather than returning the bytes.
+    Verification fails closed: a caller who asked for ``verify_content`` gets
+    either proven content or an error, never unverified bytes presented as
+    though they had been checked.
     """
     raw_digest = bytes(cid.raw_digest)
     if cid.hashfun.name == "identity":
@@ -213,15 +258,11 @@ def _verify_cid_content(cid: CID, data: bytes) -> None:
 
     try:
         computed = multihash.digest(data, cid.hashfun.name, size=len(raw_digest))
-    except Exception:  # pragma: no cover - depends on multiformats build
-        logger.warning(
-            "Cannot verify CID %s: local multiformats cannot compute %s at "
-            "%d bytes; returning unverified gateway content",
-            cid,
-            cid.hashfun.name,
-            len(raw_digest),
-        )
-        return
+    except Exception as error:
+        raise GatewayContentUnverifiable(
+            f"cannot verify {cid}: computing {cid.hashfun.name} at "
+            f"{len(raw_digest)} bytes failed ({error})"
+        ) from error
     if bytes(multihash.unwrap(computed)) != raw_digest:
         raise GatewayContentMismatch(
             f"gateway returned {len(data)} bytes that do not hash to {cid}"
@@ -1062,6 +1103,93 @@ class KuboCAS(ContentAddressedStore):
                 )
         raise RuntimeError("Exited the retry loop unexpectedly.")  # pragma: no cover
 
+    def _request_headers_for(
+        self, client: httpx.AsyncClient, url: str, headers: Dict[str, str]
+    ) -> Tuple[Dict[str, str], bool]:
+        """Build headers for ``url``, dropping credentials on a foreign origin.
+
+        Returns the headers and whether credentials were withheld (which also
+        means client-level ``auth`` must be suppressed).
+
+        httpx merges client-level headers into every request and offers no way
+        to drop one per-request: ``Client._merge_headers`` starts from
+        ``self.headers`` and only ``update()``s, so an omitted or blanked entry
+        is reinstated. Building the ``Request`` explicitly is the only reliable
+        way to withhold a credential.
+        """
+        # Read from .raw: httpx.Headers.items() lower-cases names, and building
+        # a Request from that would silently rewrite every outgoing header name
+        # compared with the client.get() path this replaces.
+        client_headers = [
+            (name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in client.headers.raw
+        ]
+
+        if _origin_of(url) in self._credentialed_origins:
+            merged = dict(client_headers)
+            merged.update(headers)
+            return merged, False
+
+        safe_headers = {
+            name: value
+            for name, value in client_headers
+            if name.lower() in _FORWARDABLE_HEADERS
+        }
+        # Range headers are computed by load() for this request, never
+        # caller-supplied credentials, so they are always safe to send.
+        safe_headers.update(headers)
+        return safe_headers, True
+
+    async def _get_with_origin_scoped_credentials(
+        self, client: httpx.AsyncClient, url: str, headers: Dict[str, str]
+    ) -> httpx.Response:
+        """GET ``url``, re-deciding credential scope at every redirect hop.
+
+        Redirects are followed manually because httpx's own redirect handling
+        strips only ``Authorization`` and ``Cookie`` when crossing origins (see
+        ``Client._redirect_headers``). Custom credentials -- ``X-API-Key`` and
+        friends, which ``KuboCAS`` documents as a supported way to
+        authenticate -- survive its stripping, so a gateway could redirect to an
+        origin of its choosing and harvest them. Following each hop ourselves
+        re-applies the full origin check to the *redirect target*.
+        """
+        if not _carries_credentials(client):
+            # Nothing to withhold: no credentialed header and no client auth, so
+            # no origin can harvest anything by redirecting. Keep the plain
+            # client.get() path, which preserves httpx's own redirect, auth, and
+            # header-casing behaviour for the overwhelmingly common case.
+            return await client.get(url, headers=headers or None)
+
+        redirects_remaining = client.max_redirects if client.follow_redirects else 0
+        current_url = url
+
+        while True:
+            request_headers, stripped = self._request_headers_for(
+                client, current_url, headers
+            )
+            # auth=None also suppresses client-level httpx.Auth, which would
+            # otherwise re-add an Authorization header after our filtering.
+            response = await client.send(
+                httpx.Request("GET", current_url, headers=request_headers),
+                auth=None if stripped else httpx.USE_CLIENT_DEFAULT,
+                follow_redirects=False,
+            )
+
+            location = response.headers.get("Location")
+            if not (response.is_redirect and location):
+                return response
+            if redirects_remaining <= 0:
+                # Mirror httpx's own behaviour rather than silently returning
+                # the 3xx as if it were the block.
+                raise httpx.TooManyRedirects(
+                    "Exceeded maximum allowed redirects.", request=response.request
+                )
+
+            redirects_remaining -= 1
+            await response.aread()
+            await response.aclose()
+            current_url = str(response.url.join(location))
+
     async def _load_from_gateway(
         self,
         gateway_base_url: str,
@@ -1087,38 +1215,12 @@ class KuboCAS(ContentAddressedStore):
         semaphore = self._gateway_semaphore(gateway_base_url)
         retry_count = 0
 
-        # httpx merges client-level headers into every request and offers no way
-        # to drop one per-request (Client._merge_headers starts from
-        # self.headers and only update()s, so an omitted or blanked entry is
-        # reinstated). Building the Request explicitly and calling send()
-        # bypasses that merge, which is the only reliable way to withhold a
-        # credential from a foreign origin.
-        strip_credentials = (
-            _origin_of(gateway_base_url) not in self._credentialed_origins
-        )
-        request: httpx.Request | None = None
-        if strip_credentials:
-            safe_headers = {
-                name: value
-                for name, value in client.headers.items()
-                if name.lower() in _FORWARDABLE_HEADERS
-            }
-            # Range headers are computed by load() for this request, never
-            # caller-supplied credentials, so they are always safe to send.
-            safe_headers.update(headers)
-            request = httpx.Request("GET", url, headers=safe_headers)
-
         while retry_count <= self.max_retries:
             try:
                 async with semaphore:  # Throttle each gateway attempt
-                    if request is not None:
-                        # auth=None also suppresses client-level httpx.Auth,
-                        # which would otherwise re-add an Authorization header.
-                        response = await client.send(
-                            request, auth=None, follow_redirects=client.follow_redirects
-                        )
-                    else:
-                        response = await client.get(url, headers=headers or None)
+                    response = await self._get_with_origin_scoped_credentials(
+                        client, url, headers
+                    )
                 # An unsatisfiable range is answered with 416 by a compliant
                 # gateway; return b"" to match Python-slice semantics (and
                 # InMemoryCAS) instead of raising.
@@ -1243,9 +1345,11 @@ class KuboCAS(ContentAddressedStore):
         stats = _LoadStats()
         gateways = self._ordered_gateways()
         failures: list[Exception] = []
+        attempted: set[str] = set()
         try:
             for gateway_base_url in gateways:
                 health = self._gateway_health[gateway_base_url]
+                attempted.add(gateway_base_url)
                 try:
                     content = await self._load_from_gateway(
                         gateway_base_url, cid, headers, offset, length, suffix, stats
@@ -1277,6 +1381,13 @@ class KuboCAS(ContentAddressedStore):
                 f"all {len(gateways)} gateways failed for CID {cid}", failures
             )
         finally:
+            # Ranking claims a probe slot for any tripped gateway whose cooldown
+            # has elapsed, but an earlier gateway usually succeeds first and the
+            # rest are never tried. Release those unused claims, or the slot is
+            # never reported back and the gateway is locked out permanently.
+            for gateway_base_url in gateways:
+                if gateway_base_url not in attempted:
+                    self._gateway_health[gateway_base_url].probe_in_flight = False
             instrumentation.end_cas_load(
                 trace_started_at,
                 byte_count=stats.response_bytes,

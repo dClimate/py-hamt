@@ -9,6 +9,7 @@ from .sharded_zarr_store import (
 from .store_httpx import (
     ContentAddressedStore,
     GatewayContentMismatch,
+    GatewayContentUnverifiable,
     InMemoryCAS,
     KuboCAS,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "HAMT",
     "ContentAddressedStore",
     "GatewayContentMismatch",
+    "GatewayContentUnverifiable",
     "InMemoryCAS",
     "KuboCAS",
     "ZarrHAMTStore",
