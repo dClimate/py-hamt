@@ -360,60 +360,6 @@ def test_health_cooldown_leaves_gateway_on_probation() -> None:
     assert not health.is_healthy(now=store_module._GATEWAY_COOLDOWN_SECONDS + 1.0)
 
 
-def test_only_one_probe_is_admitted_after_cooldown() -> None:
-    """Half-open, not merely time-based.
-
-    Clearing the trip on a timer would let every concurrent load through at
-    once and dogpile a gateway that is still down. Exactly one caller gets a
-    probe slot; the rest stay deprioritized until it reports back.
-    """
-    health = store_module._GatewayHealth()
-    for _ in range(store_module._GATEWAY_FAILURE_THRESHOLD):
-        health.record_failure(now=0.0)
-    after = store_module._GATEWAY_COOLDOWN_SECONDS + 1.0
-
-    assert health.is_healthy(now=after), "the first caller should get the probe"
-    assert [health.is_healthy(now=after) for _ in range(8)] == [False] * 8
-
-    # A failed probe keeps it tripped without re-crossing the threshold.
-    health.record_failure(now=after)
-    assert not health.is_healthy(now=after + 1.0)
-
-    # A successful probe restores it for everyone.
-    later = after + store_module._GATEWAY_COOLDOWN_SECONDS + 1.0
-    assert health.is_healthy(now=later)
-    health.record_success()
-    assert all(health.is_healthy(now=later) for _ in range(5))
-
-
-@pytest.mark.asyncio
-async def test_unused_probe_claim_is_released(
-    gateway_a: FakeGateway, gateway_b: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A gateway ranked but never tried must not keep its probe slot.
-
-    Ranking claims the slot, but the loop stops at the first success, so a
-    lower-ranked gateway is usually never attempted. Without releasing the
-    claim it would never report back and would be locked out forever.
-    """
-    monkeypatch.setattr(store_module, "_GATEWAY_COOLDOWN_SECONDS", 0.0)
-
-    async with make_cas(gateway_a, gateway_b, max_retries=0) as cas:
-        health_b = cas._gateway_health[cas.gateway_base_urls[1]]
-        for _ in range(store_module._GATEWAY_FAILURE_THRESHOLD):
-            health_b.record_failure(time.monotonic())
-
-        # gateway_a serves this, so gateway_b is ranked but never attempted.
-        assert await cas.load(GOOD_CID) == BODY
-        assert gateway_b.hits == []
-        assert not health_b.probe_in_flight, "probe slot leaked on an unused gateway"
-
-        # gateway_b is therefore still reachable on a later read.
-        gateway_a.responder = lambda _cid: (500, b"")
-        assert await cas.load(GOOD_CID) == BODY
-        assert len(gateway_b.hits) == 1
-
-
 # --------------------------------------------------------------------------- #
 # per-gateway concurrency                                                      #
 # --------------------------------------------------------------------------- #
@@ -837,6 +783,27 @@ async def test_redirect_loop_is_bounded(gateway_a: FakeGateway) -> None:
 
     # Bounded, not infinite: it gave up rather than looping forever.
     assert len(gateway_a.hits) <= 21
+
+
+def test_origin_comparison_normalizes_default_ports() -> None:
+    """``https://h`` and ``https://h:443`` are one origin, not two.
+
+    Otherwise a gateway written without a port in config but reached with an
+    explicit one would look foreign and silently lose its credentials.
+    """
+    assert store_module._origin_of("https://h/ipfs/") == store_module._origin_of(
+        "https://h:443/ipfs/"
+    )
+    assert store_module._origin_of("http://h/ipfs/") == store_module._origin_of(
+        "http://h:80/ipfs/"
+    )
+    # Genuinely different origins still differ.
+    assert store_module._origin_of("https://h/ipfs/") != store_module._origin_of(
+        "http://h/ipfs/"
+    )
+    assert store_module._origin_of("https://h/ipfs/") != store_module._origin_of(
+        "https://h:8443/ipfs/"
+    )
 
 
 def test_forwardable_headers_is_an_allowlist_of_non_credentials() -> None:

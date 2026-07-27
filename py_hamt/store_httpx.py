@@ -69,10 +69,22 @@ def _carries_credentials(client: httpx.AsyncClient) -> bool:
     )
 
 
+# Ports implied by a scheme, so ``https://h`` and ``https://h:443`` compare
+# equal rather than looking like two different origins.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 def _origin_of(url: str) -> tuple[str, str, int | None]:
-    """Scheme/host/port triple used to decide if two URLs share an origin."""
+    """Scheme/host/port triple used to decide if two URLs share an origin.
+
+    The port falls back to the scheme default so a gateway written without a
+    port in config and reached with an explicit one (or vice versa) is treated
+    as the same origin, rather than silently losing its credentials.
+    """
     parsed = urlsplit(url)
-    return (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port)
+    scheme = parsed.scheme.lower()
+    port = parsed.port or _DEFAULT_PORTS.get(scheme)
+    return (scheme, (parsed.hostname or "").lower(), port)
 
 
 def _normalize_gateway_base_url(gateway_base_url: str) -> str:
@@ -103,45 +115,41 @@ class _GatewayHealth:
     state is touched from a second loop.
     """
 
-    __slots__ = ("consecutive_failures", "probe_in_flight", "tripped_at")
+    __slots__ = ("consecutive_failures", "tripped_at")
 
     def __init__(self) -> None:
         self.consecutive_failures: int = 0
         self.tripped_at: float | None = None
-        # True between handing out a post-cooldown probe slot and learning how
-        # that probe went. Keeps the gateway closed to everyone else meanwhile.
-        self.probe_in_flight: bool = False
 
     def record_success(self) -> None:
         self.consecutive_failures = 0
         self.tripped_at = None
-        self.probe_in_flight = False
 
     def record_failure(self, now: float) -> None:
         self.consecutive_failures += 1
-        self.probe_in_flight = False
         if self.consecutive_failures >= _GATEWAY_FAILURE_THRESHOLD:
             self.tripped_at = now
 
     def is_healthy(self, now: float) -> bool:
-        """Whether this gateway should be preferred, claiming a probe if due.
+        """Whether this gateway should still be preferred.
 
-        Half-open, not merely time-based: exactly one caller past the cooldown
-        is let through as a probe, and the gateway stays deprioritized for
-        everyone else until that probe reports back via ``record_success`` or
-        ``record_failure``. Clearing the trip on a timer instead would let every
-        concurrent load in at once and dogpile a gateway that is still down.
+        Deliberately time-based rather than a single-probe half-open gate. Once
+        the cooldown elapses, concurrent loads may all retry a gateway that is
+        still down -- but that costs a handful of wasted requests once per
+        cooldown, and each still fails over. Gating it behind one in-flight
+        probe means tracking that probe's outcome across cancellation and
+        never-attempted gateways, which is materially more machinery than the
+        thundering herd it avoids is worth here.
         """
         if self.tripped_at is None:
             return True
-        if self.probe_in_flight:
-            # A probe is already out; nobody else gets through on its coattails.
-            return False
         if now - self.tripped_at >= _GATEWAY_COOLDOWN_SECONDS:
-            # Claim the probe slot. tripped_at stays set so that if this probe
-            # fails, the gateway remains tripped without needing to re-cross the
-            # failure threshold; record_failure refreshes the cooldown window.
-            self.probe_in_flight = True
+            # Cooldown elapsed. Clear the trip so a single probe failure does
+            # not immediately re-trip on a stale counter, but keep the gateway
+            # on probation by leaving the failure count one short of the
+            # threshold: one more failure re-trips it right away.
+            self.tripped_at = None
+            self.consecutive_failures = _GATEWAY_FAILURE_THRESHOLD - 1
             return True
         return False
 
@@ -1345,11 +1353,9 @@ class KuboCAS(ContentAddressedStore):
         stats = _LoadStats()
         gateways = self._ordered_gateways()
         failures: list[Exception] = []
-        attempted: set[str] = set()
         try:
             for gateway_base_url in gateways:
                 health = self._gateway_health[gateway_base_url]
-                attempted.add(gateway_base_url)
                 try:
                     content = await self._load_from_gateway(
                         gateway_base_url, cid, headers, offset, length, suffix, stats
@@ -1381,13 +1387,6 @@ class KuboCAS(ContentAddressedStore):
                 f"all {len(gateways)} gateways failed for CID {cid}", failures
             )
         finally:
-            # Ranking claims a probe slot for any tripped gateway whose cooldown
-            # has elapsed, but an earlier gateway usually succeeds first and the
-            # rest are never tried. Release those unused claims, or the slot is
-            # never reported back and the gateway is locked out permanently.
-            for gateway_base_url in gateways:
-                if gateway_base_url not in attempted:
-                    self._gateway_health[gateway_base_url].probe_in_flight = False
             instrumentation.end_cas_load(
                 trace_started_at,
                 byte_count=stats.response_bytes,
