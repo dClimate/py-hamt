@@ -22,7 +22,7 @@ import httpx
 import pytest
 from multiformats import CID, multihash
 
-from py_hamt import HAMT, KuboCAS
+from py_hamt import HAMT, ContentAddressedStore, KuboCAS
 from py_hamt.store_httpx import _cid_is_verifiable
 
 
@@ -52,15 +52,15 @@ def test_add_url_pins_cid_version_for_any_hasher(hasher: str) -> None:
     ],
 )
 async def test_save_returns_cidv1_with_requested_codec(
-    create_ipfs: tuple[str, str], hasher: str, codec: str
+    create_ipfs: tuple[str, str],
+    hasher: str,
+    codec: ContentAddressedStore.CodecInput,
 ) -> None:
     """sha2-256 must yield a CIDv1 carrying the codec save() was asked for."""
     rpc, gw = create_ipfs
     payload = b"py-hamt issue 43: " + hasher.encode() + b"/" + codec.encode()
 
-    async with KuboCAS(
-        hasher=hasher, rpc_base_url=rpc, gateway_base_url=gw
-    ) as cas:
+    async with KuboCAS(hasher=hasher, rpc_base_url=rpc, gateway_base_url=gw) as cas:
         cid = await cas.save(payload, codec=codec)
 
         assert cid.version == 1, f"{hasher} still returns a CIDv0"
@@ -82,9 +82,7 @@ async def test_saved_cid_digest_matches_stored_block(
     rpc, gw = create_ipfs
     payload = b"issue 43 digest check for " + hasher.encode()
 
-    async with KuboCAS(
-        hasher=hasher, rpc_base_url=rpc, gateway_base_url=gw
-    ) as cas:
+    async with KuboCAS(hasher=hasher, rpc_base_url=rpc, gateway_base_url=gw) as cas:
         cid = await cas.save(payload, codec="raw")
 
     raw_digest = bytes(cid.raw_digest)
@@ -107,9 +105,7 @@ async def test_kubo_stores_payload_verbatim_under_returned_cid(
     rpc, gw = create_ipfs
     payload = b"issue 43 block-store check for " + hasher.encode()
 
-    async with KuboCAS(
-        hasher=hasher, rpc_base_url=rpc, gateway_base_url=gw
-    ) as cas:
+    async with KuboCAS(hasher=hasher, rpc_base_url=rpc, gateway_base_url=gw) as cas:
         cid = await cas.save(payload, codec="raw")
 
     async with httpx.AsyncClient() as client:

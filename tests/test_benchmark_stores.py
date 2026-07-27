@@ -8,11 +8,21 @@ without asserting anything -- so it could not fail, and therefore protected
 nothing.
 
 What is asserted here is **request counts**, not wall-clock time. Counts are
-deterministic, so they hold up in CI, and they are the quantity the performance
-work actually moved: PR #88's speedups and ``ShardedZarrStore`` both work by
-collapsing HAMT traversal depth into fewer network round trips. Timings are
-still measured and reported via ``--benchmark-report`` for humans, but nothing
-fails on them.
+deterministic, so they hold up in CI. Timings are still measured and reported
+via ``--benchmark-report`` for humans, but nothing fails on them.
+
+A caveat these benchmarks exist to make visible: ``ShardedZarrStore`` defaults to
+``shard_read_mode="sparse"``, which fetches one entry per chunk to keep *point*
+reads cheap (PR #87: ~9x on 30 years of ERA5 dailies). On a whole-array scan that
+is the wrong mode by design and costs roughly 2x the ``"full"`` path. Every scan
+benchmark below therefore sets the mode explicitly, and
+``test_sparse_mode_trades_scan_cost_for_point_read_latency`` pins the trade-off
+so a scan measured on the default is not misread as a regression.
+
+Note also that these are network-round-trip benchmarks. PR #88's headline numbers
+measure different quantities -- bulk writes against ``InMemoryCAS``, warm-cache
+get latency, and per-request RTT depth -- so they are not comparable to the
+totals reported here.
 
 Run:
     pytest tests/test_benchmark_stores.py --ipfs
@@ -240,8 +250,10 @@ async def test_benchmark_sharded_store(
         write = report(phase.result)
 
         with _Phase("ShardedZarrStore read") as phase:
+            # Explicit: this phase is a whole-array scan, which is what "full"
+            # is for. The default is "sparse", tuned for point reads instead.
             read_store = await ShardedZarrStore.open(
-                cas=cas, read_only=True, root_cid=root_cid
+                cas=cas, read_only=True, root_cid=root_cid, shard_read_mode="full"
             )
             actual = xr.open_zarr(store=read_store)
             actual.load()
@@ -254,32 +266,22 @@ async def test_benchmark_sharded_store(
     assert read.retries == 0
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Sharded full-scan reads currently cost ~2x the HAMT walk and refetch "
-        "roughly one duplicate block per chunk (320 chunks -> 313 duplicate "
-        "requests, vs 5 for HAMT). cas_load totals are also identical for "
-        "chunks_per_shard of 50, 500 and 5000, and shard_cache.hit/miss are "
-        "never emitted -- so this read path is not consulting the shard cache "
-        "at lines 1770-1820 at all. Tracked separately; this test documents the "
-        "intended contract and will pass once the read path uses the cache."
-    ),
-    strict=True,
-)
-async def test_sharded_read_uses_fewer_round_trips_than_hamt(
+async def test_sharded_full_mode_read_batches_chunks_into_shard_fetches(
     create_ipfs: tuple[str, str], report: Any
 ) -> None:
-    """The sharded store's reason for existing, asserted rather than assumed.
+    """Sharding's reason for existing, asserted rather than assumed.
 
-    Sharding batches many chunk references into one shard object, so a full read
-    should cost materially fewer content-store loads than the HAMT walk. This is
-    the claim behind PR #88 and issue #56; without it in a test, a regression
-    that reintroduced per-chunk round trips passes CI silently -- which is
-    exactly what was happening.
+    In ``shard_read_mode="full"`` one shard fetch serves every chunk in that
+    shard, so a whole-array scan costs roughly ``num_shards`` loads instead of
+    one per chunk. Without this in a test, a regression reintroducing per-chunk
+    round trips on the full path would pass CI silently.
 
-    The dataset here is deliberately larger than ``chunks_per_shard``. Below that
-    threshold both backends coincidentally tie, so a smaller dataset would let
-    this assertion pass without demonstrating anything.
+    Note the mode is explicit here. The store's default is ``"sparse"``, which
+    is deliberately the opposite trade-off -- see
+    ``test_sparse_mode_trades_scan_cost_for_point_read_latency``.
+
+    The dataset is deliberately larger than ``chunks_per_shard``; below that
+    threshold everything fits in one shard and the comparison proves nothing.
     """
     rpc, gateway = create_ipfs
     # 100 time steps at a chunk of 5 => 80 chunks, comfortably above the
@@ -312,9 +314,12 @@ async def test_sharded_read_uses_fewer_round_trips_than_hamt(
         ds.to_zarr(store=sharded, mode="w")
         root_cid = await sharded.flush()
 
-        with _Phase("Sharded read") as phase:
+        with _Phase("Sharded read (full)") as phase:
             read_store = await ShardedZarrStore.open(
-                cas=cas, read_only=True, root_cid=root_cid
+                cas=cas,
+                read_only=True,
+                root_cid=root_cid,
+                shard_read_mode="full",
             )
             sharded_result = xr.open_zarr(store=read_store)
             sharded_result.load()
@@ -323,13 +328,87 @@ async def test_sharded_read_uses_fewer_round_trips_than_hamt(
     # Both must return the same data, or the comparison is meaningless.
     xr.testing.assert_identical(hamt_result, sharded_result)
 
-    # Network round trips specifically: a shard fetch that hits the in-process
-    # cache costs nothing remotely, so cas_load is the honest measure on both
-    # sides here (unlike the write path, which buffers -- see work_units).
+    n_chunks = sum(len(chunks) for chunks in ds.chunks.values())
+
+    # The batching claim: a handful of shard fetches, not one per chunk.
+    assert 0 < sharded_read.shard_loads < n_chunks, (
+        f"{sharded_read.shard_loads:.0f} shard loads for ~{n_chunks} chunks; "
+        "full mode is supposed to batch chunk references into shard fetches"
+    )
+    # Batching should also mean no block is pulled twice.
+    assert sharded_read.duplicate_requests == 0, (
+        f"full-mode scan refetched {sharded_read.duplicate_requests} blocks; "
+        "one shard fetch should serve every chunk it covers"
+    )
     assert sharded_read.cas_loads <= hamt_read.cas_loads, (
         f"sharded read cost {sharded_read.cas_loads:.0f} CAS loads vs HAMT's "
         f"{hamt_read.cas_loads:.0f}; sharding is supposed to reduce round trips"
     )
+
+
+async def test_sparse_mode_trades_scan_cost_for_point_read_latency(
+    create_ipfs: tuple[str, str], report: Any
+) -> None:
+    """Characterize the default read mode, so its cost is not mistaken for a bug.
+
+    ``shard_read_mode`` defaults to ``"sparse"`` (PR #87): a read-only cache miss
+    with no byte range fetches just the requested entry rather than decoding the
+    whole shard. That is a large win for point reads over long time ranges -- the
+    AEGIS workload the mode was built for -- and a deliberate loss on a full
+    scan, where every entry is wanted anyway and per-chunk fetches add up.
+
+    Asserted here so the trade-off is visible and intentional: a full scan in
+    sparse mode legitimately costs *more* than in full mode. Anyone benchmarking
+    a whole-array read should set ``shard_read_mode="full"``.
+    """
+    rpc, gateway = create_ipfs
+    ds = _make_dataset("temp", periods=100, time_chunk=5)
+
+    async with KuboCAS(rpc_base_url=rpc, gateway_base_url=gateway) as cas:
+        store = await ShardedZarrStore.open(
+            cas=cas,
+            read_only=False,
+            array_shape=tuple(ds.sizes.values()),
+            chunk_shape=_chunk_shape(ds),
+            chunks_per_shard=50,
+        )
+        ds.to_zarr(store=store, mode="w")
+        root_cid = await store.flush()
+
+        results: dict[str, BenchmarkResult] = {}
+        for mode in ("sparse", "full"):
+            with _Phase(f"full scan @ shard_read_mode={mode}") as phase:
+                read_store = await ShardedZarrStore.open(
+                    cas=cas, read_only=True, root_cid=root_cid, shard_read_mode=mode
+                )
+                scanned = xr.open_zarr(store=read_store)
+                scanned.load()
+            results[mode] = report(phase.result)
+            xr.testing.assert_identical(ds, scanned)
+
+    assert results["sparse"].cas_loads > results["full"].cas_loads, (
+        "expected sparse mode to cost more on a full scan; if this now holds "
+        "the other way, sparse decoding has changed and the default may want "
+        "revisiting"
+    )
+
+
+async def test_sharded_store_defaults_to_sparse_read_mode(
+    create_ipfs: tuple[str, str],
+) -> None:
+    """Pin the default, since it determines which trade-off users get."""
+    rpc, gateway = create_ipfs
+
+    async with KuboCAS(rpc_base_url=rpc, gateway_base_url=gateway) as cas:
+        store = await ShardedZarrStore.open(
+            cas=cas,
+            read_only=False,
+            array_shape=(10, 10),
+            chunk_shape=(5, 5),
+            chunks_per_shard=4,
+        )
+
+    assert store.shard_read_mode == "sparse"
 
 
 async def test_read_cache_prevents_duplicate_cid_fetches(
