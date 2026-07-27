@@ -22,6 +22,13 @@ def pytest_addoption(parser):
         default=False,
         help="run tests that require a Kubo daemon",
     )
+    parser.addoption(
+        "--benchmark-report",
+        action="store_true",
+        default=False,
+        help="print timing and request-count tables from the benchmark suite "
+        "(combine with -s); benchmarks assert on request counts either way",
+    )
 
 
 def pytest_configure(config):
