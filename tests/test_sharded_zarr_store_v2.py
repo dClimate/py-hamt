@@ -507,7 +507,7 @@ async def test_full_mode_never_touches_auto_mode_state() -> None:
 async def test_auto_mode_state_threads_through_with_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The clone shares the counter dict and inherits the latch by value."""
+    """The clone shares both the counter dict and the latch cell."""
     monkeypatch.setattr(ShardedZarrStore, "_SPARSE_PROMOTE_THRESHOLD", 3)
     cas = LocalCIDCAS()
     proto = zarr.core.buffer.default_buffer_prototype()
@@ -520,14 +520,65 @@ async def test_auto_mode_state_threads_through_with_read_only(
 
     clone = store.with_read_only(False)
     assert clone._sparse_read_counts is store._sparse_read_counts
+    assert clone._full_mode_latched_cell is store._full_mode_latched_cell
     assert clone._full_mode_latched is False
 
     for _ in range(ShardedZarrStore._SPARSE_PROMOTE_THRESHOLD - 1):
         assert await store.get("a/c/2", proto) is not None
     assert store._full_mode_latched is True
+    # Shared cell: the pre-existing clone sees the latch, not just later ones.
+    assert clone._full_mode_latched is True
 
     latched_clone = store.with_read_only(False)
     assert latched_clone._full_mode_latched is True
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_latch_is_visible_to_sibling_clones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A latch earned by one clone must reach its siblings.
+
+    Regression: the latch was originally copied by value while the counters and
+    cache were shared by reference. Latching in one read-only clone cleared the
+    *shared* counters but left a sibling clone of the same writable parent
+    holding a stale ``False`` -- so the sibling resumed sparse reads on evicted
+    shards with no counter left to re-earn promotion from, permanently. This is
+    reachable from stock zarr, which calls ``with_read_only(True)`` on writable
+    stores (zarr/storage/_common.py).
+    """
+    monkeypatch.setattr(ShardedZarrStore, "_SPARSE_PROMOTE_THRESHOLD", 3)
+    cas = LocalCIDCAS()
+    proto = zarr.core.buffer.default_buffer_prototype()
+    root_cid = await _seed_auto_mode_store(cas, num_chunks=4, chunks_per_shard=4)
+
+    parent = await ShardedZarrStore.open(
+        cas=cas, read_only=False, root_cid=root_cid, shard_read_mode="auto"
+    )
+    first = parent.with_read_only(True)
+    for _ in range(ShardedZarrStore._SPARSE_PROMOTE_THRESHOLD):
+        assert await first.get("a/c/2", proto) is not None
+
+    assert first._full_mode_latched is True
+    assert parent._full_mode_latched is True, "the writable parent must observe it"
+    assert first._sparse_read_counts == {}
+
+    second = parent.with_read_only(True)
+    assert second._full_mode_latched is True, (
+        "a sibling clone inherited a stale unlatched state; it would resume "
+        "sparse reads with the shared counters already cleared"
+    )
+
+    # Evict, then confirm the sibling takes the full path rather than sparse.
+    await second._shard_data_cache.discard(("a", 0))
+
+    async def fail_sparse_decode(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a latched sibling must not sparse-decode")
+
+    monkeypatch.setattr(second, "_load_sparse_shard_entry", fail_sparse_decode)
+    buffer = await second.get("a/c/2", proto)
+    assert buffer is not None
+    assert buffer.to_bytes() == b"v2"
 
 
 def _pyramid_level(data: np.ndarray, *, coord_offset: int = 0) -> xr.Dataset:

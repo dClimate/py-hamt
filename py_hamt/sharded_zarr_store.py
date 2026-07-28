@@ -529,7 +529,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         # Latched once any single shard crosses the threshold: the caller is
         # scanning, so every shard gets the full path from here on. Store-wide
         # because the access pattern belongs to the caller, not the shard.
-        self._full_mode_latched: bool = False
+        #
+        # Held in a one-element list so with_read_only clones share the *cell*
+        # rather than a copied bool. They already share the counters and the
+        # cache, and a clone that latched would otherwise clear those shared
+        # counters while leaving its siblings believing they were still sparse
+        # -- so the next clone would resume sparse reads with no counter left
+        # to re-earn promotion. See _full_mode_latched.
+        self._full_mode_latched_cell: List[bool] = [False]
         self._metadata_read_cache: Dict[str, bytes] = {}
 
         self.array_indices: Dict[str, ArrayIndex] = {}
@@ -1542,6 +1549,19 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
                 ) from e
 
+    @property
+    def _full_mode_latched(self) -> bool:
+        """Whether ``auto`` mode has committed this store to full decodes.
+
+        Backed by a cell shared with every ``with_read_only`` clone, so a latch
+        earned by one clone is immediately visible to all of them.
+        """
+        return self._full_mode_latched_cell[0]
+
+    @_full_mode_latched.setter
+    def _full_mode_latched(self, value: bool) -> None:
+        self._full_mode_latched_cell[0] = value
+
     def _sparse_read_is_eligible(
         self,
         array_index: ArrayIndex,
@@ -1975,14 +1995,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         clone._shard_data_cache = self._shard_data_cache
         clone._pending_shard_loads = self._pending_shard_loads
-        # Shared by reference like the cache above: a clone that copied would
-        # restart counting from zero while reading through the *same* cache.
+        # Both shared by reference, like the cache above. The counters must be
+        # shared so a clone does not restart counting while reading through the
+        # *same* cache; the latch cell must be shared for the same reason in
+        # reverse -- latching clears the shared counters, so a sibling holding
+        # a copied False would resume sparse reads with nothing left to re-earn
+        # promotion from.
         clone._sparse_read_counts = self._sparse_read_counts
-        # Copied by value, deliberately. The clone inherits the decision made so
-        # far but latches independently afterward — it has the opposite
-        # read/write posture, and a writable clone can never take the sparse
-        # path at all, so there is nothing for a shared latch to coordinate.
-        clone._full_mode_latched = self._full_mode_latched
+        clone._full_mode_latched_cell = self._full_mode_latched_cell
         clone._metadata_read_cache = self._metadata_read_cache
 
         clone.array_indices = self.array_indices
