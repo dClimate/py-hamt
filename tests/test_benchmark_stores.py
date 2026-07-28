@@ -335,7 +335,9 @@ async def test_benchmark_sharded_store(
 
         with _Phase("ShardedZarrStore read") as phase:
             # Explicit: this phase is a whole-array scan, which is what "full"
-            # is for. The default is "sparse", tuned for point reads instead.
+            # is for. The default is "auto", which would reach the same place
+            # via the latch but pay a detection cost first -- pinned here so
+            # this measures steady-state scan cost, not the detection ramp.
             read_store = await ShardedZarrStore.open(
                 cas=cas, read_only=True, root_cid=root_cid, shard_read_mode="full"
             )
@@ -438,19 +440,88 @@ async def test_sharded_full_mode_read_batches_chunks_into_shard_fetches(
 
 
 async def test_sparse_mode_trades_scan_cost_for_point_read_latency(
+    create_ipfs: tuple[str, str], report: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Characterize each read mode on a scan, so costs are not mistaken for bugs.
+
+    ``"sparse"`` (PR #87) resolves a read-only cache miss by fetching just the
+    requested entry rather than decoding the whole shard. That is a large win
+    for point reads over long time ranges -- the AEGIS workload the mode was
+    built for -- and a deliberate loss on a full scan, where every entry is
+    wanted anyway and per-chunk fetches add up.
+
+    Asserted here so the trade-off stays visible: a full scan in sparse mode
+    legitimately costs *more* than in full mode.
+
+    The ``"auto"`` arm is why that penalty is no longer the default: it starts
+    sparse, detects the scan, and latches to full decodes, so it lands between
+    the two rather than paying the sparse penalty all the way through. It does
+    not match ``"full"`` outright, and should not -- the reads before the latch
+    trips are genuinely sparse. That gap is the bounded detection cost.
+    """
+    rpc, gateway = create_ipfs
+    ds = _make_dataset("temp", periods=100, time_chunk=5)
+
+    # This dataset is far smaller than a real one: a whole-array scan touches
+    # ~20 chunks per shard, so the production threshold of 256 would never trip
+    # and the "auto" arm below would silently measure plain sparse mode. Scale
+    # the detector to the fixture so the arm exercises the latch it claims to.
+    monkeypatch.setattr(ShardedZarrStore, "_SPARSE_PROMOTE_THRESHOLD", 8)
+
+    async with KuboCAS(rpc_base_url=rpc, gateway_base_url=gateway) as cas:
+        store = await ShardedZarrStore.open(
+            cas=cas,
+            read_only=False,
+            array_shape=tuple(ds.sizes.values()),
+            chunk_shape=_chunk_shape(ds),
+            chunks_per_shard=50,
+        )
+        ds.to_zarr(store=store, mode="w")
+        root_cid = await store.flush()
+
+        results: dict[str, BenchmarkResult] = {}
+        for mode in ("sparse", "full", "auto"):
+            with _Phase(f"full scan @ shard_read_mode={mode}") as phase:
+                read_store = await ShardedZarrStore.open(
+                    cas=cas, read_only=True, root_cid=root_cid, shard_read_mode=mode
+                )
+                scanned = xr.open_zarr(store=read_store)
+                scanned.load()
+            results[mode] = report(phase.result)
+            xr.testing.assert_identical(ds, scanned)
+            if mode == "auto":
+                assert read_store._full_mode_latched, (
+                    "a whole-array scan should have latched auto mode to full "
+                    "decodes; if it did not, the threshold is now above the "
+                    "per-shard chunk count and auto has silently become sparse"
+                )
+
+    assert results["sparse"].cas_loads > results["full"].cas_loads, (
+        "expected sparse mode to cost more on a full scan; if this now holds "
+        "the other way, sparse decoding has changed and the default may want "
+        "revisiting"
+    )
+    # The whole point of auto: pay a bounded detection cost, then stop paying
+    # the sparse scan penalty. Asserted against sparse rather than pinned to
+    # full because auto is *expected* to cost a little more than full -- the
+    # reads before the latch trips are genuinely sparse.
+    assert results["auto"].cas_loads < results["sparse"].cas_loads, (
+        f"auto scan cost {results['auto'].cas_loads:.0f} CAS loads vs sparse's "
+        f"{results['sparse'].cas_loads:.0f}; auto should detect the scan and "
+        "latch to full decodes rather than staying sparse throughout"
+    )
+
+
+async def test_auto_mode_matches_sparse_on_point_reads(
     create_ipfs: tuple[str, str], report: Any
 ) -> None:
-    """Characterize the default read mode, so its cost is not mistaken for a bug.
+    """The other half of the auto claim: no scan, no latch, no added cost.
 
-    ``shard_read_mode`` defaults to ``"sparse"`` (PR #87): a read-only cache miss
-    with no byte range fetches just the requested entry rather than decoding the
-    whole shard. That is a large win for point reads over long time ranges -- the
-    AEGIS workload the mode was built for -- and a deliberate loss on a full
-    scan, where every entry is wanted anyway and per-chunk fetches add up.
-
-    Asserted here so the trade-off is visible and intentional: a full scan in
-    sparse mode legitimately costs *more* than in full mode. Anyone benchmarking
-    a whole-array read should set ``shard_read_mode="full"``.
+    ``test_sparse_mode_trades_scan_cost_for_point_read_latency`` shows auto
+    escaping the sparse penalty on a scan. This shows it does not *pay* anything
+    for that safety net on the workload sparse exists to serve -- a handful of
+    scattered point reads must cost exactly what plain sparse costs, and must
+    leave the store unlatched.
     """
     rpc, gateway = create_ipfs
     ds = _make_dataset("temp", periods=100, time_chunk=5)
@@ -467,27 +538,40 @@ async def test_sparse_mode_trades_scan_cost_for_point_read_latency(
         root_cid = await store.flush()
 
         results: dict[str, BenchmarkResult] = {}
-        for mode in ("sparse", "full"):
-            with _Phase(f"full scan @ shard_read_mode={mode}") as phase:
+        for mode in ("sparse", "auto"):
+            with _Phase(f"point reads @ shard_read_mode={mode}") as phase:
                 read_store = await ShardedZarrStore.open(
                     cas=cas, read_only=True, root_cid=root_cid, shard_read_mode=mode
                 )
-                scanned = xr.open_zarr(store=read_store)
-                scanned.load()
+                opened = xr.open_zarr(store=read_store)
+                for step in (0, 25, 50, 75, 99):
+                    opened["temp"].isel(time=step).load()
             results[mode] = report(phase.result)
-            xr.testing.assert_identical(ds, scanned)
 
-    assert results["sparse"].cas_loads > results["full"].cas_loads, (
-        "expected sparse mode to cost more on a full scan; if this now holds "
-        "the other way, sparse decoding has changed and the default may want "
-        "revisiting"
+        assert not read_store._full_mode_latched, (
+            "scattered point reads are not a scan and must not latch auto mode "
+            "to full decodes -- that would hand this workload the whole-shard "
+            "cost sparse mode exists to avoid"
+        )
+
+    assert results["auto"].cas_loads == results["sparse"].cas_loads, (
+        f"auto cost {results['auto'].cas_loads:.0f} CAS loads on point reads vs "
+        f"sparse's {results['sparse'].cas_loads:.0f}; below the threshold auto "
+        "must be byte-for-byte the sparse path"
     )
 
 
-async def test_sharded_store_defaults_to_sparse_read_mode(
+async def test_sharded_store_defaults_to_auto_read_mode(
     create_ipfs: tuple[str, str],
 ) -> None:
-    """Pin the default, since it determines which trade-off users get."""
+    """Pin the default, since it determines which trade-off users get.
+
+    ``"auto"`` rather than ``"sparse"``: no caller in this repo passes
+    ``shard_read_mode`` explicitly, so the default is what essentially everyone
+    runs, and it should not hand an unbounded scan penalty to callers who never
+    learned the knob exists. ``"auto"`` matches ``"sparse"`` below the threshold
+    and escapes it above -- see the two benchmarks above.
+    """
     rpc, gateway = create_ipfs
 
     async with KuboCAS(rpc_base_url=rpc, gateway_base_url=gateway) as cas:
@@ -499,7 +583,7 @@ async def test_sharded_store_defaults_to_sparse_read_mode(
             chunks_per_shard=4,
         )
 
-    assert store.shard_read_mode == "sparse"
+    assert store.shard_read_mode == "auto"
 
 
 async def test_read_cache_prevents_duplicate_cid_fetches(

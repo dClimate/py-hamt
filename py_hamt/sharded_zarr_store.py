@@ -39,7 +39,7 @@ _FLUSH_CONCURRENCY = 8
 _V1_INFERENCE_CONCURRENCY = 8
 
 ShardCacheKey = int | tuple[str, int]
-ShardReadMode = Literal["full", "sparse"]
+ShardReadMode = Literal["full", "sparse", "auto"]
 
 
 def _read_cbor_argument(
@@ -473,6 +473,22 @@ class ShardedZarrStore(zarr.abc.store.Store):
         "sharded_zarr_v2 writes require an explicit Zarr group. Write the "
         "dataset with ds.to_zarr(..., group='0') or another group name."
     )
+    # Sparse reads of a *single* shard before "auto" latches the whole store to
+    # full decodes. Measured crossover, one CAS round trip per sparse entry:
+    #
+    #     lookups     full     sparse
+    #           1    775ms      3.6ms
+    #          32    775ms     82.2ms
+    #         128    830ms    340.0ms
+    #         256    861ms    706.3ms   <- sparse still ahead
+    #         512    832ms   1334.9ms   <- full ahead
+    #
+    # Sparse costs ~2.6ms/lookup against a ~800ms flat full decode, so the
+    # break-even is ~300; 256 trips just before it. Unlike the jaxray reference
+    # (threshold 32, local blockstore reads), this is a *scan-detection*
+    # threshold rather than a per-shard promotion point: it is paid once for the
+    # whole store, not once per shard.
+    _SPARSE_PROMOTE_THRESHOLD: ClassVar[int] = 256
 
     def __init__(
         self,
@@ -481,14 +497,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
         root_cid: Optional[str] = None,
         *,
         max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
-        shard_read_mode: ShardReadMode = "sparse",
+        shard_read_mode: ShardReadMode = "auto",
     ):
         """Use the async `open()` classmethod to instantiate this class."""
         super().__init__(read_only=read_only)
-        if shard_read_mode not in {"full", "sparse"}:
+        if shard_read_mode not in {"full", "sparse", "auto"}:
             raise ValueError(
                 f"Unsupported shard_read_mode: {shard_read_mode!r}. "
-                "Expected 'full' or 'sparse'."
+                "Expected 'full', 'sparse', or 'auto'."
             )
         self.cas = cas
         self._root_cid = root_cid
@@ -506,6 +522,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         self._shard_data_cache = MemoryBoundedLRUCache(max_cache_memory_bytes)
         self._pending_shard_loads: Dict[ShardCacheKey, asyncio.Event] = {}
+        # Per-shard sparse-read counts, used only to detect the scan pattern in
+        # "auto" mode. Detection is per-shard because 256 reads spread across
+        # 256 distinct shards is a point-read workload, not a scan.
+        self._sparse_read_counts: Dict[ShardCacheKey, int] = {}
+        # Latched once any single shard crosses the threshold: the caller is
+        # scanning, so every shard gets the full path from here on. Store-wide
+        # because the access pattern belongs to the caller, not the shard.
+        self._full_mode_latched: bool = False
         self._metadata_read_cache: Dict[str, bytes] = {}
 
         self.array_indices: Dict[str, ArrayIndex] = {}
@@ -610,7 +634,7 @@ class ShardedZarrStore(zarr.abc.store.Store):
         max_cache_memory_bytes: int = 100 * 1024 * 1024,  # 100MB default
         manifest_version: Optional[str] = None,
         primary_array_path: str = "",
-        shard_read_mode: ShardReadMode = "sparse",
+        shard_read_mode: ShardReadMode = "auto",
     ) -> "ShardedZarrStore":
         """
         Asynchronously opens an existing ShardedZarrStore or initializes a new one.
@@ -618,6 +642,31 @@ class ShardedZarrStore(zarr.abc.store.Store):
         Shape-based creation remains the v1 compatibility path. To create a new
         path-aware v2 store, pass ``manifest_version="sharded_zarr_v2"`` or omit
         ``array_shape``/``chunk_shape`` and provide ``chunks_per_shard``.
+
+        ``shard_read_mode`` controls how a **read-only** cache miss resolves a
+        chunk pointer. It has no effect on writes: a writable store always goes
+        through the shard cache so pending writes stay visible, so writes behave
+        as ``"full"`` does regardless of this setting.
+
+        - ``"auto"`` (the default) starts sparse, then latches the **entire
+          store** to full decodes once any *single* shard has been read
+          ``_SPARSE_PROMOTE_THRESHOLD`` times. The latch is store-wide because
+          the access pattern belongs to the caller rather than the shard: a
+          caller reading one shard that heavily is scanning and will scan the
+          rest too, so making every other shard re-learn that independently
+          would re-pay the detection cost on each one. It is permanent for the
+          store's lifetime and unaffected by cache eviction. Below the
+          threshold it is byte-for-byte the ``"sparse"`` path, so point reads
+          pay nothing for the safety net.
+        - ``"sparse"`` fetches only the requested entry and caches nothing. Far
+          cheaper for point reads, but degrades without bound on a scan,
+          eventually costing more than ``"full"``. Pin this when you know the
+          workload is point reads and want to rule out the latch entirely --
+          for instance a long-lived reader that hammers one hot shard without
+          ever scanning, which ``"auto"`` would latch on.
+        - ``"full"`` decodes and caches the whole shard. Flat cost regardless of
+          how many chunks are then read from it, so it suits known scans and
+          skips ``"auto"``'s detection cost.
         """
         store = cls(
             cas,
@@ -1493,6 +1542,55 @@ class ShardedZarrStore(zarr.abc.store.Store):
                     f"Failed to fetch shard {shard_idx} after {max_retries} attempts: {e}"
                 ) from e
 
+    def _sparse_read_is_eligible(
+        self,
+        array_index: ArrayIndex,
+        shard_idx: int,
+        cached_shard: Optional[List[Optional[CID]]],
+        byte_range: Optional[zarr.abc.store.ByteRequest],
+    ) -> bool:
+        """
+        Whether a single-entry shard decode is structurally legal here.
+
+        Independent of ``shard_read_mode``: a writable store must go through the
+        cache so pending writes stay visible, a cache hit is already cheaper
+        than any fetch, a byte range needs the full CID resolution path, and an
+        absent or out-of-range shard CID has nothing to sparsely decode.
+        """
+        return (
+            self.read_only
+            and cached_shard is None
+            and byte_range is None
+            and 0 <= shard_idx < array_index.num_shards
+            and array_index.shard_cids[shard_idx] is not None
+        )
+
+    def _auto_mode_wants_sparse(self, cache_key: ShardCacheKey) -> bool:
+        """
+        Record one ``auto``-mode sparse read and report whether to stay sparse.
+
+        Called only under ``self._shard_locks[cache_key]``, so each shard's
+        read-modify-write of the counter is serialized. Once any single shard
+        crosses the threshold the whole store latches to full mode: a caller
+        reading one shard that heavily is scanning, and will scan the rest too.
+
+        ``_full_mode_latched`` is written under one shard's lock and read under
+        others, so two shards can latch concurrently. That race is benign and
+        deliberate — the write is idempotent (never ``True`` back to ``False``)
+        and the worst outcome is one extra sparse read on a shard that was about
+        to latch anyway, so it does not warrant a second lock.
+        """
+        if self._full_mode_latched:
+            return False
+        count = self._sparse_read_counts.get(cache_key, 0) + 1
+        if count >= self._SPARSE_PROMOTE_THRESHOLD:
+            self._full_mode_latched = True
+            # Never read again once latched; drop whatever it accumulated.
+            self._sparse_read_counts.clear()
+            return False
+        self._sparse_read_counts[cache_key] = count
+        return True
+
     async def _load_sparse_shard_entry(
         self,
         cache_key: ShardCacheKey,
@@ -1877,6 +1975,14 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         clone._shard_data_cache = self._shard_data_cache
         clone._pending_shard_loads = self._pending_shard_loads
+        # Shared by reference like the cache above: a clone that copied would
+        # restart counting from zero while reading through the *same* cache.
+        clone._sparse_read_counts = self._sparse_read_counts
+        # Copied by value, deliberately. The clone inherits the decision made so
+        # far but latches independently afterward — it has the opposite
+        # read/write posture, and a writable clone can never take the sparse
+        # path at all, so there is nothing for a shared latch to coordinate.
+        clone._full_mode_latched = self._full_mode_latched
         clone._metadata_read_cache = self._metadata_read_cache
 
         clone.array_indices = self.array_indices
@@ -2098,14 +2204,15 @@ class ShardedZarrStore(zarr.abc.store.Store):
                 shard_lock = self._shard_locks[cache_key]
                 async with shard_lock:
                     cached_shard = await self._shard_data_cache.get(cache_key)
-                    if (
-                        self.read_only
-                        and self.shard_read_mode == "sparse"
-                        and cached_shard is None
-                        and byte_range is None
-                        and 0 <= shard_idx < array_index.num_shards
-                        and array_index.shard_cids[shard_idx] is not None
-                    ):
+                    use_sparse = (
+                        self.shard_read_mode != "full"
+                        and self._sparse_read_is_eligible(
+                            array_index, shard_idx, cached_shard, byte_range
+                        )
+                    )
+                    if use_sparse and self.shard_read_mode == "auto":
+                        use_sparse = self._auto_mode_wants_sparse(cache_key)
+                    if use_sparse:
                         chunk_cid_obj = await self._load_sparse_shard_entry(
                             cache_key,
                             shard_idx,
@@ -2386,6 +2493,9 @@ class ShardedZarrStore(zarr.abc.store.Store):
             pending_load.set()
         self._pending_shard_loads.clear()
         await self._shard_data_cache.clear()
+        # A cleared store has a new access pattern to learn.
+        self._sparse_read_counts.clear()
+        self._full_mode_latched = False
         self._root_obj["metadata"] = {}
         self._root_obj["arrays"] = {}
         self.array_indices.clear()
@@ -2739,6 +2849,10 @@ class ShardedZarrStore(zarr.abc.store.Store):
 
         await self._flush_unlocked()
         await self._shard_data_cache.clear()
+        # Cache keys change shape from int to tuple[str, int] across the
+        # migration, so stale counter entries would be unreachable garbage.
+        self._sparse_read_counts.clear()
+        self._full_mode_latched = False
 
         source_array_path = self._infer_v1_migration_source_array_path(normalized_path)
         old_metadata = dict(self._root_obj.get("metadata", {}))
