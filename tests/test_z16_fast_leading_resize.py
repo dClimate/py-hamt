@@ -122,6 +122,7 @@ async def test_v2_leading_growth_is_fast_and_array_local(
         root_cid=root_cid,
     )
     humidity_manifest = writable.array_indices["humidity"].to_manifest()
+    humidity_manifest["shard_cids"] = list(humidity_manifest["shard_cids"])
 
     snapshot = AsyncMock(
         side_effect=AssertionError("leading-dimension growth must not snapshot shards")
