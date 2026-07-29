@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr.core.buffer
+from multiformats import CID
 from testing_utils import CIDInMemoryCAS
 
 from py_hamt.sharded_zarr_store import (
@@ -54,9 +55,7 @@ async def test_v1_leading_growth_skips_snapshot_and_preserves_chunks(
     old_shard_cids = list(writable.array_indices[""].shard_cids)
 
     snapshot = AsyncMock(
-        side_effect=AssertionError(
-            "leading-dimension growth must not snapshot shards"
-        )
+        side_effect=AssertionError("leading-dimension growth must not snapshot shards")
     )
     monkeypatch.setattr(writable, "_snapshot_shards_for_resize", snapshot)
 
@@ -69,9 +68,7 @@ async def test_v1_leading_growth_skips_snapshot_and_preserves_chunks(
     assert writable._root_obj["chunks"]["array_shape"] == [3, 2]
     assert writable._root_obj["chunks"]["shard_cids"] == resized_index.shard_cids
 
-    await writable.set(
-        "temperature/c/2/0", prototype.buffer.from_bytes(b"new-2-0")
-    )
+    await writable.set("temperature/c/2/0", prototype.buffer.from_bytes(b"new-2-0"))
     resized_root_cid = await writable.flush()
     reopened = await ShardedZarrStore.open(
         cas=cas,
@@ -127,9 +124,7 @@ async def test_v2_leading_growth_is_fast_and_array_local(
     humidity_manifest = writable.array_indices["humidity"].to_manifest()
 
     snapshot = AsyncMock(
-        side_effect=AssertionError(
-            "leading-dimension growth must not snapshot shards"
-        )
+        side_effect=AssertionError("leading-dimension growth must not snapshot shards")
     )
     monkeypatch.setattr(writable, "_snapshot_shards_for_resize", snapshot)
 
@@ -139,9 +134,7 @@ async def test_v2_leading_growth_is_fast_and_array_local(
     assert writable.array_indices["temperature"].array_shape == (3, 2)
     assert writable.array_indices["humidity"].to_manifest() == humidity_manifest
 
-    await writable.set(
-        "temperature/c/2/1", prototype.buffer.from_bytes(b"appended")
-    )
+    await writable.set("temperature/c/2/1", prototype.buffer.from_bytes(b"appended"))
     resized_root_cid = await writable.flush()
     reopened = await ShardedZarrStore.open(
         cas=cas,
@@ -188,9 +181,7 @@ async def test_v1_xarray_append_persists_visible_shape_without_snapshot(
     )
 
     snapshot = AsyncMock(
-        side_effect=AssertionError(
-            "leading-dimension growth must not snapshot shards"
-        )
+        side_effect=AssertionError("leading-dimension growth must not snapshot shards")
     )
     monkeypatch.setattr(writable, "_snapshot_shards_for_resize", snapshot)
 
@@ -227,7 +218,9 @@ async def test_non_leading_change_and_shrink_use_general_resize(
     snapshot_calls = 0
     original_snapshot = store._snapshot_shards_for_resize
 
-    async def count_snapshot(array_index: ArrayIndex) -> dict:
+    async def count_snapshot(
+        array_index: ArrayIndex,
+    ) -> dict[int, list[CID | None]]:
         nonlocal snapshot_calls
         snapshot_calls += 1
         return await original_snapshot(array_index)
