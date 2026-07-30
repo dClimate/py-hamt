@@ -1279,15 +1279,38 @@ class ShardedZarrStore(zarr.abc.store.Store):
             async with shard_lock:
                 await self._shard_data_cache.discard(cache_key)
 
+    @staticmethod
+    def _can_fast_resize_leading_dimension(
+        array_index: ArrayIndex, new_shape: tuple[int, ...]
+    ) -> bool:
+        """Return whether resizing only appends to the row-major chunk grid."""
+        old_shape = array_index.array_shape
+        return (
+            len(old_shape) > 0
+            and len(new_shape) == len(old_shape)
+            and new_shape[0] >= old_shape[0]
+            and new_shape[1:] == old_shape[1:]
+            and array_index.order == "C"
+        )
+
     async def _resize_array_index(
         self, array_index: ArrayIndex, new_shape: tuple[int, ...]
     ) -> None:
+        new_shape = tuple(new_shape)
+        if self._can_fast_resize_leading_dimension(array_index, new_shape):
+            array_index.resize(new_shape)
+            if self._primary_array_path == array_index.array_path:
+                self._set_legacy_geometry_from_index(array_index)
+            self._sync_arrays_to_root()
+            self._dirty_root = True
+            return
+
         old_num_shards = array_index.num_shards
         old_total_chunks = array_index.total_chunks
         old_chunks_per_dim = array_index.chunks_per_dim
         old_shard_cids = list(array_index.shard_cids)
         old_shards_by_index = await self._snapshot_shards_for_resize(array_index)
-        array_index.resize(tuple(new_shape))
+        array_index.resize(new_shape)
         new_shards_by_index = self._remap_shards_for_resize(
             old_shards_by_index,
             old_chunks_per_dim,
