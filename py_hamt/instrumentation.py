@@ -1,3 +1,4 @@
+import math
 import os
 import statistics
 import threading
@@ -5,10 +6,11 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
-from opentelemetry import metrics, trace
+from opentelemetry import context, metrics, trace
 from opentelemetry.trace import Span, Status, StatusCode
 
 TRUE_VALUES = {"True", "true", "1", "yes", "Y", "T"}
@@ -16,6 +18,9 @@ OTEL_ATTRIBUTE_VALUE = str | bool | int | float
 
 _TRACER = trace.get_tracer("py_hamt")
 _METER = metrics.get_meter("py_hamt")
+_DEFERRED_ATTRIBUTES: ContextVar[dict[str, OTEL_ATTRIBUTE_VALUE] | None] = ContextVar(
+    "py_hamt_span_attributes", default=None
+)
 _CAS_LOAD_COUNTER = _METER.create_counter(
     "py_hamt.cas.load.requests",
     unit="1",
@@ -122,6 +127,60 @@ def _attributes(
 def span(
     name: str, attributes: dict[str, Any] | None = None
 ) -> Generator[Span, None, None]:
+    """Emit full operation detail or only completed diagnostic operations."""
+    mode = os.getenv("PY_HAMT_OTEL_TRACE_MODE", "full").strip().lower()
+    if mode not in {"full", "diagnostic", "off"}:
+        raise ValueError("PY_HAMT_OTEL_TRACE_MODE must be full, diagnostic or off")
+    if mode == "off":
+        token = _DEFERRED_ATTRIBUTES.set({})
+        try:
+            yield trace.INVALID_SPAN
+        finally:
+            _DEFERRED_ATTRIBUTES.reset(token)
+        return
+    if mode == "diagnostic":
+        slow_seconds = float(os.getenv("PY_HAMT_OTEL_SLOW_SECONDS", "5"))
+        if not math.isfinite(slow_seconds) or slow_seconds < 0:
+            raise ValueError("PY_HAMT_OTEL_SLOW_SECONDS must be finite and nonnegative")
+        deferred_attributes = _attributes(attributes)
+        token = _DEFERRED_ATTRIBUTES.set(deferred_attributes)
+        parent_context = context.get_current()
+        started_at = time.perf_counter()
+        started_ns = time.time_ns()
+        error: BaseException | None = None
+        try:
+            yield trace.INVALID_SPAN
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            ended_ns = time.time_ns()
+            elapsed = time.perf_counter() - started_at
+            _DEFERRED_ATTRIBUTES.reset(token)
+            cas_status = deferred_attributes.get("py_hamt.cas.status")
+            retries = deferred_attributes.get("py_hamt.cas.retries")
+            if (
+                error is not None
+                or elapsed >= slow_seconds
+                or cas_status not in (None, "ok")
+                or (isinstance(retries, (int, float)) and retries > 0)
+                or deferred_attributes.get("py_hamt.hamt.lookup.found") is False
+            ):
+                diagnostic_span = _TRACER.start_span(
+                    name,
+                    context=parent_context,
+                    attributes=deferred_attributes,
+                    start_time=started_ns,
+                )
+                if error is not None:
+                    diagnostic_span.record_exception(error)
+                    diagnostic_span.set_status(Status(StatusCode.ERROR, str(error)))
+                elif cas_status not in (None, "ok"):
+                    diagnostic_span.set_status(
+                        Status(StatusCode.ERROR, str(cas_status))
+                    )
+                diagnostic_span.end(end_time=ended_ns)
+        return
     with _TRACER.start_as_current_span(
         name, attributes=_attributes(attributes)
     ) as active_span:
@@ -139,6 +198,12 @@ def _current_span() -> Span:
 
 
 def _set_current_span_attributes(attributes: dict[str, Any]) -> None:
+    deferred_attributes = _DEFERRED_ATTRIBUTES.get()
+    if deferred_attributes is not None:
+        deferred_attributes.update(_attributes(attributes))
+        return
+    if os.getenv("PY_HAMT_OTEL_TRACE_MODE", "full").strip().lower() != "full":
+        return
     active_span = _current_span()
     if not active_span.is_recording():
         return
@@ -234,7 +299,7 @@ def begin_cas_load(cid: Any, has_range: bool) -> TraceContext:
         "py_hamt.cas.has_range": has_range
     }
     custom_metrics_enabled = enabled()
-    span_context_manager = _TRACER.start_as_current_span(
+    span_context_manager = span(
         "py_hamt.cas.load",
         attributes=_attributes({
             "py_hamt.cid": str(cid),
@@ -275,12 +340,13 @@ def end_cas_load(
     _CAS_LOAD_BYTES.add(byte_count, attributes)
     _CAS_LOAD_RETRIES.add(retries, attributes)
     _CAS_LOAD_DURATION.record(elapsed, attributes)
-    if trace_context.span.is_recording():
-        trace_context.span.set_attribute("py_hamt.cas.status", status)
-        trace_context.span.set_attribute("py_hamt.cas.response_bytes", byte_count)
-        trace_context.span.set_attribute("py_hamt.cas.retries", retries)
-        if status != "ok":
-            trace_context.span.set_status(Status(StatusCode.ERROR, status))
+    _set_current_span_attributes({
+        "py_hamt.cas.status": status,
+        "py_hamt.cas.response_bytes": byte_count,
+        "py_hamt.cas.retries": retries,
+    })
+    if trace_context.span.is_recording() and status != "ok":
+        trace_context.span.set_status(Status(StatusCode.ERROR, status))
     if trace_context.custom_metrics_enabled:
         with _LOCK:
             _METRICS.inflight_cas_loads = max(0, _METRICS.inflight_cas_loads - 1)
