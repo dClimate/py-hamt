@@ -20,6 +20,17 @@ jobs:
       fail-fast: true
       matrix:
         python-version: ["3.12"]
+    services:
+      kubo:
+        image: ipfs/kubo:v0.36.0@sha256:51dd374d5a6a7e1a7c77358701d65bbf558a2e76802d65d4f81b125877811ee1
+        ports:
+          - "127.0.0.1:5001:5001"
+          - "127.0.0.1:8080:8080"
+        options: >-
+          --health-cmd "ipfs --api=/ip4/127.0.0.1/tcp/5001 id"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -35,12 +46,6 @@ jobs:
 
       - name: Create project environment
         run: uv sync
-
-      - name: Install IPFS
-        uses: Faolain/setup-ipfs@v0.7.0
-        with:
-          ipfs_version: "0.36.0"
-          run_daemon: true
 
       - name: Run pytest with coverage
         run: uv run pytest --ipfs --cov=py_hamt tests/ --cov-report=xml -s

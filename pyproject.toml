@@ -37,6 +37,7 @@ dev = [
     "types-docker>=7.1.0.20250523",
     "pre-commit>=4.2.0",
     "trustme>=1.2.1",
+    "opentelemetry-sdk>=1.30.0",
 ]
 
 [tool.ruff]
