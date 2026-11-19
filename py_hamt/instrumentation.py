@@ -21,6 +21,9 @@ _METER = metrics.get_meter("py_hamt")
 _DEFERRED_ATTRIBUTES: ContextVar[dict[str, OTEL_ATTRIBUTE_VALUE] | None] = ContextVar(
     "py_hamt_span_attributes", default=None
 )
+_FULL_SPAN_ACTIVE: ContextVar[bool] = ContextVar(
+    "py_hamt_full_span_active", default=False
+)
 _CAS_LOAD_COUNTER = _METER.create_counter(
     "py_hamt.cas.load.requests",
     unit="1",
@@ -159,11 +162,13 @@ def span(
             _DEFERRED_ATTRIBUTES.reset(token)
             cas_status = deferred_attributes.get("py_hamt.cas.status")
             retries = deferred_attributes.get("py_hamt.cas.retries")
+            gateway_failures = deferred_attributes.get("py_hamt.cas.gateway_failures")
             if (
                 error is not None
                 or elapsed >= slow_seconds
                 or cas_status not in (None, "ok")
                 or (isinstance(retries, (int, float)) and retries > 0)
+                or (isinstance(gateway_failures, (int, float)) and gateway_failures > 0)
                 or deferred_attributes.get("py_hamt.hamt.lookup.found") is False
             ):
                 diagnostic_span = _TRACER.start_span(
@@ -181,16 +186,22 @@ def span(
                     )
                 diagnostic_span.end(end_time=ended_ns)
         return
-    with _TRACER.start_as_current_span(
-        name, attributes=_attributes(attributes)
-    ) as active_span:
-        try:
-            yield active_span
-        except Exception as exc:
-            if active_span.is_recording():
-                active_span.record_exception(exc)
-                active_span.set_status(Status(StatusCode.ERROR, str(exc)))
-            raise
+    deferred_token = _DEFERRED_ATTRIBUTES.set(None)
+    full_token = _FULL_SPAN_ACTIVE.set(True)
+    try:
+        with _TRACER.start_as_current_span(
+            name, attributes=_attributes(attributes)
+        ) as active_span:
+            try:
+                yield active_span
+            except BaseException as exc:
+                if active_span.is_recording():
+                    active_span.record_exception(exc)
+                    active_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
+    finally:
+        _FULL_SPAN_ACTIVE.reset(full_token)
+        _DEFERRED_ATTRIBUTES.reset(deferred_token)
 
 
 def _current_span() -> Span:
@@ -202,7 +213,10 @@ def _set_current_span_attributes(attributes: dict[str, Any]) -> None:
     if deferred_attributes is not None:
         deferred_attributes.update(_attributes(attributes))
         return
-    if os.getenv("PY_HAMT_OTEL_TRACE_MODE", "full").strip().lower() != "full":
+    if (
+        not _FULL_SPAN_ACTIVE.get()
+        and os.getenv("PY_HAMT_OTEL_TRACE_MODE", "full").strip().lower() != "full"
+    ):
         return
     active_span = _current_span()
     if not active_span.is_recording():
@@ -331,6 +345,8 @@ def end_cas_load(
     byte_count: int = 0,
     retries: int = 0,
     status: str = "ok",
+    gateway_failures: int = 0,
+    exception: BaseException | None = None,
 ) -> None:
     if trace_context is None:
         return
@@ -344,6 +360,7 @@ def end_cas_load(
         "py_hamt.cas.status": status,
         "py_hamt.cas.response_bytes": byte_count,
         "py_hamt.cas.retries": retries,
+        "py_hamt.cas.gateway_failures": gateway_failures,
     })
     if trace_context.span.is_recording() and status != "ok":
         trace_context.span.set_status(Status(StatusCode.ERROR, status))
@@ -354,7 +371,11 @@ def end_cas_load(
             _METRICS.counters["cas_load.retries"] += retries
             _METRICS.bytes["cas_load.response_bytes"] += byte_count
             _METRICS.observe("cas_load.latency_seconds", elapsed)
-    trace_context.span_context_manager.__exit__(None, None, None)
+    trace_context.span_context_manager.__exit__(
+        type(exception) if exception is not None else None,
+        exception,
+        exception.__traceback__ if exception is not None else None,
+    )
 
 
 def record_hamt_node_load(

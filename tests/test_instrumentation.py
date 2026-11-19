@@ -1,13 +1,15 @@
 import asyncio
 from collections.abc import Generator
 
+import httpx
 import pytest
+from multiformats import CID, multihash
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from py_hamt import instrumentation
+from py_hamt import KuboCAS, instrumentation
 
 
 @pytest.fixture
@@ -70,6 +72,174 @@ def test_full_mode_preserves_nested_detail(
     assert lookup_span.parent == parent.context
     assert load_span.attributes["py_hamt.cid"] == "cid"
     assert load_span.attributes["py_hamt.cas.response_bytes"] == 123
+
+
+@pytest.mark.parametrize("initial_mode", ["full", "diagnostic", "off"])
+@pytest.mark.parametrize("completion_mode", ["full", "diagnostic", "off"])
+def test_cas_completion_keeps_the_operation_start_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    initial_mode: str,
+    completion_mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", initial_mode)
+    provider, exporter = otel_spans
+    with provider.get_tracer("caller").start_as_current_span("job"):
+        load = instrumentation.begin_cas_load("cid", has_range=False)
+        monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", completion_mode)
+        instrumentation.end_cas_load(load, byte_count=123, retries=1, status="timeout")
+    spans = exporter.get_finished_spans()
+    if initial_mode == "off":
+        assert [span.name for span in spans] == ["job"]
+    else:
+        load_span, parent = spans
+        assert load_span.parent == parent.context
+        assert load_span.status.status_code == trace.StatusCode.ERROR
+        assert load_span.attributes["py_hamt.cas.status"] == "timeout"
+        assert load_span.attributes["py_hamt.cas.response_bytes"] == 123
+        assert load_span.attributes["py_hamt.cas.retries"] == 1
+    assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+    assert not instrumentation._FULL_SPAN_ACTIVE.get()
+
+
+def test_full_child_does_not_write_into_an_outer_diagnostic_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_SLOW_SECONDS", "0")
+    _, exporter = otel_spans
+    with instrumentation.span("outer"):
+        monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", "full")
+        with instrumentation.span("inner"):
+            instrumentation._set_current_span_attributes({"owner": "inner"})
+        instrumentation._set_current_span_attributes({"owner": "outer"})
+    inner, outer = exporter.get_finished_spans()
+    assert inner.attributes["owner"] == "inner"
+    assert outer.attributes["owner"] == "outer"
+    assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+    assert not instrumentation._FULL_SPAN_ACTIVE.get()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic", "off"])
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize("retry_first", [False, True])
+async def test_cas_load_preserves_actual_exceptions_and_records_metrics_once(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+    error_type: type[BaseException],
+    retry_first: bool,
+) -> None:
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    provider, exporter = otel_spans
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
+    meter = meter_provider.get_meter("py_hamt")
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_COUNTER", meter.create_counter("requests")
+    )
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_RETRIES", meter.create_counter("retries")
+    )
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_DURATION", meter.create_histogram("duration")
+    )
+    error = error_type("CAS interrupted")
+    attempts = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if retry_first and attempts == 1:
+            raise httpx.ReadTimeout("retry", request=request)
+        raise error
+
+    cid = CID("base32", 1, "raw", multihash.digest(b"block", "sha2-256"))
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            async with KuboCAS(
+                client=client,
+                gateway_base_url="https://gateway.test",
+                max_retries=1,
+                initial_delay=0.001,
+            ) as cas:
+                with provider.get_tracer("caller").start_as_current_span(
+                    "job"
+                ) as parent:
+                    with pytest.raises(error_type) as raised:
+                        await cas.load(cid)
+                    assert raised.value is error
+                    assert trace.get_current_span() is parent
+        spans = exporter.get_finished_spans()
+        if mode == "off":
+            assert [span.name for span in spans] == ["job"]
+        else:
+            load_span, job_span = spans
+            assert load_span.parent == job_span.context
+            assert load_span.status.status_code == trace.StatusCode.ERROR
+            assert load_span.attributes["py_hamt.cas.retries"] == int(retry_first)
+            assert load_span.attributes["py_hamt.cas.status"] == (
+                "cancelled" if error_type is asyncio.CancelledError else "error"
+            )
+            assert any(
+                "CAS interrupted" in event.attributes["exception.stacktrace"]
+                for event in load_span.events
+            )
+        values = {
+            metric.name: metric.data.data_points[0]
+            for resource in reader.get_metrics_data().resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+        }
+        assert values["requests"].value == 1
+        assert values["retries"].value == int(retry_first)
+        assert values["duration"].count == 1
+        assert attempts == 1 + int(retry_first)
+        assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+        assert not instrumentation._FULL_SPAN_ACTIVE.get()
+    finally:
+        meter_provider.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [(404, b""), (200, b"corrupt"), (503, b"")])
+async def test_diagnostic_spans_retain_successful_gateway_failover(
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter], status: int, body: bytes
+) -> None:
+    provider, exporter = otel_spans
+    data = b"block"
+    cid = CID("base32", 1, "raw", multihash.digest(data, "sha2-256"))
+    attempts: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.host)
+        return (
+            httpx.Response(status, content=body)
+            if request.url.host == "primary.test"
+            else httpx.Response(200, content=data)
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async with KuboCAS(
+            client=client,
+            gateway_base_urls=["https://primary.test", "https://secondary.test"],
+            max_retries=0,
+            verify_content=True,
+        ) as cas:
+            with provider.get_tracer("caller").start_as_current_span("job"):
+                assert await cas.load(cid) == data
+    load_span, parent = exporter.get_finished_spans()
+    assert attempts == ["primary.test", "secondary.test"]
+    assert load_span.parent == parent.context
+    assert load_span.attributes["py_hamt.cas.gateway_failures"] == 1
+    assert load_span.attributes["py_hamt.cas.retries"] == 0
+    assert load_span.attributes["py_hamt.cas.status"] == "ok"
+    assert load_span.attributes["py_hamt.cas.response_bytes"] == len(data)
+    assert load_span.status.status_code == trace.StatusCode.UNSET
 
 
 @pytest.mark.parametrize("mode", ["diagnostic", "off"])

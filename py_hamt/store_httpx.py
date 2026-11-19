@@ -1382,6 +1382,7 @@ class KuboCAS(ContentAddressedStore):
         stats = _LoadStats()
         gateways = self._ordered_gateways()
         failures: list[Exception] = []
+        exception: BaseException | None = None
         try:
             for gateway_base_url in gateways:
                 health = self._gateway_health[gateway_base_url]
@@ -1415,12 +1416,21 @@ class KuboCAS(ContentAddressedStore):
             raise ExceptionGroup(
                 f"all {len(gateways)} gateways failed for CID {cid}", failures
             )
+        except BaseException as error:
+            exception = error
+            if isinstance(error, asyncio.CancelledError):
+                stats.status = "cancelled"
+            elif stats.status == "ok":
+                stats.status = "error"
+            raise
         finally:
             instrumentation.end_cas_load(
                 trace_started_at,
                 byte_count=stats.response_bytes,
                 retries=stats.retries,
                 status=stats.status,
+                gateway_failures=len(failures),
+                exception=exception,
             )
 
     # --------------------------------------------------------------------- #

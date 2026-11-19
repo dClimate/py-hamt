@@ -62,7 +62,7 @@ logging levels and aggregate metrics:
 
 `full` preserves the existing nested span for every block load, HAMT lookup and
 Zarr store read. For busy workers, select `diagnostic` to create spans only after
-an operation fails, retries a CAS read, misses a HAMT lookup, or reaches the slow
+an operation fails, retries or fails over a CAS read, misses a HAMT lookup, or reaches the slow
 threshold. Diagnostic spans retain operation attributes, actual start/end times,
 exception stacks where available, and the caller's parent trace/job context.
 They attach directly to that caller rather than reconstructing omitted internal
