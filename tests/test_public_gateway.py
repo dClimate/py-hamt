@@ -179,6 +179,7 @@ async def test_kubocas_public_gateway():
         cas = KuboCAS(
             rpc_base_url="http://127.0.0.1:5001",  # Keep local RPC for saves
             gateway_base_url=gateway_url,  # Use specified gateway for loads
+            max_retries=0,  # Skip unavailable public gateways without long backoffs.
         )
 
         try:
