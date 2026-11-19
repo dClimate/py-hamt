@@ -185,9 +185,13 @@ async def test_cas_load_preserves_actual_exceptions_and_records_metrics_once(
             assert load_span.attributes["py_hamt.cas.status"] == (
                 "cancelled" if error_type is asyncio.CancelledError else "error"
             )
-            assert any(
-                "CAS interrupted" in event.attributes["exception.stacktrace"]
-                for event in load_span.events
+            exception_events = [
+                event for event in load_span.events if event.name == "exception"
+            ]
+            assert len(exception_events) == 1
+            assert (
+                "CAS interrupted"
+                in exception_events[0].attributes["exception.stacktrace"]
             )
         values = {
             metric.name: metric.data.data_points[0]
@@ -261,23 +265,33 @@ def test_quiet_metric_helpers_do_not_annotate_the_caller_outside_a_library_span(
 @pytest.mark.parametrize(
     "error", [RuntimeError("failure"), asyncio.CancelledError("cancelled")]
 )
-def test_diagnostic_exceptions_preserve_stack_and_job_context(
-    otel_spans: tuple[TracerProvider, InMemorySpanExporter], error: BaseException
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+def test_exceptions_preserve_stack_and_job_context(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    error: BaseException,
+    mode: str,
 ) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
     provider, exporter = otel_spans
     with provider.get_tracer("caller").start_as_current_span("job"):
-        with pytest.raises(type(error)):
+        with pytest.raises(type(error)) as raised:
             with instrumentation.span(
                 "py_hamt.hamt.lookup", {"py_hamt.hamt.lookup.key": "key"}
             ):
                 raise error
-    diagnostic, parent = exporter.get_finished_spans()
-    assert diagnostic.parent == parent.context
-    assert diagnostic.context.trace_id == parent.context.trace_id
-    assert diagnostic.status.status_code == trace.StatusCode.ERROR
-    assert diagnostic.attributes["py_hamt.hamt.lookup.key"] == "key"
-    assert "Traceback" in diagnostic.events[0].attributes["exception.stacktrace"]
-    assert diagnostic.end_time >= diagnostic.start_time
+        assert raised.value is error
+    operation, parent = exporter.get_finished_spans()
+    assert operation.parent == parent.context
+    assert operation.context.trace_id == parent.context.trace_id
+    assert operation.status.status_code == trace.StatusCode.ERROR
+    assert operation.attributes["py_hamt.hamt.lookup.key"] == "key"
+    exception_events = [
+        event for event in operation.events if event.name == "exception"
+    ]
+    assert len(exception_events) == 1
+    assert "Traceback" in exception_events[0].attributes["exception.stacktrace"]
+    assert operation.end_time >= operation.start_time
     assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
 
 
@@ -465,7 +479,12 @@ class _FakeTracer:
         self.context_managers: list[_FakeSpanContextManager] = []
 
     def start_as_current_span(
-        self, name: str, attributes: dict[str, object] | None = None
+        self,
+        name: str,
+        attributes: dict[str, object] | None = None,
+        *,
+        record_exception: bool = True,
+        set_status_on_exception: bool = True,
     ) -> _FakeSpanContextManager:
         span = _FakeSpan()
         if attributes:

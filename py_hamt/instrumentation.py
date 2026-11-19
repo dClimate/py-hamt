@@ -190,7 +190,10 @@ def span(
     full_token = _FULL_SPAN_ACTIVE.set(True)
     try:
         with _TRACER.start_as_current_span(
-            name, attributes=_attributes(attributes)
+            name,
+            attributes=_attributes(attributes),
+            record_exception=False,
+            set_status_on_exception=False,
         ) as active_span:
             try:
                 yield active_span
