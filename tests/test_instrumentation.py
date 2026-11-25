@@ -5,6 +5,7 @@ import httpx
 import pytest
 from multiformats import CID, multihash
 from opentelemetry import trace
+from opentelemetry.sdk.trace import Span as SDKSpan
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -120,9 +121,16 @@ def test_full_child_does_not_write_into_an_outer_diagnostic_buffer(
     assert not instrumentation._FULL_SPAN_ACTIVE.get()
 
 
+class UnformattableError(RuntimeError):
+    def __str__(self) -> str:
+        raise ValueError("formatting failed")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["full", "diagnostic", "off"])
-@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, asyncio.CancelledError, UnformattableError]
+)
 @pytest.mark.parametrize("retry_first", [False, True])
 async def test_cas_load_preserves_actual_exceptions_and_records_metrics_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -189,10 +197,11 @@ async def test_cas_load_preserves_actual_exceptions_and_records_metrics_once(
                 event for event in load_span.events if event.name == "exception"
             ]
             assert len(exception_events) == 1
-            assert (
-                "CAS interrupted"
-                in exception_events[0].attributes["exception.stacktrace"]
-            )
+            event = exception_events[0]
+            assert event.attributes["exception.type"].endswith(error_type.__name__)
+            assert "in handle" in event.attributes["exception.stacktrace"]
+            if mode == "diagnostic":
+                assert event.timestamp == load_span.end_time
         values = {
             metric.name: metric.data.data_points[0]
             for resource in reader.get_metrics_data().resource_metrics
@@ -207,6 +216,46 @@ async def test_cas_load_preserves_actual_exceptions_and_records_metrics_once(
         assert not instrumentation._FULL_SPAN_ACTIVE.get()
     finally:
         meter_provider.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+@pytest.mark.parametrize("multiple_gateways", [False, True])
+async def test_cas_failure_spans_omit_gateway_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+    multiple_gateways: bool,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    _, exporter = otel_spans
+    gateway_urls = ["https://test-user:dummy-password@primary.test"]
+    if multiple_gateways:
+        gateway_urls.append("https://secondary.test")
+    cid = CID("base32", 1, "raw", multihash.digest(b"block", "sha2-256"))
+    transport = httpx.MockTransport(lambda _: httpx.Response(401))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        async with KuboCAS(
+            client=client, gateway_base_urls=gateway_urls, max_retries=0
+        ) as cas:
+            with pytest.raises(
+                ExceptionGroup if multiple_gateways else httpx.HTTPStatusError
+            ) as raised:
+                with instrumentation.span("py_hamt.hamt.lookup"):
+                    await cas.load(cid)
+
+    original = raised.value
+    first_error = (
+        original.exceptions[0] if isinstance(original, ExceptionGroup) else original
+    )
+    assert "dummy-password" in str(first_error)
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["py_hamt.cas.load", "py_hamt.hamt.lookup"]
+    for span in spans:
+        assert "dummy-password" not in span.to_json()
+        (event,) = span.events
+        assert "httpx.HTTPStatusError" in event.attributes["exception.stacktrace"]
 
 
 @pytest.mark.asyncio
@@ -293,6 +342,42 @@ def test_exceptions_preserve_stack_and_job_context(
     assert "Traceback" in exception_events[0].attributes["exception.stacktrace"]
     assert operation.end_time >= operation.start_time
     assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+
+
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+def test_span_ends_when_exception_event_recording_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    _, exporter = otel_spans
+    original = RuntimeError("read failed")
+
+    def fail_recording(*args: object, **kwargs: object) -> None:
+        raise ValueError("event recording failed")
+
+    monkeypatch.setattr(SDKSpan, "add_event", fail_recording)
+    with pytest.raises(RuntimeError) as raised:
+        with instrumentation.span("py_hamt.hamt.lookup"):
+            raise original
+    assert raised.value is original
+    (operation,) = exporter.get_finished_spans()
+    assert operation.status.status_code == trace.StatusCode.ERROR
+
+
+def test_exception_stacktrace_preserves_chained_types_and_handles_cycles() -> None:
+    error = RuntimeError("private message")
+    cause = ValueError("private cause")
+    error.__cause__ = cause
+    cause.__context__ = error
+    cause.add_note("private note")
+
+    stacktrace = instrumentation._exception_stacktrace(error)
+
+    assert stacktrace.count("RuntimeError") == 1
+    assert "ValueError" in stacktrace
+    assert "private" not in stacktrace
 
 
 @pytest.mark.parametrize("elapsed,kept", [(4.999, False), (5, True)])
@@ -445,14 +530,16 @@ def test_off_mode_skips_diagnostic_threshold(monkeypatch: pytest.MonkeyPatch) ->
 class _FakeSpan:
     def __init__(self) -> None:
         self.attributes: dict[str, object] = {}
-        self.exceptions: list[Exception] = []
+        self.events: list[str] = []
         self.statuses: list[object] = []
 
     def is_recording(self) -> bool:
         return True
 
-    def record_exception(self, exc: Exception) -> None:
-        self.exceptions.append(exc)
+    def add_event(
+        self, name: str, attributes: dict[str, str], timestamp: int | None = None
+    ) -> None:
+        self.events.append(name)
 
     def set_status(self, status: object) -> None:
         self.statuses.append(status)
@@ -545,7 +632,7 @@ def test_attributes_and_recording_span(monkeypatch: pytest.MonkeyPatch) -> None:
         with instrumentation.span("test.span", {"object": object()}):
             raise RuntimeError("boom")
 
-    assert tracer.spans[0].exceptions
+    assert tracer.spans[0].events == ["exception"]
     assert tracer.spans[0].statuses
 
     active_span = _FakeSpan()

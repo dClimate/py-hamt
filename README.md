@@ -62,13 +62,16 @@ logging levels and aggregate metrics:
 
 `full` preserves the existing nested span for every block load, HAMT lookup and
 Zarr store read. For busy workers, select `diagnostic` to create spans only after
-an operation fails, retries or fails over a CAS read, misses a HAMT lookup, or reaches the slow
-threshold. Diagnostic spans retain operation attributes, actual start/end times,
-exception stacks where available, and the caller's parent trace/job context.
-They attach directly to that caller rather than reconstructing omitted internal
-span parents. Ordinary successful reads have no individual spans in this mode.
+an operation fails, retries or fails over a CAS read, misses a HAMT lookup, or
+reaches the slow threshold. Diagnostic spans retain operation attributes,
+actual start/end times, and the caller's parent trace/job context. They attach
+directly to that caller. Ordinary successful reads have no individual spans in
+this mode.
 Set `full` on a worker during an investigation when complete low-level history
 is needed; previously omitted history cannot be recovered.
+
+To protect gateway credentials, `full` and `diagnostic` spans limit exported
+exception details to types and stack frame locations.
 
 `off` emits no py-hamt operation spans, including diagnostic spans, while leaving
 the caller's active span intact. Aggregate request, byte, retry and latency

@@ -3,9 +3,10 @@ import os
 import statistics
 import threading
 import time
+import traceback
 from collections import Counter, defaultdict
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -126,6 +127,57 @@ def _attributes(
     return cleaned
 
 
+def _exception_type(error: BaseException) -> str:
+    cls = type(error)
+    if cls.__module__ == "builtins":
+        return cls.__qualname__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _exception_stacktrace(error: BaseException) -> str:
+    # Messages, notes, and source lines can include credentials or request data.
+    # Keep frame locations and types, including chained and grouped failures.
+    pending = [error]
+    seen: set[int] = set()
+    lines: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        lines.append("Traceback (most recent call last):")
+        lines.extend(
+            f'  File "{frame.f_code.co_filename}", line {lineno}, in {frame.f_code.co_name}'
+            for frame, lineno in traceback.walk_tb(current.__traceback__)
+        )
+        lines.append(_exception_type(current))
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+    return "\n".join(lines)
+
+
+def _record_span_error(
+    active_span: Span, error: BaseException, *, timestamp: int | None = None
+) -> None:
+    if not active_span.is_recording():
+        return
+    error_type = _exception_type(error)
+    active_span.set_status(Status(StatusCode.ERROR, error_type))
+    active_span.add_event(
+        "exception",
+        {
+            "exception.type": error_type,
+            "exception.stacktrace": _exception_stacktrace(error),
+        },
+        timestamp=timestamp,
+    )
+
+
 @contextmanager
 def span(
     name: str, attributes: dict[str, Any] | None = None
@@ -171,20 +223,25 @@ def span(
                 or (isinstance(gateway_failures, (int, float)) and gateway_failures > 0)
                 or deferred_attributes.get("py_hamt.hamt.lookup.found") is False
             ):
-                diagnostic_span = _TRACER.start_span(
-                    name,
-                    context=parent_context,
-                    attributes=deferred_attributes,
-                    start_time=started_ns,
-                )
-                if error is not None:
-                    diagnostic_span.record_exception(error)
-                    diagnostic_span.set_status(Status(StatusCode.ERROR, str(error)))
-                elif cas_status not in (None, "ok"):
-                    diagnostic_span.set_status(
-                        Status(StatusCode.ERROR, str(cas_status))
+                # A failure recording telemetry must not replace the operation result.
+                with suppress(Exception):
+                    diagnostic_span = _TRACER.start_span(
+                        name,
+                        context=parent_context,
+                        attributes=deferred_attributes,
+                        start_time=started_ns,
                     )
-                diagnostic_span.end(end_time=ended_ns)
+                    try:
+                        if error is not None:
+                            _record_span_error(
+                                diagnostic_span, error, timestamp=ended_ns
+                            )
+                        elif cas_status not in (None, "ok"):
+                            diagnostic_span.set_status(
+                                Status(StatusCode.ERROR, str(cas_status))
+                            )
+                    finally:
+                        diagnostic_span.end(end_time=ended_ns)
         return
     deferred_token = _DEFERRED_ATTRIBUTES.set(None)
     full_token = _FULL_SPAN_ACTIVE.set(True)
@@ -198,9 +255,8 @@ def span(
             try:
                 yield active_span
             except BaseException as exc:
-                if active_span.is_recording():
-                    active_span.record_exception(exc)
-                    active_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                with suppress(Exception):
+                    _record_span_error(active_span, exc)
                 raise
     finally:
         _FULL_SPAN_ACTIVE.reset(full_token)
