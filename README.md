@@ -70,8 +70,10 @@ this mode.
 Set `full` on a worker during an investigation when complete low-level history
 is needed; previously omitted history cannot be recovered.
 
-To protect gateway credentials, `full` and `diagnostic` spans limit exported
-exception details to types and stack frame locations.
+To protect gateway credentials, `full` and `diagnostic` spans export exception
+types and stack frame locations. For HTTP failures they also record numeric
+response codes as `http.response.status_code` for one response or
+`py_hamt.http.response.status_codes` for multiple responses.
 
 `off` emits no py-hamt operation spans, including diagnostic spans, while leaving
 the caller's active span intact. Aggregate request, byte, retry and latency

@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from opentelemetry import context, metrics, trace
 from opentelemetry.trace import Span, Status, StatusCode
 
@@ -134,12 +135,13 @@ def _exception_type(error: BaseException) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
-def _exception_stacktrace(error: BaseException) -> str:
+def _exception_details(error: BaseException) -> tuple[str, list[int]]:
     # Messages, notes, and source lines can include credentials or request data.
-    # Keep frame locations and types, including chained and grouped failures.
+    # Keep frame locations, types, and numeric HTTP status codes.
     pending = [error]
     seen: set[int] = set()
     lines: list[str] = []
+    http_status_codes: list[int] = []
     while pending:
         current = pending.pop()
         if id(current) in seen:
@@ -151,6 +153,8 @@ def _exception_stacktrace(error: BaseException) -> str:
             for frame, lineno in traceback.walk_tb(current.__traceback__)
         )
         lines.append(_exception_type(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            http_status_codes.append(current.response.status_code)
         cause = current.__cause__
         if cause is None and not current.__suppress_context__:
             cause = current.__context__
@@ -158,7 +162,7 @@ def _exception_stacktrace(error: BaseException) -> str:
             pending.append(cause)
         if isinstance(current, BaseExceptionGroup):
             pending.extend(reversed(current.exceptions))
-    return "\n".join(lines)
+    return "\n".join(lines), http_status_codes
 
 
 def _record_span_error(
@@ -168,11 +172,18 @@ def _record_span_error(
         return
     error_type = _exception_type(error)
     active_span.set_status(Status(StatusCode.ERROR, error_type))
+    stacktrace, http_status_codes = _exception_details(error)
+    if len(http_status_codes) == 1:
+        active_span.set_attribute("http.response.status_code", http_status_codes[0])
+    elif http_status_codes:
+        active_span.set_attribute(
+            "py_hamt.http.response.status_codes", http_status_codes
+        )
     active_span.add_event(
         "exception",
         {
             "exception.type": error_type,
-            "exception.stacktrace": _exception_stacktrace(error),
+            "exception.stacktrace": stacktrace,
         },
         timestamp=timestamp,
     )

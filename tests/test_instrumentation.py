@@ -220,27 +220,40 @@ async def test_cas_load_preserves_actual_exceptions_and_records_metrics_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["full", "diagnostic"])
-@pytest.mark.parametrize("multiple_gateways", [False, True])
-async def test_cas_failure_spans_omit_gateway_credentials(
+@pytest.mark.parametrize(
+    "primary_status,secondary_status",
+    [(401, None), (429, None), (503, None), (401, 503)],
+)
+async def test_cas_failure_spans_keep_http_status_codes_and_omit_credentials(
     monkeypatch: pytest.MonkeyPatch,
     otel_spans: tuple[TracerProvider, InMemorySpanExporter],
     mode: str,
-    multiple_gateways: bool,
+    primary_status: int,
+    secondary_status: int | None,
 ) -> None:
     monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
     _, exporter = otel_spans
     gateway_urls = ["https://test-user:dummy-password@primary.test"]
-    if multiple_gateways:
+    if secondary_status is not None:
         gateway_urls.append("https://secondary.test")
     cid = CID("base32", 1, "raw", multihash.digest(b"block", "sha2-256"))
-    transport = httpx.MockTransport(lambda _: httpx.Response(401))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "primary.test":
+            return httpx.Response(primary_status)
+        assert secondary_status is not None
+        return httpx.Response(secondary_status)
+
+    transport = httpx.MockTransport(handle)
 
     async with httpx.AsyncClient(transport=transport) as client:
         async with KuboCAS(
             client=client, gateway_base_urls=gateway_urls, max_retries=0
         ) as cas:
             with pytest.raises(
-                ExceptionGroup if multiple_gateways else httpx.HTTPStatusError
+                ExceptionGroup
+                if secondary_status is not None
+                else httpx.HTTPStatusError
             ) as raised:
                 with instrumentation.span("py_hamt.hamt.lookup"):
                     await cas.load(cid)
@@ -253,7 +266,17 @@ async def test_cas_failure_spans_omit_gateway_credentials(
     spans = exporter.get_finished_spans()
     assert [span.name for span in spans] == ["py_hamt.cas.load", "py_hamt.hamt.lookup"]
     for span in spans:
-        assert "dummy-password" not in span.to_json()
+        exported = span.to_json()
+        assert "test-user" not in exported
+        assert "dummy-password" not in exported
+        assert span.attributes is not None
+        if secondary_status is None:
+            assert span.attributes["http.response.status_code"] == primary_status
+        else:
+            assert span.attributes["py_hamt.http.response.status_codes"] == (
+                primary_status,
+                secondary_status,
+            )
         (event,) = span.events
         assert "httpx.HTTPStatusError" in event.attributes["exception.stacktrace"]
 
@@ -373,11 +396,12 @@ def test_exception_stacktrace_preserves_chained_types_and_handles_cycles() -> No
     cause.__context__ = error
     cause.add_note("private note")
 
-    stacktrace = instrumentation._exception_stacktrace(error)
+    stacktrace, http_status_codes = instrumentation._exception_details(error)
 
     assert stacktrace.count("RuntimeError") == 1
     assert "ValueError" in stacktrace
     assert "private" not in stacktrace
+    assert not http_status_codes
 
 
 @pytest.mark.parametrize("elapsed,kept", [(4.999, False), (5, True)])
