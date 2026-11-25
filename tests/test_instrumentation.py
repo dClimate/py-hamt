@@ -315,7 +315,42 @@ async def test_diagnostic_spans_retain_successful_gateway_failover(
     assert load_span.attributes["py_hamt.cas.retries"] == 0
     assert load_span.attributes["py_hamt.cas.status"] == "ok"
     assert load_span.attributes["py_hamt.cas.response_bytes"] == len(data)
+    assert load_span.attributes.get("py_hamt.cas.failed_http_status_codes") == (
+        (status,) if status != 200 else None
+    )
     assert load_span.status.status_code == trace.StatusCode.UNSET
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+async def test_cas_span_retains_http_status_codes_after_successful_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    _, exporter = otel_spans
+    data = b"block"
+    cid = CID("base32", 1, "raw", multihash.digest(data, "sha2-256"))
+    statuses = iter((429, 503, 200))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        status = next(statuses)
+        return httpx.Response(status, content=data if status == 200 else b"")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async with KuboCAS(
+            client=client,
+            gateway_base_url="https://gateway.test",
+            max_retries=2,
+            initial_delay=0.001,
+        ) as cas:
+            assert await cas.load(cid) == data
+
+    (load_span,) = exporter.get_finished_spans()
+    assert load_span.attributes["py_hamt.cas.failed_http_status_codes"] == (429, 503)
+    assert load_span.attributes["py_hamt.cas.retries"] == 2
+    assert load_span.attributes["py_hamt.cas.status"] == "ok"
 
 
 @pytest.mark.parametrize("mode", ["diagnostic", "off"])

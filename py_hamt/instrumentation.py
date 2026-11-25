@@ -14,13 +14,14 @@ from typing import Any
 import httpx
 from opentelemetry import context, metrics, trace
 from opentelemetry.trace import Span, Status, StatusCode
+from opentelemetry.util.types import AttributeValue
 
 TRUE_VALUES = {"True", "true", "1", "yes", "Y", "T"}
 OTEL_ATTRIBUTE_VALUE = str | bool | int | float
 
 _TRACER = trace.get_tracer("py_hamt")
 _METER = metrics.get_meter("py_hamt")
-_DEFERRED_ATTRIBUTES: ContextVar[dict[str, OTEL_ATTRIBUTE_VALUE] | None] = ContextVar(
+_DEFERRED_ATTRIBUTES: ContextVar[dict[str, AttributeValue] | None] = ContextVar(
     "py_hamt_span_attributes", default=None
 )
 _FULL_SPAN_ACTIVE: ContextVar[bool] = ContextVar(
@@ -114,14 +115,16 @@ class TraceContext:
 
 def _attributes(
     attributes: dict[str, Any] | None = None,
-) -> dict[str, OTEL_ATTRIBUTE_VALUE]:
+) -> dict[str, AttributeValue]:
     if not attributes:
         return {}
-    cleaned: dict[str, OTEL_ATTRIBUTE_VALUE] = {}
+    cleaned: dict[str, AttributeValue] = {}
     for key, value in attributes.items():
         if value is None:
             continue
-        if isinstance(value, (str, bool, int, float)):
+        if isinstance(value, (str, bool, int, float)) or (
+            isinstance(value, tuple) and all(type(item) is int for item in value)
+        ):
             cleaned[key] = value
         else:
             cleaned[key] = str(value)
@@ -416,6 +419,7 @@ def end_cas_load(
     retries: int = 0,
     status: str = "ok",
     gateway_failures: int = 0,
+    failed_http_status_codes: list[int] | None = None,
     exception: BaseException | None = None,
 ) -> None:
     if trace_context is None:
@@ -431,6 +435,9 @@ def end_cas_load(
         "py_hamt.cas.response_bytes": byte_count,
         "py_hamt.cas.retries": retries,
         "py_hamt.cas.gateway_failures": gateway_failures,
+        "py_hamt.cas.failed_http_status_codes": (
+            tuple(failed_http_status_codes) if failed_http_status_codes else None
+        ),
     })
     if trace_context.span.is_recording() and status != "ok":
         trace_context.span.set_status(Status(StatusCode.ERROR, status))

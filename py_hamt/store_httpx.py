@@ -187,12 +187,13 @@ def _retry_delay(
 class _LoadStats:
     """Mutable trace counters shared across the gateways one load attempts."""
 
-    __slots__ = ("response_bytes", "retries", "status")
+    __slots__ = ("response_bytes", "retries", "status", "failed_http_status_codes")
 
     def __init__(self) -> None:
         self.response_bytes: int = 0
         self.retries: int = 0
         self.status: str = "ok"
+        self.failed_http_status_codes: list[int] | None = None
 
 
 class GatewayContentMismatch(Exception):
@@ -1315,6 +1316,9 @@ class KuboCAS(ContentAddressedStore):
                 )
 
             except httpx.HTTPStatusError as error:
+                if stats.failed_http_status_codes is None:
+                    stats.failed_http_status_codes = []
+                stats.failed_http_status_codes.append(error.response.status_code)
                 if (
                     error.response.status_code not in _RETRYABLE_STATUS_CODES
                     or retry_count >= self.max_retries
@@ -1430,6 +1434,7 @@ class KuboCAS(ContentAddressedStore):
                 retries=stats.retries,
                 status=stats.status,
                 gateway_failures=len(failures),
+                failed_http_status_codes=stats.failed_http_status_codes,
                 exception=exception,
             )
 

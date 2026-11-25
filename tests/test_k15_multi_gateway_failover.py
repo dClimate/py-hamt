@@ -529,6 +529,7 @@ async def test_failed_load_is_not_traced_as_a_success(
         retries: int,
         status: str,
         gateway_failures: int,
+        failed_http_status_codes: list[int] | None,
         exception: BaseException | None,
     ) -> None:
         seen.append(status)
@@ -538,6 +539,7 @@ async def test_failed_load_is_not_traced_as_a_success(
             retries=retries,
             status=status,
             gateway_failures=gateway_failures,
+            failed_http_status_codes=failed_http_status_codes,
             exception=exception,
         )
 
@@ -566,6 +568,7 @@ async def test_recovery_after_a_failed_gateway_traces_as_success(
         retries: int,
         status: str,
         gateway_failures: int,
+        failed_http_status_codes: list[int] | None,
         exception: BaseException | None,
     ) -> None:
         seen.append(status)
@@ -575,6 +578,7 @@ async def test_recovery_after_a_failed_gateway_traces_as_success(
             retries=retries,
             status=status,
             gateway_failures=gateway_failures,
+            failed_http_status_codes=failed_http_status_codes,
             exception=exception,
         )
 
