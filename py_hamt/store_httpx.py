@@ -1389,6 +1389,9 @@ class KuboCAS(ContentAddressedStore):
         exception: BaseException | None = None
         try:
             for gateway_base_url in gateways:
+                # Each gateway starts with a fresh outcome. Retry and HTTP
+                # status history still accumulate across gateways.
+                stats.status = "ok"
                 health = self._gateway_health[gateway_base_url]
                 try:
                     content = await self._load_from_gateway(
@@ -1407,9 +1410,6 @@ class KuboCAS(ContentAddressedStore):
                     continue
                 else:
                     health.record_success()
-                    # A gateway leg may have set a failure status before a later
-                    # gateway succeeded; the operation as a whole is a success.
-                    stats.status = "ok"
                     return content
 
             # Every gateway failed. With one configured, re-raise its error

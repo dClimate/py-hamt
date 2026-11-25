@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Generator
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -319,6 +320,42 @@ async def test_diagnostic_spans_retain_successful_gateway_failover(
         (status,) if status != 200 else None
     )
     assert load_span.status.status_code == trace.StatusCode.UNSET
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+async def test_cas_classifies_unexpected_error_after_gateway_failover(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    requests = Mock()
+    monkeypatch.setattr(instrumentation, "_CAS_LOAD_COUNTER", requests)
+    _, exporter = otel_spans
+    cid = CID("base32", 1, "raw", multihash.digest(b"block", "sha2-256"))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "primary.test":
+            return httpx.Response(404)
+        raise RuntimeError("fallback failed")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async with KuboCAS(
+            client=client,
+            gateway_base_urls=["https://primary.test", "https://fallback.test"],
+            max_retries=0,
+        ) as cas:
+            with pytest.raises(RuntimeError, match="fallback failed"):
+                await cas.load(cid)
+
+    (load_span,) = exporter.get_finished_spans()
+    assert load_span.attributes["py_hamt.cas.status"] == "error"
+    assert load_span.attributes["py_hamt.cas.gateway_failures"] == 1
+    assert load_span.attributes["py_hamt.cas.failed_http_status_codes"] == (404,)
+    requests.add.assert_called_once_with(
+        1, {"py_hamt.cas.has_range": False, "py_hamt.cas.status": "error"}
+    )
 
 
 @pytest.mark.asyncio
