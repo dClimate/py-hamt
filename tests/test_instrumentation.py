@@ -1,19 +1,641 @@
-import pytest
+import asyncio
+from collections.abc import Generator
+from unittest.mock import Mock
 
-from py_hamt import instrumentation
+import httpx
+import pytest
+from multiformats import CID, multihash
+from opentelemetry import trace
+from opentelemetry.sdk.trace import Span as SDKSpan
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+from py_hamt import KuboCAS, instrumentation
+
+
+@pytest.fixture
+def otel_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[tuple[TracerProvider, InMemorySpanExporter], None, None]:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(instrumentation, "_TRACER", provider.get_tracer("py_hamt"))
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", "diagnostic")
+    monkeypatch.setenv("PY_HAMT_OTEL_SLOW_SECONDS", "5")
+    try:
+        yield provider, exporter
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["diagnostic", "off"])
+def test_quiet_modes_preserve_parent_context_without_parent_attribute_pollution(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    provider, exporter = otel_spans
+    with provider.get_tracer("caller").start_as_current_span("job") as parent:
+        with instrumentation.span(
+            "py_hamt.hamt.lookup", {"py_hamt.hamt.lookup.key": "key"}
+        ):
+            instrumentation.record_hamt_lookup(
+                "key",
+                depth=1,
+                node_loads=1,
+                node_cache_hits=0,
+                found=True,
+                seconds=0.01,
+            )
+            load = instrumentation.begin_cas_load("cid", has_range=False)
+            instrumentation.end_cas_load(load, byte_count=123)
+            assert trace.get_current_span() is parent
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "job"
+    assert not exported.attributes
+    assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+
+
+def test_full_mode_preserves_nested_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", "full")
+    provider, exporter = otel_spans
+    with provider.get_tracer("caller").start_as_current_span("job"):
+        with instrumentation.span("py_hamt.hamt.lookup"):
+            load = instrumentation.begin_cas_load("cid", has_range=False)
+            instrumentation.end_cas_load(load, byte_count=123)
+    load_span, lookup_span, parent = exporter.get_finished_spans()
+    assert load_span.parent == lookup_span.context
+    assert lookup_span.parent == parent.context
+    assert load_span.attributes["py_hamt.cid"] == "cid"
+    assert load_span.attributes["py_hamt.cas.response_bytes"] == 123
+
+
+@pytest.mark.parametrize("initial_mode", ["full", "diagnostic", "off"])
+@pytest.mark.parametrize("completion_mode", ["full", "diagnostic", "off"])
+def test_cas_completion_keeps_the_operation_start_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    initial_mode: str,
+    completion_mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", initial_mode)
+    provider, exporter = otel_spans
+    with provider.get_tracer("caller").start_as_current_span("job"):
+        load = instrumentation.begin_cas_load("cid", has_range=False)
+        monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", completion_mode)
+        instrumentation.end_cas_load(load, byte_count=123, retries=1, status="timeout")
+    spans = exporter.get_finished_spans()
+    if initial_mode == "off":
+        assert [span.name for span in spans] == ["job"]
+    else:
+        load_span, parent = spans
+        assert load_span.parent == parent.context
+        assert load_span.status.status_code == trace.StatusCode.ERROR
+        assert load_span.attributes["py_hamt.cas.status"] == "timeout"
+        assert load_span.attributes["py_hamt.cas.response_bytes"] == 123
+        assert load_span.attributes["py_hamt.cas.retries"] == 1
+    assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+    assert not instrumentation._FULL_SPAN_ACTIVE.get()
+
+
+def test_full_child_does_not_write_into_an_outer_diagnostic_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_SLOW_SECONDS", "0")
+    _, exporter = otel_spans
+    with instrumentation.span("outer"):
+        monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", "full")
+        with instrumentation.span("inner"):
+            instrumentation._set_current_span_attributes({"owner": "inner"})
+        instrumentation._set_current_span_attributes({"owner": "outer"})
+    inner, outer = exporter.get_finished_spans()
+    assert inner.attributes["owner"] == "inner"
+    assert outer.attributes["owner"] == "outer"
+    assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+    assert not instrumentation._FULL_SPAN_ACTIVE.get()
+
+
+class UnformattableError(RuntimeError):
+    def __str__(self) -> str:
+        raise ValueError("formatting failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic", "off"])
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, asyncio.CancelledError, UnformattableError]
+)
+@pytest.mark.parametrize("retry_first", [False, True])
+async def test_cas_load_preserves_actual_exceptions_and_records_metrics_once(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+    error_type: type[BaseException],
+    retry_first: bool,
+) -> None:
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    provider, exporter = otel_spans
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
+    meter = meter_provider.get_meter("py_hamt")
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_COUNTER", meter.create_counter("requests")
+    )
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_RETRIES", meter.create_counter("retries")
+    )
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_DURATION", meter.create_histogram("duration")
+    )
+    error = error_type("CAS interrupted")
+    attempts = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if retry_first and attempts == 1:
+            raise httpx.ReadTimeout("retry", request=request)
+        raise error
+
+    cid = CID("base32", 1, "raw", multihash.digest(b"block", "sha2-256"))
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            async with KuboCAS(
+                client=client,
+                gateway_base_url="https://gateway.test",
+                max_retries=1,
+                initial_delay=0.001,
+            ) as cas:
+                with provider.get_tracer("caller").start_as_current_span(
+                    "job"
+                ) as parent:
+                    with pytest.raises(error_type) as raised:
+                        await cas.load(cid)
+                    assert raised.value is error
+                    assert trace.get_current_span() is parent
+        spans = exporter.get_finished_spans()
+        if mode == "off":
+            assert [span.name for span in spans] == ["job"]
+        else:
+            load_span, job_span = spans
+            assert load_span.parent == job_span.context
+            assert load_span.status.status_code == trace.StatusCode.ERROR
+            assert load_span.attributes["py_hamt.cas.retries"] == int(retry_first)
+            assert load_span.attributes["py_hamt.cas.status"] == (
+                "cancelled" if error_type is asyncio.CancelledError else "error"
+            )
+            exception_events = [
+                event for event in load_span.events if event.name == "exception"
+            ]
+            assert len(exception_events) == 1
+            event = exception_events[0]
+            assert event.attributes["exception.type"].endswith(error_type.__name__)
+            assert "in handle" in event.attributes["exception.stacktrace"]
+            if mode == "diagnostic":
+                assert event.timestamp == load_span.end_time
+        values = {
+            metric.name: metric.data.data_points[0]
+            for resource in reader.get_metrics_data().resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+        }
+        assert values["requests"].value == 1
+        assert values["retries"].value == int(retry_first)
+        assert values["duration"].count == 1
+        assert attempts == 1 + int(retry_first)
+        assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+        assert not instrumentation._FULL_SPAN_ACTIVE.get()
+    finally:
+        meter_provider.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+@pytest.mark.parametrize(
+    "primary_status,secondary_status",
+    [(401, None), (429, None), (503, None), (401, 503)],
+)
+async def test_cas_failure_spans_keep_http_status_codes_and_omit_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+    primary_status: int,
+    secondary_status: int | None,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    _, exporter = otel_spans
+    gateway_urls = ["https://test-user:dummy-password@primary.test"]
+    if secondary_status is not None:
+        gateway_urls.append("https://secondary.test")
+    cid = CID("base32", 1, "raw", multihash.digest(b"block", "sha2-256"))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "primary.test":
+            return httpx.Response(primary_status)
+        assert secondary_status is not None
+        return httpx.Response(secondary_status)
+
+    transport = httpx.MockTransport(handle)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        async with KuboCAS(
+            client=client, gateway_base_urls=gateway_urls, max_retries=0
+        ) as cas:
+            with pytest.raises(
+                ExceptionGroup
+                if secondary_status is not None
+                else httpx.HTTPStatusError
+            ) as raised:
+                with instrumentation.span("py_hamt.hamt.lookup"):
+                    await cas.load(cid)
+
+    original = raised.value
+    first_error = (
+        original.exceptions[0] if isinstance(original, ExceptionGroup) else original
+    )
+    assert "dummy-password" in str(first_error)
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["py_hamt.cas.load", "py_hamt.hamt.lookup"]
+    for span in spans:
+        exported = span.to_json()
+        assert "test-user" not in exported
+        assert "dummy-password" not in exported
+        assert span.attributes is not None
+        if secondary_status is None:
+            assert span.attributes["http.response.status_code"] == primary_status
+        else:
+            assert span.attributes["py_hamt.http.response.status_codes"] == (
+                primary_status,
+                secondary_status,
+            )
+        (event,) = span.events
+        assert "httpx.HTTPStatusError" in event.attributes["exception.stacktrace"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [(404, b""), (200, b"corrupt"), (503, b"")])
+async def test_diagnostic_spans_retain_successful_gateway_failover(
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter], status: int, body: bytes
+) -> None:
+    provider, exporter = otel_spans
+    data = b"block"
+    cid = CID("base32", 1, "raw", multihash.digest(data, "sha2-256"))
+    attempts: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.host)
+        return (
+            httpx.Response(status, content=body)
+            if request.url.host == "primary.test"
+            else httpx.Response(200, content=data)
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async with KuboCAS(
+            client=client,
+            gateway_base_urls=["https://primary.test", "https://secondary.test"],
+            max_retries=0,
+            verify_content=True,
+        ) as cas:
+            with provider.get_tracer("caller").start_as_current_span("job"):
+                assert await cas.load(cid) == data
+    load_span, parent = exporter.get_finished_spans()
+    assert attempts == ["primary.test", "secondary.test"]
+    assert load_span.parent == parent.context
+    assert load_span.attributes["py_hamt.cas.gateway_failures"] == 1
+    assert load_span.attributes["py_hamt.cas.retries"] == 0
+    assert load_span.attributes["py_hamt.cas.status"] == "ok"
+    assert load_span.attributes["py_hamt.cas.response_bytes"] == len(data)
+    assert load_span.attributes.get("py_hamt.cas.failed_http_status_codes") == (
+        (status,) if status != 200 else None
+    )
+    assert load_span.status.status_code == trace.StatusCode.UNSET
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+async def test_cas_classifies_unexpected_error_after_gateway_failover(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    requests = Mock()
+    monkeypatch.setattr(instrumentation, "_CAS_LOAD_COUNTER", requests)
+    _, exporter = otel_spans
+    cid = CID("base32", 1, "raw", multihash.digest(b"block", "sha2-256"))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "primary.test":
+            return httpx.Response(404)
+        raise RuntimeError("fallback failed")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async with KuboCAS(
+            client=client,
+            gateway_base_urls=["https://primary.test", "https://fallback.test"],
+            max_retries=0,
+        ) as cas:
+            with pytest.raises(RuntimeError, match="fallback failed"):
+                await cas.load(cid)
+
+    (load_span,) = exporter.get_finished_spans()
+    assert load_span.attributes["py_hamt.cas.status"] == "error"
+    assert load_span.attributes["py_hamt.cas.gateway_failures"] == 1
+    assert load_span.attributes["py_hamt.cas.failed_http_status_codes"] == (404,)
+    requests.add.assert_called_once_with(
+        1, {"py_hamt.cas.has_range": False, "py_hamt.cas.status": "error"}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+async def test_cas_span_retains_http_status_codes_after_successful_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    _, exporter = otel_spans
+    data = b"block"
+    cid = CID("base32", 1, "raw", multihash.digest(data, "sha2-256"))
+    statuses = iter((429, 503, 200))
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        status = next(statuses)
+        return httpx.Response(status, content=data if status == 200 else b"")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async with KuboCAS(
+            client=client,
+            gateway_base_url="https://gateway.test",
+            max_retries=2,
+            initial_delay=0.001,
+        ) as cas:
+            assert await cas.load(cid) == data
+
+    (load_span,) = exporter.get_finished_spans()
+    assert load_span.attributes["py_hamt.cas.failed_http_status_codes"] == (429, 503)
+    assert load_span.attributes["py_hamt.cas.retries"] == 2
+    assert load_span.attributes["py_hamt.cas.status"] == "ok"
+
+
+@pytest.mark.parametrize("mode", ["diagnostic", "off"])
+def test_quiet_metric_helpers_do_not_annotate_the_caller_outside_a_library_span(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    provider, exporter = otel_spans
+    with provider.get_tracer("caller").start_as_current_span("job"):
+        instrumentation.record_hamt_lookup(
+            "key", depth=1, node_loads=1, node_cache_hits=0, found=True, seconds=0.01
+        )
+    (parent,) = exporter.get_finished_spans()
+    assert not parent.attributes
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("failure"), asyncio.CancelledError("cancelled")]
+)
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+def test_exceptions_preserve_stack_and_job_context(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    error: BaseException,
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    provider, exporter = otel_spans
+    with provider.get_tracer("caller").start_as_current_span("job"):
+        with pytest.raises(type(error)) as raised:
+            with instrumentation.span(
+                "py_hamt.hamt.lookup", {"py_hamt.hamt.lookup.key": "key"}
+            ):
+                raise error
+        assert raised.value is error
+    operation, parent = exporter.get_finished_spans()
+    assert operation.parent == parent.context
+    assert operation.context.trace_id == parent.context.trace_id
+    assert operation.status.status_code == trace.StatusCode.ERROR
+    assert operation.attributes["py_hamt.hamt.lookup.key"] == "key"
+    exception_events = [
+        event for event in operation.events if event.name == "exception"
+    ]
+    assert len(exception_events) == 1
+    assert "Traceback" in exception_events[0].attributes["exception.stacktrace"]
+    assert operation.end_time >= operation.start_time
+    assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+
+
+@pytest.mark.parametrize("mode", ["full", "diagnostic"])
+def test_span_ends_when_exception_event_recording_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    _, exporter = otel_spans
+    original = RuntimeError("read failed")
+
+    def fail_recording(*args: object, **kwargs: object) -> None:
+        raise ValueError("event recording failed")
+
+    monkeypatch.setattr(SDKSpan, "add_event", fail_recording)
+    with pytest.raises(RuntimeError) as raised:
+        with instrumentation.span("py_hamt.hamt.lookup"):
+            raise original
+    assert raised.value is original
+    (operation,) = exporter.get_finished_spans()
+    assert operation.status.status_code == trace.StatusCode.ERROR
+
+
+def test_exception_stacktrace_preserves_chained_types_and_handles_cycles() -> None:
+    error = RuntimeError("private message")
+    cause = ValueError("private cause")
+    error.__cause__ = cause
+    cause.__context__ = error
+    cause.add_note("private note")
+
+    stacktrace, http_status_codes = instrumentation._exception_details(error)
+
+    assert stacktrace.count("RuntimeError") == 1
+    assert "ValueError" in stacktrace
+    assert "private" not in stacktrace
+    assert not http_status_codes
+
+
+@pytest.mark.parametrize("elapsed,kept", [(4.999, False), (5, True)])
+def test_diagnostic_slow_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    elapsed: float,
+    kept: bool,
+) -> None:
+    _, exporter = otel_spans
+    clock = iter([0.0, elapsed])
+    monkeypatch.setattr(instrumentation.time, "perf_counter", lambda: next(clock))
+    with instrumentation.span("py_hamt.sharded_store.get"):
+        instrumentation._set_current_span_attributes({"py_hamt.zarr.key": "chunk"})
+    spans = exporter.get_finished_spans()
+    assert len(spans) == int(kept)
+    if kept:
+        assert spans[0].attributes["py_hamt.zarr.key"] == "chunk"
+
+
+@pytest.mark.parametrize("status,retries", [("timeout", 0), ("ok", 1)])
+def test_diagnostic_cas_failure_and_retry_attributes(
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter], status: str, retries: int
+) -> None:
+    _, exporter = otel_spans
+    load = instrumentation.begin_cas_load("cid", has_range=True)
+    instrumentation.end_cas_load(load, byte_count=12, retries=retries, status=status)
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes["py_hamt.cid"] == "cid"
+    assert span.attributes["py_hamt.cas.status"] == status
+    assert span.attributes["py_hamt.cas.retries"] == retries
+    assert span.status.status_code == (
+        trace.StatusCode.ERROR if status != "ok" else trace.StatusCode.UNSET
+    )
+
+
+def test_diagnostic_missing_lookup_is_retained(
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    _, exporter = otel_spans
+    with instrumentation.span("py_hamt.hamt.lookup"):
+        instrumentation.record_hamt_lookup(
+            "missing",
+            depth=1,
+            node_loads=1,
+            node_cache_hits=0,
+            found=False,
+            seconds=0.01,
+        )
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes["py_hamt.hamt.lookup.found"] is False
+    assert span.attributes["py_hamt.hamt.lookup.key"] == "missing"
+
+
+@pytest.mark.parametrize("mode", ["diagnostic", "off"])
+def test_quiet_modes_keep_aggregate_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+    mode: str,
+) -> None:
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", mode)
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    meter = provider.get_meter("py_hamt")
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_COUNTER", meter.create_counter("requests")
+    )
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_BYTES", meter.create_counter("bytes")
+    )
+    monkeypatch.setattr(
+        instrumentation, "_CAS_LOAD_DURATION", meter.create_histogram("duration")
+    )
+    try:
+        load = instrumentation.begin_cas_load("cid", has_range=False)
+        instrumentation.end_cas_load(load, byte_count=123)
+        values = {
+            metric.name: metric.data.data_points[0]
+            for resource in reader.get_metrics_data().resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+        }
+        assert values["requests"].value == 1
+        assert values["bytes"].value == 123
+        assert values["duration"].count == 1
+        assert not otel_spans[1].get_finished_spans()
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_context_is_isolated_between_async_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+    otel_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_SLOW_SECONDS", "0")
+    provider, exporter = otel_spans
+
+    async def read(key: str) -> None:
+        with provider.get_tracer("caller").start_as_current_span(key):
+            with instrumentation.span("py_hamt.hamt.lookup", {"key": key}):
+                await asyncio.sleep(0)
+                instrumentation._set_current_span_attributes({"result": key})
+
+    await asyncio.gather(read("first"), read("second"))
+    spans = exporter.get_finished_spans()
+    parents = {
+        span.context.span_id: span.name
+        for span in spans
+        if span.name != "py_hamt.hamt.lookup"
+    }
+    for span in spans:
+        if span.name == "py_hamt.hamt.lookup":
+            assert (
+                span.attributes["key"]
+                == span.attributes["result"]
+                == parents[span.parent.span_id]
+            )
+    assert instrumentation._DEFERRED_ATTRIBUTES.get() is None
+
+
+@pytest.mark.parametrize("threshold", ["-1", "nan", "inf", "bad"])
+def test_invalid_diagnostic_threshold_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, threshold: str
+) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", "diagnostic")
+    monkeypatch.setenv("PY_HAMT_OTEL_SLOW_SECONDS", threshold)
+    with pytest.raises(ValueError):
+        with instrumentation.span("test"):
+            pass
+
+
+def test_invalid_mode_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", "typo")
+    with pytest.raises(ValueError, match="PY_HAMT_OTEL_TRACE_MODE"):
+        with instrumentation.span("test"):
+            pass
+
+
+def test_off_mode_skips_diagnostic_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PY_HAMT_OTEL_TRACE_MODE", "off")
+    monkeypatch.setenv("PY_HAMT_OTEL_SLOW_SECONDS", "unused")
+    with instrumentation.span("test") as span:
+        assert not span.is_recording()
 
 
 class _FakeSpan:
     def __init__(self) -> None:
         self.attributes: dict[str, object] = {}
-        self.exceptions: list[Exception] = []
+        self.events: list[str] = []
         self.statuses: list[object] = []
 
     def is_recording(self) -> bool:
         return True
 
-    def record_exception(self, exc: Exception) -> None:
-        self.exceptions.append(exc)
+    def add_event(
+        self, name: str, attributes: dict[str, str], timestamp: int | None = None
+    ) -> None:
+        self.events.append(name)
 
     def set_status(self, status: object) -> None:
         self.statuses.append(status)
@@ -40,7 +662,12 @@ class _FakeTracer:
         self.context_managers: list[_FakeSpanContextManager] = []
 
     def start_as_current_span(
-        self, name: str, attributes: dict[str, object] | None = None
+        self,
+        name: str,
+        attributes: dict[str, object] | None = None,
+        *,
+        record_exception: bool = True,
+        set_status_on_exception: bool = True,
     ) -> _FakeSpanContextManager:
         span = _FakeSpan()
         if attributes:
@@ -101,7 +728,7 @@ def test_attributes_and_recording_span(monkeypatch: pytest.MonkeyPatch) -> None:
         with instrumentation.span("test.span", {"object": object()}):
             raise RuntimeError("boom")
 
-    assert tracer.spans[0].exceptions
+    assert tracer.spans[0].events == ["exception"]
     assert tracer.spans[0].statuses
 
     active_span = _FakeSpan()

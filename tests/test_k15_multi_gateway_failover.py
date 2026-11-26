@@ -523,10 +523,25 @@ async def test_failed_load_is_not_traced_as_a_success(
     original = store_module.instrumentation.end_cas_load
 
     def spy(
-        trace: TraceContext | None, *, byte_count: int, retries: int, status: str
+        trace: TraceContext | None,
+        *,
+        byte_count: int,
+        retries: int,
+        status: str,
+        gateway_failures: int,
+        failed_http_status_codes: list[int] | None,
+        exception: BaseException | None,
     ) -> None:
         seen.append(status)
-        return original(trace, byte_count=byte_count, retries=retries, status=status)
+        return original(
+            trace,
+            byte_count=byte_count,
+            retries=retries,
+            status=status,
+            gateway_failures=gateway_failures,
+            failed_http_status_codes=failed_http_status_codes,
+            exception=exception,
+        )
 
     monkeypatch.setattr(store_module.instrumentation, "end_cas_load", spy)
     gateway_a.responder = lambda _cid: (200, b"corrupted payload")
@@ -547,10 +562,25 @@ async def test_recovery_after_a_failed_gateway_traces_as_success(
     original = store_module.instrumentation.end_cas_load
 
     def spy(
-        trace: TraceContext | None, *, byte_count: int, retries: int, status: str
+        trace: TraceContext | None,
+        *,
+        byte_count: int,
+        retries: int,
+        status: str,
+        gateway_failures: int,
+        failed_http_status_codes: list[int] | None,
+        exception: BaseException | None,
     ) -> None:
         seen.append(status)
-        return original(trace, byte_count=byte_count, retries=retries, status=status)
+        return original(
+            trace,
+            byte_count=byte_count,
+            retries=retries,
+            status=status,
+            gateway_failures=gateway_failures,
+            failed_http_status_codes=failed_http_status_codes,
+            exception=exception,
+        )
 
     monkeypatch.setattr(store_module.instrumentation, "end_cas_load", spy)
     gateway_a.responder = lambda _cid: (500, b"")

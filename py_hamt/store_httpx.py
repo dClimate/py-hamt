@@ -187,12 +187,13 @@ def _retry_delay(
 class _LoadStats:
     """Mutable trace counters shared across the gateways one load attempts."""
 
-    __slots__ = ("response_bytes", "retries", "status")
+    __slots__ = ("response_bytes", "retries", "status", "failed_http_status_codes")
 
     def __init__(self) -> None:
         self.response_bytes: int = 0
         self.retries: int = 0
         self.status: str = "ok"
+        self.failed_http_status_codes: list[int] | None = None
 
 
 class GatewayContentMismatch(Exception):
@@ -1315,6 +1316,9 @@ class KuboCAS(ContentAddressedStore):
                 )
 
             except httpx.HTTPStatusError as error:
+                if stats.failed_http_status_codes is None:
+                    stats.failed_http_status_codes = []
+                stats.failed_http_status_codes.append(error.response.status_code)
                 if (
                     error.response.status_code not in _RETRYABLE_STATUS_CODES
                     or retry_count >= self.max_retries
@@ -1382,8 +1386,12 @@ class KuboCAS(ContentAddressedStore):
         stats = _LoadStats()
         gateways = self._ordered_gateways()
         failures: list[Exception] = []
+        exception: BaseException | None = None
         try:
             for gateway_base_url in gateways:
+                # Each gateway starts with a fresh outcome. Retry and HTTP
+                # status history still accumulate across gateways.
+                stats.status = "ok"
                 health = self._gateway_health[gateway_base_url]
                 try:
                     content = await self._load_from_gateway(
@@ -1402,9 +1410,6 @@ class KuboCAS(ContentAddressedStore):
                     continue
                 else:
                     health.record_success()
-                    # A gateway leg may have set a failure status before a later
-                    # gateway succeeded; the operation as a whole is a success.
-                    stats.status = "ok"
                     return content
 
             # Every gateway failed. With one configured, re-raise its error
@@ -1415,12 +1420,22 @@ class KuboCAS(ContentAddressedStore):
             raise ExceptionGroup(
                 f"all {len(gateways)} gateways failed for CID {cid}", failures
             )
+        except BaseException as error:
+            exception = error
+            if isinstance(error, asyncio.CancelledError):
+                stats.status = "cancelled"
+            elif stats.status == "ok":
+                stats.status = "error"
+            raise
         finally:
             instrumentation.end_cas_load(
                 trace_started_at,
                 byte_count=stats.response_bytes,
                 retries=stats.retries,
                 status=stats.status,
+                gateway_failures=len(failures),
+                failed_http_status_codes=stats.failed_http_status_codes,
+                exception=exception,
             )
 
     # --------------------------------------------------------------------- #

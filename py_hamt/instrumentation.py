@@ -1,21 +1,32 @@
+import math
 import os
 import statistics
 import threading
 import time
+import traceback
 from collections import Counter, defaultdict
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
-from opentelemetry import metrics, trace
+import httpx
+from opentelemetry import context, metrics, trace
 from opentelemetry.trace import Span, Status, StatusCode
+from opentelemetry.util.types import AttributeValue
 
 TRUE_VALUES = {"True", "true", "1", "yes", "Y", "T"}
 OTEL_ATTRIBUTE_VALUE = str | bool | int | float
 
 _TRACER = trace.get_tracer("py_hamt")
 _METER = metrics.get_meter("py_hamt")
+_DEFERRED_ATTRIBUTES: ContextVar[dict[str, AttributeValue] | None] = ContextVar(
+    "py_hamt_span_attributes", default=None
+)
+_FULL_SPAN_ACTIVE: ContextVar[bool] = ContextVar(
+    "py_hamt_full_span_active", default=False
+)
 _CAS_LOAD_COUNTER = _METER.create_counter(
     "py_hamt.cas.load.requests",
     unit="1",
@@ -104,34 +115,166 @@ class TraceContext:
 
 def _attributes(
     attributes: dict[str, Any] | None = None,
-) -> dict[str, OTEL_ATTRIBUTE_VALUE]:
+) -> dict[str, AttributeValue]:
     if not attributes:
         return {}
-    cleaned: dict[str, OTEL_ATTRIBUTE_VALUE] = {}
+    cleaned: dict[str, AttributeValue] = {}
     for key, value in attributes.items():
         if value is None:
             continue
-        if isinstance(value, (str, bool, int, float)):
+        if isinstance(value, (str, bool, int, float)) or (
+            isinstance(value, tuple) and all(type(item) is int for item in value)
+        ):
             cleaned[key] = value
         else:
             cleaned[key] = str(value)
     return cleaned
 
 
+def _exception_type(error: BaseException) -> str:
+    cls = type(error)
+    if cls.__module__ == "builtins":
+        return cls.__qualname__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _exception_details(error: BaseException) -> tuple[str, list[int]]:
+    # Messages, notes, and source lines can include credentials or request data.
+    # Keep frame locations, types, and numeric HTTP status codes.
+    pending = [error]
+    seen: set[int] = set()
+    lines: list[str] = []
+    http_status_codes: list[int] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        lines.append("Traceback (most recent call last):")
+        lines.extend(
+            f'  File "{frame.f_code.co_filename}", line {lineno}, in {frame.f_code.co_name}'
+            for frame, lineno in traceback.walk_tb(current.__traceback__)
+        )
+        lines.append(_exception_type(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            http_status_codes.append(current.response.status_code)
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+    return "\n".join(lines), http_status_codes
+
+
+def _record_span_error(
+    active_span: Span, error: BaseException, *, timestamp: int | None = None
+) -> None:
+    if not active_span.is_recording():
+        return
+    error_type = _exception_type(error)
+    active_span.set_status(Status(StatusCode.ERROR, error_type))
+    stacktrace, http_status_codes = _exception_details(error)
+    if len(http_status_codes) == 1:
+        active_span.set_attribute("http.response.status_code", http_status_codes[0])
+    elif http_status_codes:
+        active_span.set_attribute(
+            "py_hamt.http.response.status_codes", http_status_codes
+        )
+    active_span.add_event(
+        "exception",
+        {
+            "exception.type": error_type,
+            "exception.stacktrace": stacktrace,
+        },
+        timestamp=timestamp,
+    )
+
+
 @contextmanager
 def span(
     name: str, attributes: dict[str, Any] | None = None
 ) -> Generator[Span, None, None]:
-    with _TRACER.start_as_current_span(
-        name, attributes=_attributes(attributes)
-    ) as active_span:
+    """Emit full operation detail or only completed diagnostic operations."""
+    mode = os.getenv("PY_HAMT_OTEL_TRACE_MODE", "full").strip().lower()
+    if mode not in {"full", "diagnostic", "off"}:
+        raise ValueError("PY_HAMT_OTEL_TRACE_MODE must be full, diagnostic or off")
+    if mode == "off":
+        token = _DEFERRED_ATTRIBUTES.set({})
         try:
-            yield active_span
-        except Exception as exc:
-            if active_span.is_recording():
-                active_span.record_exception(exc)
-                active_span.set_status(Status(StatusCode.ERROR, str(exc)))
+            yield trace.INVALID_SPAN
+        finally:
+            _DEFERRED_ATTRIBUTES.reset(token)
+        return
+    if mode == "diagnostic":
+        slow_seconds = float(os.getenv("PY_HAMT_OTEL_SLOW_SECONDS", "5"))
+        if not math.isfinite(slow_seconds) or slow_seconds < 0:
+            raise ValueError("PY_HAMT_OTEL_SLOW_SECONDS must be finite and nonnegative")
+        deferred_attributes = _attributes(attributes)
+        token = _DEFERRED_ATTRIBUTES.set(deferred_attributes)
+        parent_context = context.get_current()
+        started_at = time.perf_counter()
+        started_ns = time.time_ns()
+        error: BaseException | None = None
+        try:
+            yield trace.INVALID_SPAN
+        except BaseException as exc:
+            error = exc
             raise
+        finally:
+            ended_ns = time.time_ns()
+            elapsed = time.perf_counter() - started_at
+            _DEFERRED_ATTRIBUTES.reset(token)
+            cas_status = deferred_attributes.get("py_hamt.cas.status")
+            retries = deferred_attributes.get("py_hamt.cas.retries")
+            gateway_failures = deferred_attributes.get("py_hamt.cas.gateway_failures")
+            if (
+                error is not None
+                or elapsed >= slow_seconds
+                or cas_status not in (None, "ok")
+                or (isinstance(retries, (int, float)) and retries > 0)
+                or (isinstance(gateway_failures, (int, float)) and gateway_failures > 0)
+                or deferred_attributes.get("py_hamt.hamt.lookup.found") is False
+            ):
+                # A failure recording telemetry must not replace the operation result.
+                with suppress(Exception):
+                    diagnostic_span = _TRACER.start_span(
+                        name,
+                        context=parent_context,
+                        attributes=deferred_attributes,
+                        start_time=started_ns,
+                    )
+                    try:
+                        if error is not None:
+                            _record_span_error(
+                                diagnostic_span, error, timestamp=ended_ns
+                            )
+                        elif cas_status not in (None, "ok"):
+                            diagnostic_span.set_status(
+                                Status(StatusCode.ERROR, str(cas_status))
+                            )
+                    finally:
+                        diagnostic_span.end(end_time=ended_ns)
+        return
+    deferred_token = _DEFERRED_ATTRIBUTES.set(None)
+    full_token = _FULL_SPAN_ACTIVE.set(True)
+    try:
+        with _TRACER.start_as_current_span(
+            name,
+            attributes=_attributes(attributes),
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as active_span:
+            try:
+                yield active_span
+            except BaseException as exc:
+                with suppress(Exception):
+                    _record_span_error(active_span, exc)
+                raise
+    finally:
+        _FULL_SPAN_ACTIVE.reset(full_token)
+        _DEFERRED_ATTRIBUTES.reset(deferred_token)
 
 
 def _current_span() -> Span:
@@ -139,6 +282,15 @@ def _current_span() -> Span:
 
 
 def _set_current_span_attributes(attributes: dict[str, Any]) -> None:
+    deferred_attributes = _DEFERRED_ATTRIBUTES.get()
+    if deferred_attributes is not None:
+        deferred_attributes.update(_attributes(attributes))
+        return
+    if (
+        not _FULL_SPAN_ACTIVE.get()
+        and os.getenv("PY_HAMT_OTEL_TRACE_MODE", "full").strip().lower() != "full"
+    ):
+        return
     active_span = _current_span()
     if not active_span.is_recording():
         return
@@ -234,7 +386,7 @@ def begin_cas_load(cid: Any, has_range: bool) -> TraceContext:
         "py_hamt.cas.has_range": has_range
     }
     custom_metrics_enabled = enabled()
-    span_context_manager = _TRACER.start_as_current_span(
+    span_context_manager = span(
         "py_hamt.cas.load",
         attributes=_attributes({
             "py_hamt.cid": str(cid),
@@ -266,6 +418,9 @@ def end_cas_load(
     byte_count: int = 0,
     retries: int = 0,
     status: str = "ok",
+    gateway_failures: int = 0,
+    failed_http_status_codes: list[int] | None = None,
+    exception: BaseException | None = None,
 ) -> None:
     if trace_context is None:
         return
@@ -275,12 +430,17 @@ def end_cas_load(
     _CAS_LOAD_BYTES.add(byte_count, attributes)
     _CAS_LOAD_RETRIES.add(retries, attributes)
     _CAS_LOAD_DURATION.record(elapsed, attributes)
-    if trace_context.span.is_recording():
-        trace_context.span.set_attribute("py_hamt.cas.status", status)
-        trace_context.span.set_attribute("py_hamt.cas.response_bytes", byte_count)
-        trace_context.span.set_attribute("py_hamt.cas.retries", retries)
-        if status != "ok":
-            trace_context.span.set_status(Status(StatusCode.ERROR, status))
+    _set_current_span_attributes({
+        "py_hamt.cas.status": status,
+        "py_hamt.cas.response_bytes": byte_count,
+        "py_hamt.cas.retries": retries,
+        "py_hamt.cas.gateway_failures": gateway_failures,
+        "py_hamt.cas.failed_http_status_codes": (
+            tuple(failed_http_status_codes) if failed_http_status_codes else None
+        ),
+    })
+    if trace_context.span.is_recording() and status != "ok":
+        trace_context.span.set_status(Status(StatusCode.ERROR, status))
     if trace_context.custom_metrics_enabled:
         with _LOCK:
             _METRICS.inflight_cas_loads = max(0, _METRICS.inflight_cas_loads - 1)
@@ -288,7 +448,11 @@ def end_cas_load(
             _METRICS.counters["cas_load.retries"] += retries
             _METRICS.bytes["cas_load.response_bytes"] += byte_count
             _METRICS.observe("cas_load.latency_seconds", elapsed)
-    trace_context.span_context_manager.__exit__(None, None, None)
+    trace_context.span_context_manager.__exit__(
+        type(exception) if exception is not None else None,
+        exception,
+        exception.__traceback__ if exception is not None else None,
+    )
 
 
 def record_hamt_node_load(
