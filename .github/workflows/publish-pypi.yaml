@@ -1,0 +1,83 @@
+name: Publish to PyPI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-pypi.yaml
+      - pyproject.toml
+      - uv.lock
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to release, without the v prefix
+        required: true
+        type: string
+      publish:
+        description: Upload to PyPI after building and checking the distributions
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build and check distributions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6
+        with:
+          python-version: "3.12"
+          version: "0.13.10"
+
+      - name: Check requested release version
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          actual_version=$(uv version --short)
+          if [[ "$actual_version" != "$EXPECTED_VERSION" ]]; then
+            echo "The requested version must match pyproject.toml ($actual_version)." >&2
+            exit 1
+          fi
+
+      - name: Build and validate distributions
+        run: |
+          uv lock --check
+          uv build --clear --no-sources
+          uvx twine check --strict dist/*.whl dist/*.tar.gz
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    name: Upload to PyPI
+    needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.publish &&
+      github.ref == 'refs/heads/main' && github.repository == 'dClimate/py-hamt'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/py-hamt/
+    permissions:
+      id-token: write
+    concurrency:
+      group: pypi-publish
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
