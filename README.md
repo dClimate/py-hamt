@@ -157,3 +157,28 @@ If you are an LLM reading this repo, refer to the `AGENTS.md` file.
 
 ## Managing dependencies
 Use `uv add` and `uv remove`, e.g. `uv add numpy` or `uv add pytest --group dev`. For more information please see the [uv documentation](https://docs.astral.sh/uv/guides/projects/).
+
+## Publishing a release
+
+1. Run `uv version <version>` and commit the changes to `pyproject.toml` and
+   `uv.lock`. Merge the release commit into `main` and confirm its checks pass.
+2. From a clean checkout of that commit, build the source distribution and wheel,
+   then check their metadata and description rendering.
+
+   ```sh
+   uv build --clear --no-sources
+   uvx twine check --strict dist/*
+   ```
+
+3. Use a PyPI API token scoped to `py-hamt`. In Bash, enter it at the hidden
+   prompt and upload both distributions.
+
+   ```bash
+   read -rs -p 'PyPI API token: ' release_token
+   UV_PUBLISH_TOKEN="$release_token" uv publish dist/*
+   unset release_token
+   ```
+
+4. Check that both files appear on the [PyPI project page](https://pypi.org/project/py-hamt/).
+   Then create the GitHub release with the matching `v<version>` tag pointing
+   to the commit you built. The GitHub tag does not upload files to PyPI.
