@@ -162,23 +162,23 @@ Use `uv add` and `uv remove`, e.g. `uv add numpy` or `uv add pytest --group dev`
 
 1. Run `uv version <version>` and commit the changes to `pyproject.toml` and
    `uv.lock`. Merge the release commit into `main` and confirm its checks pass.
-2. From a clean checkout of that commit, build the source distribution and wheel,
-   then check their metadata and description rendering.
+2. Create and push a tag from the merged release commit, using the exact
+   `v<version>` shown in the package metadata (for example, `v3.7.1`).
 
    ```sh
-   uv build --clear --no-sources
-   uvx twine check --strict dist/*
+   git switch main
+   git pull --ff-only
+   git tag v3.7.1
+   git push origin v3.7.1
    ```
 
-3. Use a PyPI API token scoped to `py-hamt`. In Bash, enter it at the hidden
-   prompt and upload both distributions.
+3. The tag starts **Publish to PyPI**. It verifies that the tagged commit is
+   in `main` and that the tag matches the version in its `pyproject.toml`.
+   It then builds, validates, and uploads the wheel and source distribution.
+   Once both files appear on the [PyPI project page](https://pypi.org/project/py-hamt/),
+   create the GitHub release using the same tag.
 
-   ```bash
-   read -rs -p 'PyPI API token: ' release_token
-   UV_PUBLISH_TOKEN="$release_token" uv publish dist/*
-   unset release_token
-   ```
-
-4. Check that both files appear on the [PyPI project page](https://pypi.org/project/py-hamt/).
-   Then create the GitHub release with the matching `v<version>` tag pointing
-   to the commit you built. The GitHub tag does not upload files to PyPI.
+The workflow uses PyPI Trusted Publishing. The `py-hamt` project publisher
+must point to owner `dClimate`, repository `py-hamt`, workflow filename
+`publish-pypi.yaml`, and GitHub Actions environment `pypi`. The `pypi`
+environment permits deployments from `main`.

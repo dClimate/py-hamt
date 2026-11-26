@@ -1,0 +1,20 @@
+name: Version tag pushed
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions: {}
+
+jobs:
+  new-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm a new tag was pushed
+        env:
+          TAG_CREATED: ${{ github.event.created }}
+        run: |
+          if [[ "$TAG_CREATED" != true ]]; then
+            echo 'Publishing requires a newly pushed version tag.' >&2
+            exit 1
+          fi

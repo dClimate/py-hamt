@@ -1,0 +1,108 @@
+name: Publish to PyPI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-pypi.yaml
+      - .github/workflows/version-tag.yaml
+      - pyproject.toml
+      - uv.lock
+  # Run the publisher from the default branch, where the pypi environment is allowed.
+  workflow_run:
+    workflows: [Version tag pushed]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build and check distributions
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.repository == 'dClimate/py-hamt' && github.ref == 'refs/heads/main' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.path == '.github/workflows/version-tag.yaml' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify and check out the tagged commit
+        if: github.event_name == 'workflow_run'
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          tag_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          pushed_commit=$(git rev-parse --verify --end-of-options "${RELEASE_SHA}^{commit}")
+          if [[ "$tag_commit" != "$pushed_commit" ]]; then
+            echo 'The tag no longer points to the commit that triggered this release.' >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_commit" HEAD; then
+            echo 'The tagged commit must be in the history of main.' >&2
+            exit 1
+          fi
+          git checkout --detach "$tag_commit"
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6
+        with:
+          enable-cache: false
+          python-version: "3.12"
+          version: "0.13.10"
+
+      - name: Check tag against the package version
+        if: github.event_name == 'workflow_run'
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          version=$(uv run --no-project python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as project:
+              print(tomllib.load(project)["project"]["version"])
+          PY
+          )
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "The release tag must match pyproject.toml (expected v$version)." >&2
+            exit 1
+          fi
+
+      - name: Build and validate distributions
+        run: |
+          uv lock --check
+          uv build --clear --no-sources
+          uvx twine check --strict dist/*.whl dist/*.tar.gz
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    name: Upload to PyPI
+    needs: build
+    if: github.event_name == 'workflow_run' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/py-hamt/
+    permissions:
+      id-token: write
+    concurrency:
+      group: pypi-publish-${{ github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
